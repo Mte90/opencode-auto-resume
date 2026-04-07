@@ -190,9 +190,3 @@ for each tracked session:
       ├─ attempts < maxRetries → "continue" with backoff
       └─ exhausted → give up, log warning
 ```
-
----
-
-## License
-
-[GPL-3.0-or-later](LICENSE)
