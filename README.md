@@ -56,6 +56,16 @@ Periodic: cleanup idle sessions older than 10min or >50 entries
 
 ## Installation
 
+### Opencode
+
+```
+{
+  "plugins": ["opencode-auto-resume@latest"]
+}
+```
+
+### Manual
+
 ```bash
 mkdir -p ~/.config/opencode/plugin/opencode-auto-resume
 cd ~/.config/opencode/plugin/opencode-auto-resume
