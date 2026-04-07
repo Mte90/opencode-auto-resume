@@ -57,28 +57,7 @@ User-initiated cancellation (`MessageAbortedError`) is detected and all resume a
 
 ## Installation
 
-### Via npm (recommended)
-
-```bash
-npm install opencode-auto-resume
-```
-
-Then add to your `opencode.jsonc`:
-
-```jsonc
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": ["opencode-auto-resume"]
-}
-```
-
-### Via OCX
-
-```bash
-ocx add npm:opencode-auto-resume
-```
-
-### Via Bun (local build)
+Clone the repository and build:
 
 ```bash
 git clone https://github.com/Mte90/opencode-auto-resume.git
@@ -87,11 +66,12 @@ bun install
 bun run build
 ```
 
-Then reference the built file in `opencode.jsonc`:
+Then add to your `opencode.jsonc`:
 
 ```jsonc
 {
-  "plugin": ["file:///path/to/opencode-auto-resume/dist/index.js"]
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["file:///absolute/path/to/opencode-auto-resume/dist/index.js"]
 }
 ```
 
@@ -102,25 +82,13 @@ Pass options as the second element of a tuple:
 ```jsonc
 {
   "plugin": [
-    ["opencode-auto-resume", {
+    ["file:///absolute/path/to/opencode-auto-resume/dist/index.js", {
       "chunkTimeoutMs": 45000,
       "gracePeriodMs": 3000,
       "maxRetries": 3,
       "subagentWaitMs": 15000,
       "loopMaxContinues": 3,
       "loopWindowMs": 600000
-    }]
-  ]
-}
-```
-
-For local builds:
-
-```jsonc
-{
-  "plugin": [
-    ["file:///path/to/opencode-auto-resume/dist/index.js", {
-      "chunkTimeoutMs": 60000
     }]
   ]
 }

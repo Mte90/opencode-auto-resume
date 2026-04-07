@@ -7,8 +7,7 @@
     "plugin",
     "auto-resume",
     "stall-detection",
-    "llm",
-    "ocx"
+    "llm"
   ],
   "homepage": "https://github.com/Mte90/opencode-auto-resume#readme",
   "bugs": {
@@ -22,9 +21,7 @@
   "author": "Daniele \"mte90\" Scasciafratte",
   "type": "module",
   "main": "dist/index.js",
-  "files": [
-    "dist/index.js"
-  ],
+
   "scripts": {
     "build": "bun build src/index.ts --outdir dist --target bun",
     "dev": "bun build src/index.ts --outdir dist --target bun --watch"
