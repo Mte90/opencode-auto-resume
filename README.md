@@ -56,33 +56,44 @@ Periodic: cleanup idle sessions older than 10min or >50 entries
 
 ## Installation
 
-### Opencode
-
-```
-{
-  "plugins": ["opencode-auto-resume@latest"]
-}
-```
-
-### Manual
+### Via npm (recommended)
 
 ```bash
-mkdir -p ~/.config/opencode/plugin/opencode-auto-resume
-cd ~/.config/opencode/plugin/opencode-auto-resume
-# Copy package.json, tsconfig.json, src/ here
-bun install
-bun run build
+npm install opencode-auto-resume
 ```
 
-Register in `opencode.json`:
+Add to your `opencode.jsonc`:
 
-```json
+```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
+  "plugin": ["opencode-auto-resume"]
+}
+```
+
+With options:
+
+```jsonc
+{
   "plugin": [
-    "file:///home/YOURUSER/.config/opencode/plugins/opencode-auto-resume/dist/index.js"
+    ["opencode-auto-resume", {
+      "chunkTimeoutMs": 45000,
+      "gracePeriodMs": 3000,
+      "maxRetries": 3
+    }]
   ]
 }
+```
+
+### Via GitHub (manual clone)
+
+OpenCode may clone the repository to `~/.config/opencode/plugins/opencode-auto-resume/` automatically.
+
+**To update** the plugin:
+```bash
+cd ~/.config/opencode/plugins/opencode-auto-resume
+git pull
+bun run build
 ```
 
 ## Configuration
@@ -110,14 +121,15 @@ Register in `opencode.json`:
 | `loopMaxContinues` | `3` | Continues in window before triggering abort |
 | `loopWindowMs` | `600000` | Hallucination loop detection window (10 min) |
 
-## Manual resume
+## Verification
 
-The plugin exposes a `resume` tool:
+To verify the plugin is loaded:
 
-```
-Please use the resume tool to unstick this session
-Please use the resume tool with prompt "try the edit on src/main.js again"
-```
+1. Check OpenCode logs for: `opencode-auto-resume ready. timeout=45000ms...`
+2. Let a session idle for 48 seconds — it should auto-resume
+3. Check logs for `Stream stall` or `Ready-to-continue pattern detected`
+
+The plugin handles all recovery automatically — no manual intervention needed.
 
 ## Troubleshooting
 

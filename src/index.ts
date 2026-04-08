@@ -96,6 +96,20 @@ const TRUNCATED_XML_PATTERNS = [
     { open: /<tool_call[^>]*>/i, close: /<\/tool_call>/i },
 ]
 
+/**
+ * Patterns that indicate the agent is waiting to continue but didn't actually send the continue prompt.
+ * These appear at the end of assistant messages when the model says it will continue but doesn't.
+ */
+const READY_TO_CONTINUE_PATTERNS = [
+    /ready to continue with task/i,
+    /continuing with task/i,
+    /continue with task/i,
+    /proceeding with task/i,
+    /ready to proceed with task/i,
+    /will continue with task/i,
+    /moving on to task/i,
+]
+
 function containsToolCallAsText(text: string): boolean {
     if (text.length <= 10) return false
 
@@ -108,6 +122,20 @@ function containsToolCallAsText(text: string): boolean {
     }
 
     return false
+}
+
+/**
+ * Check if the last line of the message contains "ready to continue" patterns.
+ * These indicate the model says it will continue but doesn't actually send the prompt.
+ */
+function containsReadyToContinuePattern(text: string): boolean {
+    const lines = text.split('\n')
+    const lastLine = lines[lines.length - 1]?.trim()
+    if (!lastLine) return false
+    
+    // Check only last 3 lines for the pattern (model usually says it at the end)
+    const lastLines = lines.slice(-3).join('\n')
+    return READY_TO_CONTINUE_PATTERNS.some((pat) => pat.test(lastLines))
 }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +381,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 for (const part of parts) {
                     if (part.type !== "text") continue
                     const text = (part.text as string) ?? ""
+                    
                     if (containsToolCallAsText(text)) {
                         w.toolTextRecovered = true
                         w.toolTextAttempts++
@@ -377,6 +406,35 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                             } catch (err) {
                                 const errMsg = err instanceof Error ? err.message : String(err)
                                 await log("warn", `${short(sid)} - tool-call-as-text recovery failed: ${errMsg}`)
+                            }
+                        }
+                        return
+                    }
+                    
+                    if (containsReadyToContinuePattern(text)) {
+                        w.toolTextRecovered = true
+                        w.toolTextAttempts++
+                        await log(
+                            "info",
+                            `Ready-to-continue pattern detected on ${short(sid)}! ` +
+                            `Attempt ${w.toolTextAttempts}/${maxRetries}. Sending continue...`
+                        )
+
+                        if (isHallucinationLoop(sid)) {
+                            await log("warn", `Hallucination loop detected on ${short(sid)} — aborting instead`)
+                            await tryAbortAndResume(sid, w)
+                        } else {
+                            try {
+                                await ctx.client.session.prompt({
+                                    path: { id: sid },
+                                    body: { parts: [{ type: "text", text: "continue" }] },
+                                })
+                                recordContinue(sid)
+                                w.lastRetryAt = Date.now()
+                                await log("info", `${short(sid)} - ready-to-continue recovery sent (attempt ${w.toolTextAttempts})`)
+                            } catch (err) {
+                                const errMsg = err instanceof Error ? err.message : String(err)
+                                await log("warn", `${short(sid)} - ready-to-continue recovery failed: ${errMsg}`)
                             }
                         }
                         return
@@ -711,58 +769,19 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         event: async ({ event }) => {
             if (!initialised) {
                 initialised = true
-                log("info", `v8.0 ready. timeout=${chunkTimeoutMs}ms, orphan=${subagentWaitMs}ms, loop=${loopMaxContinues}x/${loopWindowMs / 1000}s`)
+                log("info", `opencode-auto-resume ready. timeout=${chunkTimeoutMs}ms, orphan=${subagentWaitMs}ms, loop=${loopMaxContinues}x/${loopWindowMs / 1000}s`)
             }
             handleEvent(event as Record<string, unknown>)
         },
 
         config: async () => {
-            log("info", `v8.0 config OK`)
-        },
-
-        tool: {
-            resume: tool({
-                description: "Manually resume a stalled LLM session.",
-                args: {
-                    prompt: tool.schema.string().optional().describe("Continuation prompt. Defaults to 'continue'."),
-                    session_id: tool.schema.string().optional().describe("Target session ID."),
-                },
-                async execute(args, toolCtx) {
-                    let targetSid = (args.session_id as string) ?? toolCtx.sessionID
-
-                    if (!targetSid) {
-                        let orphan: { sid: string; w: SessionWatch } | null = null
-                        let best: { sid: string; last: number } | null = null
-                        for (const [sid, w] of sessions) {
-                            if (w.status === "busy") {
-                                if (w.orphanWatchStartAt !== null && !orphan) orphan = { sid, w }
-                                if (w.lastActivityAt > 0 && (!best || w.lastActivityAt > best.last)) {
-                                    best = { sid, last: w.lastActivityAt }
-                                }
-                            }
-                        }
-                        targetSid = orphan?.sid ?? best?.sid
-                        if (!targetSid) return "No active stalled session found."
-                    }
-
-                    const w = sessions.get(targetSid)
-                    const text = (args.prompt as string) ?? "continue"
-                    log("info", `Manual resume on ${short(targetSid)}: "${text}"`)
-
-                    try {
-                        await ctx.client.session.prompt({
-                            path: { id: targetSid },
-                            body: { agent: toolCtx.agent, parts: [{ type: "text", text }] },
-                        })
-                        recordContinue(targetSid)
-                        if (w) { w.orphanWatchStartAt = null; w.resumeAttempts = 0; w.toolTextRecovered = false; w.toolTextAttempts = 0 }
-                        return `Resume sent to ${short(targetSid)}: "${text}"`
-                    } catch (err) {
-                        const msg = err instanceof Error ? err.message : String(err)
-                        return `Failed: ${msg}`
-                    }
-                },
-            }),
+            log("info", `opencode-auto-resume config OK`)
+            ctx.ui.toast({
+                title: "Auto-Resume Plugin",
+                message: `Loaded with ${chunkTimeoutMs}ms timeout, ${loopMaxContinues} loop attempts`,
+                variant: "success",
+                duration: 5000
+            })
         },
     }
 }
