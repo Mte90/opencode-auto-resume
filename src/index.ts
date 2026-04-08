@@ -514,7 +514,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         try {
             await ctx.client.session.prompt({
                 path: { id: sid },
-                body: { parts: [{ type: "text", text: "continue" }] },
+                body: { model: true, parts: [{ type: "text", text: "continue" }] },
             })
             recordContinue(sid)
             await log("info", `${short(sid)} - retry sent`)
