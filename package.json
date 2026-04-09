@@ -21,12 +21,12 @@
   "author": "Daniele \"mte90\" Scasciafratte",
   "type": "module",
   "main": "dist/index.js",
-  "scripts": {
+"scripts": {
     "build": "bun build src/index.ts --outdir dist --target bun",
     "dev": "bun build src/index.ts --outdir dist --target bun --watch",
+    "test": "bun test",
     "prepublishOnly": "bun run build"
-  },
-  "files": [
+},  "files": [
     "dist/index.js",
     "README.md",
     "LICENSE"
