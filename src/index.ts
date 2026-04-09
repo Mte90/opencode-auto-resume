@@ -342,6 +342,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     // -----------------------------------------------------------------------
 
     async function checkForToolCallAsText(sid: string, w: SessionWatch) {
+        if (typeof sid !== "string" || !sid) return
         if (w.userCancelled || w.toolTextRecovered) return
 
         // v8.0: Backoff for tool-text recovery
@@ -400,7 +401,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                             try {
                                 await ctx.client.session.prompt({
                                     path: { id: sid },
-                                    body: { agent: w.agent, parts: [{ type: "text", text: TOOL_TEXT_RECOVERY_PROMPT }] },
+                                    body: { agent: typeof w.agent === "string" ? w.agent : undefined, parts: [{ type: "text", text: TOOL_TEXT_RECOVERY_PROMPT }] },
                                 })
                                 recordContinue(sid)
                                 w.lastRetryAt = Date.now()
@@ -429,7 +430,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                             try {
                                 await ctx.client.session.prompt({
                                     path: { id: sid },
-                                    body: { agent: w.agent, parts: [{ type: "text", text: "continue" }] },
+                                    body: { agent: typeof w.agent === "string" ? w.agent : undefined, parts: [{ type: "text", text: "continue" }] },
                                 })
                                 recordContinue(sid)
                                 w.lastRetryAt = Date.now()
@@ -454,6 +455,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     // -----------------------------------------------------------------------
 
     async function tryAbortAndResume(sid: string, w: SessionWatch): Promise<boolean> {
+        if (typeof sid !== "string" || !sid) return false
         if (w.aborting) return false
         w.aborting = true
 
@@ -477,7 +479,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         try {
             await ctx.client.session.prompt({
                 path: { id: sid },
-                body: { agent: w.agent, parts: [{ type: "text", text: "continue" }] },
+                body: { agent: typeof w.agent === "string" ? w.agent : undefined, parts: [{ type: "text", text: "continue" }] },
             })
             recordContinue(sid)
             await log("info", `${short(sid)} - abort+continue done`)
@@ -499,6 +501,10 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     // -----------------------------------------------------------------------
 
     async function tryResume(sid: string, w: SessionWatch, reason: string): Promise<boolean> {
+        if (typeof sid !== "string" || !sid) {
+            await log("warn", `tryResume called with invalid sid: ${sid}`)
+            return false
+        }
         const now = Date.now()
         const elapsedSinceRetry = now - w.lastRetryAt
         const requiredBackoff = backoffMs(w.resumeAttempts)
@@ -513,10 +519,11 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         const idleSec = Math.round((now - w.lastActivityAt) / 1000)
         await log("info", `${reason} on ${short(sid)} (${idleSec}s, retry ${w.resumeAttempts}/${maxRetries})`)
 
+        const agent = typeof w.agent === "string" ? w.agent : undefined
         try {
             await ctx.client.session.prompt({
                 path: { id: sid },
-                body: { agent: w.agent, model: true, parts: [{ type: "text", text: "continue" }] },
+                body: { agent, model: true, parts: [{ type: "text", text: "continue" }] },
             })
             recordContinue(sid)
             await log("info", `${short(sid)} - retry sent`)
@@ -531,6 +538,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     }
 
     async function getSessionAgent(sid: string): Promise<string | undefined> {
+        if (typeof sid !== "string" || !sid) return undefined
         try {
             const response = await ctx.client.session.messages({
                 path: { id: sid },
