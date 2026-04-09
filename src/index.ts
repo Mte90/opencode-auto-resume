@@ -29,6 +29,8 @@ interface SessionWatch {
     continueTimestamps: number[]
     /** Timestamp when session was last marked idle (for cleanup). */
     idleSince: number | null
+    /** The agent to use when continuing this session (extracted from last AssistantMessage). */
+    agent?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -398,7 +400,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                             try {
                                 await ctx.client.session.prompt({
                                     path: { id: sid },
-                                    body: { parts: [{ type: "text", text: TOOL_TEXT_RECOVERY_PROMPT }] },
+                                    body: { agent: w.agent, parts: [{ type: "text", text: TOOL_TEXT_RECOVERY_PROMPT }] },
                                 })
                                 recordContinue(sid)
                                 w.lastRetryAt = Date.now()
@@ -427,7 +429,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                             try {
                                 await ctx.client.session.prompt({
                                     path: { id: sid },
-                                    body: { parts: [{ type: "text", text: "continue" }] },
+                                    body: { agent: w.agent, parts: [{ type: "text", text: "continue" }] },
                                 })
                                 recordContinue(sid)
                                 w.lastRetryAt = Date.now()
@@ -475,7 +477,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         try {
             await ctx.client.session.prompt({
                 path: { id: sid },
-                body: { parts: [{ type: "text", text: "continue" }] },
+                body: { agent: w.agent, parts: [{ type: "text", text: "continue" }] },
             })
             recordContinue(sid)
             await log("info", `${short(sid)} - abort+continue done`)
@@ -514,7 +516,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         try {
             await ctx.client.session.prompt({
                 path: { id: sid },
-                body: { model: true, parts: [{ type: "text", text: "continue" }] },
+                body: { agent: w.agent, model: true, parts: [{ type: "text", text: "continue" }] },
             })
             recordContinue(sid)
             await log("info", `${short(sid)} - retry sent`)
@@ -528,9 +530,32 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Session discovery (v8.0: periodic session.list() to find missed sessions)
-    // -----------------------------------------------------------------------
+    async function getSessionAgent(sid: string): Promise<string | undefined> {
+        try {
+            const response = await ctx.client.session.messages({
+                path: { id: sid },
+            })
+            const data = response as Record<string, unknown>
+            let messages: Array<Record<string, unknown>> = []
+            if (Array.isArray(data)) {
+                messages = data
+            } else if (Array.isArray(data.data)) {
+                messages = data.data
+            } else if (Array.isArray(data.messages)) {
+                messages = data.messages
+            }
+            for (let i = messages.length - 1; i >= 0; i--) {
+                const msg = messages[i]
+                const role = msg.role as string | undefined
+                if (role === "assistant") {
+                    const agent = msg.agent as string | undefined
+                    if (agent) return agent
+                }
+            }
+        } catch {
+        }
+        return undefined
+    }
 
     async function discoverSessions() {
         try {
@@ -545,7 +570,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
             for (const s of list) {
                 const sid = s.id as string
-                if (sid && !sessions.has(sid)) {
+                if (sid) {
+                    const isNew = !sessions.has(sid)
                     ensureWatch(sid)
                     const status = s.status as string | undefined
                     if (status) {
@@ -553,7 +579,16 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         w.status = status as SessionWatch["status"]
                         if (status === "idle") w.idleSince = Date.now()
                     }
-                    log("debug", `Discovered session ${short(sid)} via list()`)
+                    if (isNew) {
+                        const agent = await getSessionAgent(sid)
+                        if (agent) {
+                            const w = sessions.get(sid)!
+                            w.agent = agent
+                            log("debug", `Discovered session ${short(sid)} with agent: ${agent}`)
+                        } else {
+                            log("debug", `Discovered session ${short(sid)} via list()`)
+                        }
+                    }
                 }
             }
         } catch (err) {
