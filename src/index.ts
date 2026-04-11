@@ -21,16 +21,11 @@ interface SessionWatch {
     gaveUp: boolean
     orphanWatchStartAt: number | null
     aborting: boolean
-    /** True if we already sent a tool-call-as-text recovery for this idle cycle. */
     toolTextRecovered: boolean
-    /** Tool-text recovery attempt count (separate from stall retries). */
     toolTextAttempts: number
-    /** Per-session hallucination loop timestamps. */
     continueTimestamps: number[]
-    /** Timestamp when session was last marked idle (for cleanup). */
     idleSince: number | null
-    /** The agent to use when continuing this session (extracted from last AssistantMessage). */
-    agent?: string
+    continuing: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +220,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 toolTextAttempts: 0,
                 continueTimestamps: [],
                 idleSince: null,
+                continuing: false,
             }
             sessions.set(sid, w)
         }
@@ -336,6 +332,51 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         }
     }
 
+    async function sendContinuePrompt(sid: string, text: string, w: SessionWatch) {
+        if (w.continuing) {
+            await log("debug", `${short(sid)} - continue already in progress, skipping`)
+            return
+        }
+        w.continuing = true
+        try {
+            await ctx.client.session.prompt({
+                path: { id: sid },
+                body: { parts: [{ type: "text", text }] },
+            })
+            recordContinue(sid)
+            w.lastRetryAt = Date.now()
+        } finally {
+            w.continuing = false
+        }
+    }
+
+    function extractMessages(response: Record<string, unknown>): Array<Record<string, unknown>> {
+        if (Array.isArray(response)) return response
+        if (Array.isArray(response.data)) return response.data
+        if (Array.isArray(response.messages)) return response.messages
+        return []
+    }
+
+    function resetSessionFlags(w: SessionWatch) {
+        w.userCancelled = false
+        w.resumeAttempts = 0
+        w.gaveUp = false
+        w.orphanWatchStartAt = null
+        w.aborting = false
+        w.toolTextRecovered = false
+        w.toolTextAttempts = 0
+        w.continueTimestamps = []
+        w.idleSince = null
+        w.continuing = false
+    }
+
+    function resetIdleFlags(w: SessionWatch) {
+        w.userCancelled = false
+        w.aborting = false
+        w.orphanWatchStartAt = null
+        w.idleSince = Date.now()
+    }
+
     // -----------------------------------------------------------------------
     // Tool-call-as-text detection (v8.0: no busyCount guard, backoff,
     // specific recovery prompt)
@@ -361,17 +402,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             const response = await ctx.client.session.messages({
                 path: { id: sid },
             })
-
-            const data = response as Record<string, unknown>
-            let messages: Array<Record<string, unknown>> = []
-            if (Array.isArray(data)) {
-                messages = data
-            } else if (Array.isArray(data.data)) {
-                messages = data.data
-            } else if (Array.isArray(data.messages)) {
-                messages = data.messages
-            }
-
+            const messages = extractMessages(response as Record<string, unknown>)
             const recent = messages.slice(-3)
 
             for (const msg of recent) {
@@ -399,12 +430,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                             await tryAbortAndResume(sid, w)
                         } else {
                             try {
-                                await ctx.client.session.prompt({
-                                    path: { id: sid },
-                                    body: { agent: typeof w.agent === "string" ? w.agent : undefined, parts: [{ type: "text", text: TOOL_TEXT_RECOVERY_PROMPT }] },
-                                })
-                                recordContinue(sid)
-                                w.lastRetryAt = Date.now()
+                                await sendContinuePrompt(sid, TOOL_TEXT_RECOVERY_PROMPT, w)
                                 await log("info", `${short(sid)} - tool-call-as-text recovery sent (attempt ${w.toolTextAttempts})`)
                             } catch (err) {
                                 const errMsg = err instanceof Error ? err.message : String(err)
@@ -428,12 +454,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                             await tryAbortAndResume(sid, w)
                         } else {
                             try {
-                                await ctx.client.session.prompt({
-                                    path: { id: sid },
-                                    body: { agent: typeof w.agent === "string" ? w.agent : undefined, parts: [{ type: "text", text: "continue" }] },
-                                })
-                                recordContinue(sid)
-                                w.lastRetryAt = Date.now()
+                                await sendContinuePrompt(sid, "continue", w)
                                 await log("info", `${short(sid)} - ready-to-continue recovery sent (attempt ${w.toolTextAttempts})`)
                             } catch (err) {
                                 const errMsg = err instanceof Error ? err.message : String(err)
@@ -477,13 +498,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         if (w.status === "busy") w.status = "idle"
 
         try {
-            await ctx.client.session.prompt({
-                path: { id: sid },
-                body: { agent: typeof w.agent === "string" ? w.agent : undefined, parts: [{ type: "text", text: "continue" }] },
-            })
-            recordContinue(sid)
+            await sendContinuePrompt(sid, "continue", w)
             await log("info", `${short(sid)} - abort+continue done`)
-            w.lastRetryAt = Date.now()
             w.orphanWatchStartAt = null
             w.resumeAttempts++
             w.aborting = false
@@ -519,15 +535,9 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         const idleSec = Math.round((now - w.lastActivityAt) / 1000)
         await log("info", `${reason} on ${short(sid)} (${idleSec}s, retry ${w.resumeAttempts}/${maxRetries})`)
 
-        const agent = typeof w.agent === "string" ? w.agent : undefined
         try {
-            await ctx.client.session.prompt({
-                path: { id: sid },
-                body: { agent, model: true, parts: [{ type: "text", text: "continue" }] },
-            })
-            recordContinue(sid)
+            await sendContinuePrompt(sid, "continue", w)
             await log("info", `${short(sid)} - retry sent`)
-            w.lastRetryAt = now
             return true
         } catch (err) {
             const errMsg = err instanceof Error ? err.message : String(err)
@@ -537,44 +547,10 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         }
     }
 
-    async function getSessionAgent(sid: string): Promise<string | undefined> {
-        if (typeof sid !== "string" || !sid) return undefined
-        try {
-            const response = await ctx.client.session.messages({
-                path: { id: sid },
-            })
-            const data = response as Record<string, unknown>
-            let messages: Array<Record<string, unknown>> = []
-            if (Array.isArray(data)) {
-                messages = data
-            } else if (Array.isArray(data.data)) {
-                messages = data.data
-            } else if (Array.isArray(data.messages)) {
-                messages = data.messages
-            }
-            for (let i = messages.length - 1; i >= 0; i--) {
-                const msg = messages[i]
-                const role = msg.role as string | undefined
-                if (role === "assistant") {
-                    const agent = msg.agent as string | undefined
-                    if (agent) return agent
-                }
-            }
-        } catch {
-        }
-        return undefined
-    }
-
     async function discoverSessions() {
         try {
             const response = await ctx.client.session.list()
-            const data = response as Record<string, unknown>
-            let list: Array<Record<string, unknown>> = []
-            if (Array.isArray(data)) {
-                list = data
-            } else if (Array.isArray(data.data)) {
-                list = data.data
-            }
+            const list = extractMessages(response as Record<string, unknown>)
 
             for (const s of list) {
                 const sid = s.id as string
@@ -588,14 +564,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         if (status === "idle") w.idleSince = Date.now()
                     }
                     if (isNew) {
-                        const agent = await getSessionAgent(sid)
-                        if (agent) {
-                            const w = sessions.get(sid)!
-                            w.agent = agent
-                            log("debug", `Discovered session ${short(sid)} with agent: ${agent}`)
-                        } else {
-                            log("debug", `Discovered session ${short(sid)} via list()`)
-                        }
+                        log("debug", `Discovered session ${short(sid)} via list()`)
                     }
                 }
             }
@@ -689,21 +658,11 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
                 if (statusType === "busy") {
                     w.lastActivityAt = Date.now()
-                    w.userCancelled = false
-                    w.resumeAttempts = 0
-                    w.gaveUp = false
-                    w.orphanWatchStartAt = null
-                    w.aborting = false
-                    w.toolTextRecovered = false
-                    w.toolTextAttempts = 0
-                    w.continueTimestamps = []
-                    w.idleSince = null
+                    resetSessionFlags(w)
                     log("debug", `${short(sid)} -> busy (${busyCount()})`)
                 } else if (statusType === "idle") {
                     w.status = "idle"
-                    w.userCancelled = false
-                    w.aborting = false
-                    w.idleSince = Date.now()
+                    resetIdleFlags(w)
 
                     const currentBusy = busyCount()
                     if (prevBusyCount > 1 && currentBusy === 1) {
@@ -746,10 +705,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 const w = sessions.get(sid)
                 if (w) {
                     w.status = "idle"
-                    w.userCancelled = false
-                    w.orphanWatchStartAt = null
-                    w.aborting = false
-                    w.idleSince = Date.now()
+                    resetIdleFlags(w)
 
                     // v8.0: Also check for tool-call-as-text on legacy idle event
                     if (!w.toolTextRecovered && w.toolTextAttempts < maxRetries) {
@@ -771,9 +727,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         if (w.status === "busy") {
                             w.userCancelled = true
                             w.status = "idle"
-                            w.orphanWatchStartAt = null
-                            w.aborting = false
-                            w.idleSince = Date.now()
+                            resetIdleFlags(w)
                         }
                     }
                     log("info", "User abort (ESC)")
@@ -791,13 +745,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
             case "command.executed": {
                 for (const [, w] of sessions) {
-                    w.userCancelled = false
-                    w.resumeAttempts = 0
-                    w.gaveUp = false
-                    w.orphanWatchStartAt = null
-                    w.aborting = false
-                    w.toolTextRecovered = false
-                    w.toolTextAttempts = 0
+                    resetSessionFlags(w)
                 }
                 break
             }

@@ -1,6 +1,6 @@
 {
   "name": "opencode-auto-resume",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "OpenCode plugin that automatically resumes stalled LLM sessions when thinking/streaming freezes mid-generation.",
   "keywords": [
     "opencode",

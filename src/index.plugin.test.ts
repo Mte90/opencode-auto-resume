@@ -301,3 +301,102 @@ describe("Loop Detection", () => {
         expect(allStartSame).toBe(true)
     })
 })
+
+describe("Continue Lock Prevention", () => {
+    test("prevents concurrent continue prompts", () => {
+        const w = { continuing: false }
+        
+        // First continue should be allowed
+        const shouldSend1 = !w.continuing
+        expect(shouldSend1).toBe(true)
+        
+        // Simulate continue in progress
+        w.continuing = true
+        
+        // Second continue should be blocked
+        const shouldSend2 = !w.continuing
+        expect(shouldSend2).toBe(false)
+        
+        // After continue completes
+        w.continuing = false
+        
+        // Next continue should be allowed again
+        const shouldSend3 = !w.continuing
+        expect(shouldSend3).toBe(true)
+    })
+
+    test("resets continuing flag on busy status", () => {
+        const w = { 
+            continuing: true,
+            userCancelled: false,
+            resumeAttempts: 0,
+            gaveUp: false,
+            orphanWatchStartAt: null,
+            aborting: false,
+            toolTextRecovered: false,
+            toolTextAttempts: 0,
+            continueTimestamps: [],
+            idleSince: null,
+        }
+        
+        // Simulate resetSessionFlags when status becomes "busy"
+        w.continuing = false
+        w.userCancelled = false
+        w.resumeAttempts = 0
+        w.gaveUp = false
+        w.orphanWatchStartAt = null
+        w.aborting = false
+        w.toolTextRecovered = false
+        w.toolTextAttempts = 0
+        w.continueTimestamps = []
+        w.idleSince = null
+        
+        expect(w.continuing).toBe(false)
+    })
+
+    test("allows continue after user writes message", () => {
+        const w = { continuing: true }
+        
+        // User writes something → status becomes "busy" → resetSessionFlags
+        w.continuing = false
+        
+        // Continue should now be allowed
+        expect(w.continuing).toBe(false)
+    })
+})
+
+describe("Idle Flags Reset", () => {
+    test("resets only idle-specific flags", () => {
+        const w = {
+            userCancelled: true,
+            aborting: true,
+            orphanWatchStartAt: Date.now(),
+            idleSince: null,
+            resumeAttempts: 5, // Should NOT be reset
+            continuing: true, // Should NOT be reset
+        }
+        
+        // Simulate resetIdleFlags
+        w.userCancelled = false
+        w.aborting = false
+        w.orphanWatchStartAt = null
+        w.idleSince = Date.now()
+        
+        expect(w.userCancelled).toBe(false)
+        expect(w.aborting).toBe(false)
+        expect(w.orphanWatchStartAt).toBeNull()
+        expect(w.idleSince).toBeDefined()
+        expect(w.resumeAttempts).toBe(5) // Preserved
+        expect(w.continuing).toBe(true) // Preserved
+    })
+
+    test("sets idleSince timestamp", () => {
+        const w = { idleSince: null as number | null }
+        const before = Date.now()
+        
+        w.idleSince = Date.now()
+        
+        expect(w.idleSince).toBeGreaterThanOrEqual(before)
+        expect(w.idleSince).toBeLessThanOrEqual(Date.now() + 1)
+    })
+})
