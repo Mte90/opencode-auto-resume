@@ -60,6 +60,11 @@ const TOOL_TEXT_RECOVERY_PROMPT =
     "Your last message contained a raw tool call printed as text instead of being executed. " +
     "Please use the proper tool calling mechanism to execute it."
 
+/** Recovery prompt for function calls stuck in thinking (ReasoningPart). */
+const THINKING_TOOL_RECOVERY_PROMPT =
+    "I noticed you have a tool call generated in your thinking/reasoning. " +
+    "Please execute it using the proper tool calling mechanism instead of keeping it in reasoning."
+
 // ---------------------------------------------------------------------------
 // Patterns that indicate a tool call was printed as text, not executed.
 // v8.0: Expanded to cover truncated tags, alternative formats, and partial XML.
@@ -413,15 +418,29 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 if (!parts) continue
 
                 for (const part of parts) {
-                    if (part.type !== "text") continue
-                    const text = (part.text as string) ?? ""
+                    const partType = part.type as string
+                    let text = ""
+                    let isReasoning = false
+
+                    if (partType === "text") {
+                        text = (part.text as string) ?? ""
+                    } else if (partType === "reasoning") {
+                        text = (part.text as string) ?? ""
+                        isReasoning = true
+                    } else {
+                        continue
+                    }
                     
                     if (containsToolCallAsText(text)) {
                         w.toolTextRecovered = true
                         w.toolTextAttempts++
+                        
+                        const prompt = isReasoning ? THINKING_TOOL_RECOVERY_PROMPT : TOOL_TEXT_RECOVERY_PROMPT
+                        const source = isReasoning ? "reasoning" : "text"
+                        
                         await log(
                             "info",
-                            `Tool-call-as-text detected on ${short(sid)}! ` +
+                            `Tool-call-as-text in ${source} detected on ${short(sid)}! ` +
                             `Attempt ${w.toolTextAttempts}/${maxRetries}. Sending recovery prompt...`
                         )
 
@@ -430,7 +449,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                             await tryAbortAndResume(sid, w)
                         } else {
                             try {
-                                await sendContinuePrompt(sid, TOOL_TEXT_RECOVERY_PROMPT, w)
+                                await sendContinuePrompt(sid, prompt, w)
                                 await log("info", `${short(sid)} - tool-call-as-text recovery sent (attempt ${w.toolTextAttempts})`)
                             } catch (err) {
                                 const errMsg = err instanceof Error ? err.message : String(err)
