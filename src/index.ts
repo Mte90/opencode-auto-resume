@@ -362,6 +362,36 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         return []
     }
 
+    async function checkSubagentCrashed(parentSid: string): Promise<boolean> {
+        try {
+            const response = await ctx.client.session.list()
+            const sessions = extractMessages(response as Record<string, unknown>)
+            
+            for (const s of sessions) {
+                const sId = s.id as string
+                if (!sId || sId === parentSid) continue
+                
+                const status = s.status as string
+                if (status === "busy") {
+                    const msgResponse = await ctx.client.session.messages({ path: { id: sId } })
+                    const messages = extractMessages(msgResponse as Record<string, unknown>)
+                    const lastMsg = messages[messages.length - 1]
+                    
+                    if (lastMsg && lastMsg.role === "assistant" && "error" in lastMsg) {
+                        const error = lastMsg.error as Record<string, unknown> | undefined
+                        const errorName = error?.name as string | undefined
+                        await log("debug", `Subagent ${short(sId)} appears crashed: ${errorName}`)
+                        return true
+                    }
+                }
+            }
+        } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err)
+            await log("debug", `checkSubagentCrashed failed: ${errMsg}`)
+        }
+        return false
+    }
+
     function resetSessionFlags(w: SessionWatch) {
         w.userCancelled = false
         w.resumeAttempts = 0
@@ -599,7 +629,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
     function startTimer() {
         if (timer) return
-        timer = setInterval(() => {
+        timer = setInterval(async () => {
             const now = Date.now()
             const numBusy = busyCount()
 
@@ -612,7 +642,13 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     const orphanIdle = now - w.orphanWatchStartAt
                     if (orphanIdle >= subagentWaitMs + gracePeriodMs) {
                         if (w.resumeAttempts < maxRetries) {
-                            tryAbortAndResume(sid, w)
+                            const crashed = await checkSubagentCrashed(sid)
+                            if (crashed) {
+                                await log("info", `Subagent crashed, triggering abort+resume on ${short(sid)}`)
+                                tryAbortAndResume(sid, w)
+                            } else {
+                                await log("debug", `Subagent still running, waiting...`)
+                            }
                         } else if (!w.gaveUp) {
                             w.gaveUp = true
                             w.orphanWatchStartAt = null
