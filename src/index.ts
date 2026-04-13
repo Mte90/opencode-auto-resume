@@ -344,12 +344,47 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         }
         w.continuing = true
         try {
+            let agent: string | undefined
+            let modelID: string | undefined
+            let providerID: string | undefined
+            
+            const msgResp = await ctx.client.session.messages({ path: { id: sid } })
+            const msgs = extractMessages(msgResp as Record<string, unknown>)
+            const lastMsg = msgs[msgs.length - 1]
+            if (lastMsg) {
+                const info = lastMsg.info as Record<string, unknown> | undefined
+                agent = info?.agent as string | undefined
+                if (lastMsg.role === "assistant") {
+                    modelID = lastMsg.modelID as string
+                    providerID = lastMsg.providerID as string
+                }
+            }
+            
             await ctx.client.session.prompt({
                 path: { id: sid },
                 body: { parts: [{ type: "text", text }] },
+                agent,
+                modelID,
+                providerID,
             })
+            await log("debug", `${short(sid)} - prompt sent with agent: ${agent}, model: ${modelID}`)
             recordContinue(sid)
             w.lastRetryAt = Date.now()
+        } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err)
+            await log("warn", `${short(sid)} - prompt failed: ${errMsg}`)
+            try {
+                await ctx.client.session.prompt({
+                    path: { id: sid },
+                    body: { parts: [{ type: "text", text }] },
+                })
+                recordContinue(sid)
+                w.lastRetryAt = Date.now()
+            } catch (retryErr) {
+                const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr)
+                await log("error", `${short(sid)} - prompt retry also failed: ${retryMsg}`)
+                throw retryErr
+            }
         } finally {
             w.continuing = false
         }
