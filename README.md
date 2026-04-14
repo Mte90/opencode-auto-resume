@@ -7,6 +7,8 @@
 LLM sessions fail in predictable ways. This plugin monitors all sessions and automatically recovers without user intervention.
 
 **Stall recovery** — the stream goes silent but the session stays "busy". The UI shows a blinking cursor with no progress. If no events arrive for 48 seconds, the plugin sends `"continue"` with exponential backoff. After 3 failed attempts it gives up.
+
+The plugin extracts the **agent, model, and provider** from the last session message, so it resumes with the exact same configuration the user was using (build, sisyphus, prometheus, etc.).
 _( [#55](https://github.com/opencode-ai/opencode/issues/55), [#199](https://github.com/opencode-ai/opencode/issues/199), [#283](https://github.com/opencode-ai/opencode/issues/283) )_
 
 **Tool calls as raw text** — the model prints tool invocations as raw XML (`<function=edit>...`) instead of executing them. The session goes idle normally but the tool was never run. On idle, the plugin fetches the last messages and scans for XML tool-call patterns (including truncated and alternative formats). If found, it sends a specific recovery prompt.
