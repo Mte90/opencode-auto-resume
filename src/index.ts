@@ -345,29 +345,48 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         w.continuing = true
         try {
             let agent: string | undefined
-            let modelID: string | undefined
-            let providerID: string | undefined
-            
+            let model: { providerID: string; modelID: string } | undefined
+
             const msgResp = await ctx.client.session.messages({ path: { id: sid } })
             const msgs = extractMessages(msgResp as Record<string, unknown>)
-            const lastMsg = msgs[msgs.length - 1]
-            if (lastMsg) {
-                const info = lastMsg.info as Record<string, unknown> | undefined
-                agent = info?.agent as string | undefined
-                if (lastMsg.role === "assistant") {
-                    modelID = lastMsg.modelID as string
-                    providerID = lastMsg.providerID as string
+
+            // Walk backwards to find the last UserMessage — it carries the
+            // agent/model the user selected in the UI.  AssistantMessage has
+            // no `agent` field and its model fields are what the provider
+            // resolved to, not what the user chose.
+            for (let i = msgs.length - 1; i >= 0; i--) {
+                const msg = msgs[i]
+                const info = msg.info as Record<string, unknown> | undefined
+                if (info?.role === "user") {
+                    const rawAgent = info.agent
+                    if (typeof rawAgent === "string") agent = rawAgent
+                    const rawModel = info.model as Record<string, unknown> | undefined
+                    if (
+                        rawModel &&
+                        typeof rawModel.providerID === "string" &&
+                        typeof rawModel.modelID === "string"
+                    ) {
+                        model = {
+                            providerID: rawModel.providerID,
+                            modelID: rawModel.modelID,
+                        }
+                    }
+                    break
                 }
             }
-            
+
             await ctx.client.session.prompt({
                 path: { id: sid },
-                body: { parts: [{ type: "text", text }] },
-                agent,
-                modelID,
-                providerID,
+                body: {
+                    parts: [{ type: "text", text }],
+                    agent,
+                    model,
+                },
             })
-            await log("debug", `${short(sid)} - prompt sent with agent: ${agent}, model: ${modelID}`)
+            await log(
+                "debug",
+                `${short(sid)} - prompt sent with agent: ${agent ?? "(default)"}, model: ${model ? `${model.providerID}/${model.modelID}` : "(default)"}`,
+            )
             recordContinue(sid)
             w.lastRetryAt = Date.now()
         } catch (err) {
@@ -376,7 +395,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             try {
                 await ctx.client.session.prompt({
                     path: { id: sid },
-                    body: { parts: [{ type: "text", text }] },
+                    body: { parts: [{ type: "text", text }], agent, model },
                 })
                 recordContinue(sid)
                 w.lastRetryAt = Date.now()
@@ -397,34 +416,44 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         return []
     }
 
-    async function checkSubagentCrashed(parentSid: string): Promise<boolean> {
+        async function checkSubagentStatus(parentSid: string): Promise<"crashed" | "idle" | "busy" | "unknown"> {
         try {
             const response = await ctx.client.session.list()
-            const sessions = extractMessages(response as Record<string, unknown>)
-            
-            for (const s of sessions) {
+            const allSessions = extractMessages(response as Record<string, unknown>)
+
+            let hasBusySubagent = false
+
+            for (const s of allSessions) {
                 const sId = s.id as string
                 if (!sId || sId === parentSid) continue
-                
+
                 const status = s.status as string
+
                 if (status === "busy") {
+                    hasBusySubagent = true
                     const msgResponse = await ctx.client.session.messages({ path: { id: sId } })
                     const messages = extractMessages(msgResponse as Record<string, unknown>)
                     const lastMsg = messages[messages.length - 1]
-                    
-                    if (lastMsg && lastMsg.role === "assistant" && "error" in lastMsg) {
-                        const error = lastMsg.error as Record<string, unknown> | undefined
-                        const errorName = error?.name as string | undefined
-                        await log("debug", `Subagent ${short(sId)} appears crashed: ${errorName}`)
-                        return true
+
+                    const rawRole = (lastMsg?.role ?? (lastMsg?.info as Record<string, unknown> | undefined)?.role) as string | undefined
+                    if (lastMsg && rawRole === "assistant" && ("error" in lastMsg || (lastMsg.info && "error" in (lastMsg.info as Record<string, unknown>)))) {
+                        await log("debug", `Subagent ${short(sId)} appears crashed`)
+                        return "crashed"
                     }
                 }
             }
+
+            // All subagents are idle (or no subagents exist) — parent is orphaned
+            if (!hasBusySubagent) {
+                return "idle"
+            }
+
+            return "busy"
         } catch (err) {
             const errMsg = err instanceof Error ? err.message : String(err)
-            await log("debug", `checkSubagentCrashed failed: ${errMsg}`)
+            await log("debug", `checkSubagentStatus failed: ${errMsg}`)
+            return "unknown"
         }
-        return false
     }
 
     function resetSessionFlags(w: SessionWatch) {
@@ -452,7 +481,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     // specific recovery prompt)
     // -----------------------------------------------------------------------
 
-    async function checkForToolCallAsText(sid: string, w: SessionWatch) {
+        async function checkForToolCallAsText(sid: string, w: SessionWatch) {
         if (typeof sid !== "string" || !sid) return
         if (w.userCancelled || w.toolTextRecovered) return
 
@@ -475,9 +504,19 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             const messages = extractMessages(response as Record<string, unknown>)
             const recent = messages.slice(-3)
 
+            // Prioritise tool-call-as-text in reasoning over ready-to-continue
+            // in text parts: collect all candidates first, then act on the
+            // highest-priority one.
+            let bestCandidate: {
+                prompt: string
+                source: string
+                priority: number // lower = higher priority
+            } | null = null
+
             for (const msg of recent) {
-                const role = msg.role as string | undefined
-                if (role !== "assistant") continue
+                // Role may be at msg.role OR msg.info.role depending on API shape
+                const rawRole = (msg.role ?? (msg.info as Record<string, unknown> | undefined)?.role) as string | undefined
+                if (rawRole !== "assistant") continue
 
                 const parts = msg.parts as Array<Record<string, unknown>> | undefined
                 if (!parts) continue
@@ -495,58 +534,52 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     } else {
                         continue
                     }
-                    
+
                     if (containsToolCallAsText(text)) {
-                        w.toolTextRecovered = true
-                        w.toolTextAttempts++
-                        
-                        const prompt = isReasoning ? THINKING_TOOL_RECOVERY_PROMPT : TOOL_TEXT_RECOVERY_PROMPT
-                        const source = isReasoning ? "reasoning" : "text"
-                        
-                        await log(
-                            "info",
-                            `Tool-call-as-text in ${source} detected on ${short(sid)}! ` +
-                            `Attempt ${w.toolTextAttempts}/${maxRetries}. Sending recovery prompt...`
-                        )
-
-                        if (isHallucinationLoop(sid)) {
-                            await log("warn", `Hallucination loop detected on ${short(sid)} — aborting instead`)
-                            await tryAbortAndResume(sid, w)
-                        } else {
-                            try {
-                                await sendContinuePrompt(sid, prompt, w)
-                                await log("info", `${short(sid)} - tool-call-as-text recovery sent (attempt ${w.toolTextAttempts})`)
-                            } catch (err) {
-                                const errMsg = err instanceof Error ? err.message : String(err)
-                                await log("warn", `${short(sid)} - tool-call-as-text recovery failed: ${errMsg}`)
-                            }
+                        const candidate = {
+                            prompt: isReasoning ? THINKING_TOOL_RECOVERY_PROMPT : TOOL_TEXT_RECOVERY_PROMPT,
+                            source: isReasoning ? "reasoning" : "text",
+                            priority: 0,
                         }
-                        return
+                        if (!bestCandidate || candidate.priority < bestCandidate.priority) {
+                            bestCandidate = candidate
+                        }
                     }
-                    
+
                     if (containsReadyToContinuePattern(text)) {
-                        w.toolTextRecovered = true
-                        w.toolTextAttempts++
-                        await log(
-                            "info",
-                            `Ready-to-continue pattern detected on ${short(sid)}! ` +
-                            `Attempt ${w.toolTextAttempts}/${maxRetries}. Sending continue...`
-                        )
-
-                        if (isHallucinationLoop(sid)) {
-                            await log("warn", `Hallucination loop detected on ${short(sid)} — aborting instead`)
-                            await tryAbortAndResume(sid, w)
-                        } else {
-                            try {
-                                await sendContinuePrompt(sid, "continue", w)
-                                await log("info", `${short(sid)} - ready-to-continue recovery sent (attempt ${w.toolTextAttempts})`)
-                            } catch (err) {
-                                const errMsg = err instanceof Error ? err.message : String(err)
-                                await log("warn", `${short(sid)} - ready-to-continue recovery failed: ${errMsg}`)
-                            }
+                        const candidate = {
+                            prompt: "continue",
+                            source: "ready-to-continue",
+                            priority: 1,
                         }
-                        return
+                        if (!bestCandidate || candidate.priority < bestCandidate.priority) {
+                            bestCandidate = candidate
+                        }
                     }
+                }
+            }
+
+            if (!bestCandidate) return
+
+            w.toolTextRecovered = true
+            w.toolTextAttempts++
+
+            await log(
+                "info",
+                `${bestCandidate.source} detected on ${short(sid)}! ` +
+                `Attempt ${w.toolTextAttempts}/${maxRetries}. Sending recovery prompt...`,
+            )
+
+            if (isHallucinationLoop(sid)) {
+                await log("warn", `Hallucination loop detected on ${short(sid)} — aborting instead`)
+                await tryAbortAndResume(sid, w)
+            } else {
+                try {
+                    await sendContinuePrompt(sid, bestCandidate.prompt, w)
+                    await log("info", `${short(sid)} - ${bestCandidate.source} recovery sent (attempt ${w.toolTextAttempts})`)
+                } catch (err) {
+                    const errMsg = err instanceof Error ? err.message : String(err)
+                    await log("warn", `${short(sid)} - ${bestCandidate.source} recovery failed: ${errMsg}`)
                 }
             }
         } catch (err) {
@@ -677,9 +710,12 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     const orphanIdle = now - w.orphanWatchStartAt
                     if (orphanIdle >= subagentWaitMs + gracePeriodMs) {
                         if (w.resumeAttempts < maxRetries) {
-                            const crashed = await checkSubagentCrashed(sid)
-                            if (crashed) {
+                            const subStatus = await checkSubagentStatus(sid)
+                            if (subStatus === "crashed") {
                                 await log("info", `Subagent crashed, triggering abort+resume on ${short(sid)}`)
+                                tryAbortAndResume(sid, w)
+                            } else if (subStatus === "idle") {
+                                await log("info", `All subagents idle, parent ${short(sid)} stuck. Triggering abort+resume.`)
                                 tryAbortAndResume(sid, w)
                             } else {
                                 await log("debug", `Subagent still running, waiting...`)
