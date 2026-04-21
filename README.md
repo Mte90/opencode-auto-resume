@@ -30,6 +30,12 @@ _( [#128](https://github.com/opencode-ai/opencode/pulls/128), [#22](https://gith
 
 **Session discovery** — periodically calls `session.list()` to pick up sessions that were missed by event tracking. Idle sessions are cleaned up after 10 minutes to prevent memory leaks.
 
+**Model preservation** — when resuming with "continue", the plugin extracts agent, model and provider from the last session message (not from `info` field) to preserve the user's UI selection.
+_( [#111](https://github.com/opencode-ai/opencode/issues/111), [#277](https://github.com/opencode-ai/opencode/issues/277) )_
+
+**Subagent stuck detection** — detects when a subagent hasn't received new text for >1 minute (or >3 minutes if a tool call is in progress). If stuck, sends a recovery prompt before triggering abort+resume on the parent.
+_( [#55](https://github.com/opencode-ai/opencode/issues/55), [#60](https://github.com/opencode-ai/opencode/issues/60), [#246](https://github.com/opencode-ai/opencode/issues/246) )_
+
 ## Architecture
 
 ```

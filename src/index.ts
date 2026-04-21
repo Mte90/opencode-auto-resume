@@ -356,11 +356,21 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             // resolved to, not what the user chose.
             for (let i = msgs.length - 1; i >= 0; i--) {
                 const msg = msgs[i]
-                const info = msg.info as Record<string, unknown> | undefined
-                if (info?.role === "user") {
-                    const rawAgent = info.agent
+                const role =
+                    (msg.role as string) ??
+                    ((msg.info as Record<string, unknown> | undefined)?.role as string)
+                if (role === "user") {
+                    const rawAgent = msg.agent as string | undefined
                     if (typeof rawAgent === "string") agent = rawAgent
-                    const rawModel = info.model as Record<string, unknown> | undefined
+
+                    let rawModel = msg.model as
+                        | { providerID: string; modelID: string }
+                        | undefined
+                    if (!rawModel) {
+                        rawModel = (msg.info as Record<string, unknown> | undefined)?.model as
+                            | { providerID: string; modelID: string }
+                            | undefined
+                    }
                     if (
                         rawModel &&
                         typeof rawModel.providerID === "string" &&
@@ -416,10 +426,30 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         return []
     }
 
-        async function checkSubagentStatus(parentSid: string): Promise<"crashed" | "idle" | "busy" | "unknown"> {
+        const SUBAGENT_STUCK_MS = 60_000
+
+    const SUBAGENT_RECOVERY_PROMPT = "It looks like you may have stalled or timed out. Please retry the last operation or continue with the task."
+
+    async function recoverSubagent(subagentSid: string): Promise<boolean> {
+        try {
+            await ctx.client.session.prompt({
+                path: { id: subagentSid },
+                body: { parts: [{ type: "text", text: SUBAGENT_RECOVERY_PROMPT }] },
+            })
+            await log("info", `Sent recovery prompt to subagent ${short(subagentSid)}`)
+            return true
+        } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err)
+            await log("warn", `Failed to recover subagent ${short(subagentSid)}: ${errMsg}`)
+            return false
+        }
+    }
+
+    async function checkSubagentStatus(parentSid: string): Promise<{ status: "crashed" | "idle" | "busy" | "unknown"; stuckSid?: string }> {
         try {
             const response = await ctx.client.session.list()
             const allSessions = extractMessages(response as Record<string, unknown>)
+            const now = Date.now()
 
             let hasBusySubagent = false
 
@@ -440,19 +470,31 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         await log("debug", `Subagent ${short(sId)} appears crashed`)
                         return "crashed"
                     }
+
+                    const msgTime = (lastMsg?.time as Record<string, number> | undefined)?.created ?? (lastMsg?.time as number | undefined)
+                    const hasToolCall = (lastMsg?.toolCall as Record<string, unknown> | undefined) !== undefined
+                        || (lastMsg?.tool_calls as Record<string, unknown> | undefined) !== undefined
+                        || (lastMsg?.parts as Record<string, unknown> | undefined)?.some((p: Record<string, unknown>) => p.type === "tool-call")
+                        !== undefined
+                    const isStuck = hasToolCall
+                        ? now - msgTime > SUBAGENT_STUCK_MS * 3
+                        : now - msgTime > SUBAGENT_STUCK_MS
+                    if (isStuck) {
+                        await log("debug", `Subagent ${short(sId)} stuck - no new text in >${hasToolCall ? 3 : 1}min`)
+                        return { status: "crashed", stuckSid: sId }
+                    }
                 }
             }
 
-            // All subagents are idle (or no subagents exist) — parent is orphaned
             if (!hasBusySubagent) {
-                return "idle"
+                return { status: "idle" }
             }
 
-            return "busy"
+            return { status: "busy" }
         } catch (err) {
             const errMsg = err instanceof Error ? err.message : String(err)
             await log("debug", `checkSubagentStatus failed: ${errMsg}`)
-            return "unknown"
+            return { status: "unknown" }
         }
     }
 
@@ -711,10 +753,15 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     if (orphanIdle >= subagentWaitMs + gracePeriodMs) {
                         if (w.resumeAttempts < maxRetries) {
                             const subStatus = await checkSubagentStatus(sid)
-                            if (subStatus === "crashed") {
-                                await log("info", `Subagent crashed, triggering abort+resume on ${short(sid)}`)
-                                tryAbortAndResume(sid, w)
-                            } else if (subStatus === "idle") {
+                            if (subStatus.status === "crashed" && subStatus.stuckSid) {
+                                const recovered = await recoverSubagent(subStatus.stuckSid)
+                                if (recovered) {
+                                    await log("info", `Sent recovery prompt to stuck subagent ${short(subStatus.stuckSid)}, waiting...`)
+                                } else {
+                                    await log("info", `Subagent crashed, triggering abort+resume on ${short(sid)}`)
+                                    tryAbortAndResume(sid, w)
+                                }
+                            } else if (subStatus.status === "idle") {
                                 await log("info", `All subagents idle, parent ${short(sid)} stuck. Triggering abort+resume.`)
                                 tryAbortAndResume(sid, w)
                             } else {
@@ -731,6 +778,24 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 }
 
                 if (numBusy > 1) continue
+
+                if (w.lastActivityAt > 0 && (now - w.lastActivityAt) > subagentWaitMs) {
+                    const subStatus = await checkSubagentStatus(sid)
+                    if (subStatus.status === "idle" || subStatus.status === "unknown") {
+                        await log("info", `Parent ${short(sid)} stuck with no active subagents. Triggering abort+resume.`)
+                        tryAbortAndResume(sid, w)
+                        continue
+                    } else if (subStatus.status === "crashed" && subStatus.stuckSid) {
+                        const recovered = await recoverSubagent(subStatus.stuckSid)
+                        if (recovered) {
+                            await log("info", `Sent recovery prompt to stuck subagent ${short(subStatus.stuckSid)}, waiting...`)
+                        } else {
+                            await log("info", `Parent ${short(sid)} subagent recovery failed. Triggering abort+resume.`)
+                            tryAbortAndResume(sid, w)
+                        }
+                        continue
+                    }
+                }
 
                 const idle = now - w.lastActivityAt
                 if (idle >= chunkTimeoutMs + gracePeriodMs) {
