@@ -1,6 +1,6 @@
 # opencode-auto-resume
 
-**Plugin for [OpenCode](https://github.com/opencode-ai/opencode) that automatically detects and recovers from LLM session failures — stalls, broken tool calls, hallucination loops, and stuck subagent parents. Fully silent, zero UI pollution.**
+**Plugin for [OpenCode](https://github.com/anomalyco/opencode) that automatically detects and recovers from LLM session failures — stalls, broken tool calls, hallucination loops, and stuck subagent parents. Fully silent, zero UI pollution.**
 
 ## What it does
 
@@ -9,32 +9,32 @@ LLM sessions fail in predictable ways. This plugin monitors all sessions and aut
 **Stall recovery** — the stream goes silent but the session stays "busy". The UI shows a blinking cursor with no progress. If no events arrive for 48 seconds, the plugin sends `"continue"` with exponential backoff. After 3 failed attempts it gives up.
 
 The plugin extracts the **agent, model, and provider** from the last session message, so it resumes with the exact same configuration the user was using (build, sisyphus, prometheus, etc.).
-_( [#55](https://github.com/opencode-ai/opencode/issues/55), [#199](https://github.com/opencode-ai/opencode/issues/199), [#283](https://github.com/opencode-ai/opencode/issues/283) )_
+_( [#55](https://github.com/anomalyco/opencode/issues/55), [#199](https://github.com/anomalyco/opencode/issues/199), [#283](https://github.com/anomalyco/opencode/issues/283) )_
 
 **Tool calls as raw text** — the model prints tool invocations as raw XML (`<function=edit>...`) instead of executing them. The session goes idle normally but the tool was never run. On idle, the plugin fetches the last messages and scans for XML tool-call patterns (including truncated and alternative formats). If found, it sends a specific recovery prompt.
-_( [#150](https://github.com/opencode-ai/opencode/issues/150), [#313](https://github.com/opencode-ai/opencode/issues/313), [#353](https://github.com/opencode-ai/opencode/issues/353) )_
+_( [#150](https://github.com/anomalyco/opencode/issues/150), [#313](https://github.com/anomalyco/opencode/issues/313), [#353](https://github.com/anomalyco/opencode/issues/353) )_
 
 **Hallucination loop** — the model generates the same broken output repeatedly. Each continue just picks up the broken generation. If a session needs 3+ continues within 10 minutes, the plugin aborts the request and sends `"continue"` fresh, forcing a clean restart.
-_( [#283](https://github.com/opencode-ai/opencode/issues/283), [#353](https://github.com/opencode-ai/opencode/issues/353) )_
+_( [#283](https://github.com/anomalyco/opencode/issues/283), [#353](https://github.com/anomalyco/opencode/issues/353) )_
 
 **Orphan parent** — a subagent finishes but the parent session stays stuck as "busy" forever. The plugin detects when busyCount drops from >1 to 1, waits 15 seconds, then aborts and resumes the parent.
-_( [#122](https://github.com/opencode-ai/opencode/issues/122), [#199](https://github.com/opencode-ai/opencode/issues/199), [#246](https://github.com/opencode-ai/opencode/issues/246) )_
+_( [#122](https://github.com/anomalyco/opencode/issues/122), [#199](https://github.com/anomalyco/opencode/issues/199), [#246](https://github.com/anomalyco/opencode/issues/246) )_
 
 **False positives during subagent work** — long tool execution or active subagents can look like a stall. Only the session emitting events gets its timer reset (not all sessions). When multiple sessions are busy, stall detection is paused entirely.
-_( [#55](https://github.com/opencode-ai/opencode/issues/55), [#221](https://github.com/opencode-ai/opencode/issues/221) )_
+_( [#55](https://github.com/anomalyco/opencode/issues/55), [#221](https://github.com/anomalyco/opencode/issues/221) )_
 
 **ESC cancel** — user presses ESC to cancel a request. The plugin detects `MessageAbortedError` and marks all busy sessions as cancelled, never resuming them.
 
 **Spurious error messages** — after normal completion, OpenCode sometimes fires a `session.error`. All logging goes through `ctx.client.app.log()` (zero `console.log`), and errors on already-idle sessions are silently ignored.
-_( [#128](https://github.com/opencode-ai/opencode/pulls/128), [#22](https://github.com/opencode-ai/opencode/pulls/22) )_
+_( [#128](https://github.com/anomalyco/opencode/pulls/128), [#22](https://github.com/anomalyco/opencode/pulls/22) )_
 
 **Session discovery** — periodically calls `session.list()` to pick up sessions that were missed by event tracking. Idle sessions are cleaned up after 10 minutes to prevent memory leaks.
 
 **Model preservation** — when resuming with "continue", the plugin extracts agent, model and provider from the last session message (not from `info` field) to preserve the user's UI selection.
-_( [#111](https://github.com/opencode-ai/opencode/issues/111), [#277](https://github.com/opencode-ai/opencode/issues/277) )_
+_( [#111](https://github.com/anomalyco/opencode/issues/111), [#277](https://github.com/anomalyco/opencode/issues/277) )_
 
 **Subagent stuck detection** — detects when a subagent hasn't received new text for >1 minute (or >3 minutes if a tool call is in progress). If stuck, sends a recovery prompt before triggering abort+resume on the parent.
-_( [#55](https://github.com/opencode-ai/opencode/issues/55), [#60](https://github.com/opencode-ai/opencode/issues/60), [#246](https://github.com/opencode-ai/opencode/issues/246) )_
+_( [#55](https://github.com/anomalyco/opencode/issues/55), [#60](https://github.com/anomalyco/opencode/issues/60), [#246](https://github.com/anomalyco/opencode/issues/246) )_
 
 ## Architecture
 

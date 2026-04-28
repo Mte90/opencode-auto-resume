@@ -350,10 +350,6 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             const msgResp = await ctx.client.session.messages({ path: { id: sid } })
             const msgs = extractMessages(msgResp as Record<string, unknown>)
 
-            // Walk backwards to find the last UserMessage — it carries the
-            // agent/model the user selected in the UI.  AssistantMessage has
-            // no `agent` field and its model fields are what the provider
-            // resolved to, not what the user chose.
             for (let i = msgs.length - 1; i >= 0; i--) {
                 const msg = msgs[i]
                 const role =
@@ -361,7 +357,14 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     ((msg.info as Record<string, unknown> | undefined)?.role as string)
                 if (role === "user") {
                     const rawAgent = msg.agent as string | undefined
-                    if (typeof rawAgent === "string") agent = rawAgent
+                    if (typeof rawAgent === "string") {
+                        agent = rawAgent
+                    } else {
+                        const fallbackAgent = (msg.info as Record<string, unknown> | undefined)?.agent as string | undefined
+                        if (typeof fallbackAgent === "string") {
+                            agent = fallbackAgent
+                        }
+                    }
 
                     let rawModel = msg.model as
                         | { providerID: string; modelID: string }
@@ -958,12 +961,14 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
         config: async () => {
             log("info", `opencode-auto-resume config OK`)
-            ctx.ui.toast({
-                title: "Auto-Resume Plugin",
-                message: `Loaded with ${chunkTimeoutMs}ms timeout, ${loopMaxContinues} loop attempts`,
-                variant: "success",
-                duration: 5000
-            })
+            if (ctx.ui && typeof ctx.ui.toast === "function") {
+                ctx.ui.toast({
+                    title: "Auto-Resume Plugin",
+                    message: `Loaded with ${chunkTimeoutMs}ms timeout, ${loopMaxContinues} loop attempts`,
+                    variant: "success",
+                    duration: 5000
+                })
+            }
         },
     }
 }
