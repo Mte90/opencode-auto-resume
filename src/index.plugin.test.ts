@@ -400,3 +400,105 @@ describe("Idle Flags Reset", () => {
         expect(w.idleSince).toBeLessThanOrEqual(Date.now() + 1)
     })
 })
+
+describe("Todo-Based Continue Guard", () => {
+    interface Todo { content: string; status: string; priority: string }
+
+    function hasOpenTodos(todos: Todo[]): boolean {
+        return todos.some(t => t.status === "pending" || t.status === "in_progress")
+    }
+
+    function shouldSendContinue(todos: Todo[], todoCheckAttempts: number): { send: boolean; prompt: string } {
+        const open = hasOpenTodos(todos)
+        if (!open && todos.length > 0) {
+            if (todoCheckAttempts >= 2) {
+                return { send: true, prompt: "Please close all completed todos and finish your message." }
+            }
+            return { send: false, prompt: "" }
+        }
+        return { send: true, prompt: "continue" }
+    }
+
+    test("sends continue when todos are still open", () => {
+        const todos: Todo[] = [
+            { content: "Task 1", status: "completed", priority: "high" },
+            { content: "Task 2", status: "in_progress", priority: "high" },
+            { content: "Task 3", status: "pending", priority: "medium" },
+        ]
+        const result = shouldSendContinue(todos, 0)
+        expect(result.send).toBe(true)
+        expect(result.prompt).toBe("continue")
+    })
+
+    test("skips continue when all todos completed on first attempt", () => {
+        const todos: Todo[] = [
+            { content: "Task 1", status: "completed", priority: "high" },
+            { content: "Task 2", status: "completed", priority: "high" },
+        ]
+        const result = shouldSendContinue(todos, 0)
+        expect(result.send).toBe(false)
+    })
+
+    test("skips continue when all todos completed on second attempt", () => {
+        const todos: Todo[] = [
+            { content: "Task 1", status: "completed", priority: "high" },
+        ]
+        const result = shouldSendContinue(todos, 1)
+        expect(result.send).toBe(false)
+    })
+
+    test("sends todo reminder on third attempt when all completed", () => {
+        const todos: Todo[] = [
+            { content: "Task 1", status: "completed", priority: "high" },
+            { content: "Task 2", status: "completed", priority: "medium" },
+        ]
+        const result = shouldSendContinue(todos, 2)
+        expect(result.send).toBe(true)
+        expect(result.prompt).toBe("Please close all completed todos and finish your message.")
+    })
+
+    test("sends continue when no todos exist", () => {
+        const result = shouldSendContinue([], 0)
+        expect(result.send).toBe(true)
+        expect(result.prompt).toBe("continue")
+    })
+
+    test("treats cancelled todos as closed", () => {
+        const todos: Todo[] = [
+            { content: "Task 1", status: "completed", priority: "high" },
+            { content: "Task 2", status: "cancelled", priority: "low" },
+        ]
+        const result = shouldSendContinue(todos, 0)
+        expect(result.send).toBe(false)
+    })
+
+    test("detects open pending todo", () => {
+        const todos: Todo[] = [
+            { content: "Task 1", status: "completed", priority: "high" },
+            { content: "Task 2", status: "pending", priority: "medium" },
+        ]
+        expect(hasOpenTodos(todos)).toBe(true)
+    })
+
+    test("detects open in_progress todo", () => {
+        const todos: Todo[] = [
+            { content: "Task 1", status: "in_progress", priority: "high" },
+        ]
+        expect(hasOpenTodos(todos)).toBe(true)
+    })
+
+    test("no open todos when all completed", () => {
+        const todos: Todo[] = [
+            { content: "Task 1", status: "completed", priority: "high" },
+            { content: "Task 2", status: "completed", priority: "medium" },
+        ]
+        expect(hasOpenTodos(todos)).toBe(false)
+    })
+
+    test("no open todos when all cancelled", () => {
+        const todos: Todo[] = [
+            { content: "Task 1", status: "cancelled", priority: "high" },
+        ]
+        expect(hasOpenTodos(todos)).toBe(false)
+    })
+})

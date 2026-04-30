@@ -12,6 +12,12 @@ import { tool } from "@opencode-ai/plugin"
 // Types
 // ---------------------------------------------------------------------------
 
+interface Todo {
+    content: string
+    status: "pending" | "in_progress" | "completed" | "cancelled"
+    priority: "high" | "medium" | "low"
+}
+
 interface SessionWatch {
     lastActivityAt: number
     status: "busy" | "idle" | "retry" | "unknown"
@@ -26,6 +32,8 @@ interface SessionWatch {
     continueTimestamps: number[]
     idleSince: number | null
     continuing: boolean
+    todos: Todo[]
+    todoCheckAttempts: number
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +234,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 continueTimestamps: [],
                 idleSince: null,
                 continuing: false,
+                todos: [],
+                todoCheckAttempts: 0,
             }
             sessions.set(sid, w)
         }
@@ -558,8 +568,9 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 priority: number // lower = higher priority
             } | null = null
 
+            let allAssistantText = ""
+
             for (const msg of recent) {
-                // Role may be at msg.role OR msg.info.role depending on API shape
                 const rawRole = (msg.role ?? (msg.info as Record<string, unknown> | undefined)?.role) as string | undefined
                 if (rawRole !== "assistant") continue
 
@@ -580,6 +591,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         continue
                     }
 
+                    allAssistantText += text + "\n"
+
                     if (containsToolCallAsText(text)) {
                         const candidate = {
                             prompt: isReasoning ? THINKING_TOOL_RECOVERY_PROMPT : TOOL_TEXT_RECOVERY_PROMPT,
@@ -592,6 +605,29 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     }
 
                     if (containsReadyToContinuePattern(text)) {
+                        // Check if todos exist and are all completed/cancelled
+                        const todos = w.todos || []
+                        const hasOpenTodos = todos.some(t => t.status === "pending" || t.status === "in_progress")
+                        
+                        if (!hasOpenTodos && todos.length > 0) {
+                            // Todos exist but all are completed - check if we've tried enough times
+                            w.todoCheckAttempts++
+                            if (w.todoCheckAttempts >= 2) {
+                                await log("info", `${short(sid)} - todos completed but agent hasn't closed them. Sending reminder...`)
+                                const candidate = {
+                                    prompt: "Please close all completed todos and finish your message.",
+                                    source: "todo-reminder",
+                                    priority: 1,
+                                }
+                                if (!bestCandidate || candidate.priority < bestCandidate.priority) {
+                                    bestCandidate = candidate
+                                }
+                                continue
+                            }
+                            await log("info", `${short(sid)} - skipping continue, todos appear completed (attempt ${w.todoCheckAttempts}/2)`)
+                            continue
+                        }
+                        
                         const candidate = {
                             prompt: "continue",
                             source: "ready-to-continue",
@@ -907,6 +943,22 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                             checkForToolCallAsText(sid, w)
                         }, TOOL_TEXT_CHECK_DELAY_MS)
                     }
+                }
+                break
+            }
+
+            case "todo.updated": {
+                if (!sid) break
+                const props = ev.properties as Record<string, unknown> | undefined
+                const todos = (props?.todos as Array<Record<string, unknown>>) ?? []
+                
+                const w = sessions.get(sid)
+                if (w) {
+                    w.todos = todos.map((t) => ({
+                        content: (t.content as string) ?? "",
+                        status: (t.status as Todo["status"]) ?? "pending",
+                        priority: (t.priority as Todo["priority"]) ?? "medium",
+                    }))
                 }
                 break
             }
