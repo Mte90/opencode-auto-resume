@@ -24,7 +24,6 @@ interface SessionWatch {
     userCancelled: boolean
     resumeAttempts: number
     lastRetryAt: number
-    gaveUp: boolean
     orphanWatchStartAt: number | null
     aborting: boolean
     toolTextRecovered: boolean
@@ -34,6 +33,8 @@ interface SessionWatch {
     continuing: boolean
     todos: Todo[]
     todoCheckAttempts: number
+    toolRunningSince: number | null
+    lastToolOutputAt: number | null
 }
 
 // ---------------------------------------------------------------------------
@@ -43,9 +44,9 @@ interface SessionWatch {
 const DEFAULT_CHUNK_TIMEOUT_MS = 45_000
 const DEFAULT_CHECK_INTERVAL_MS = 5_000
 const DEFAULT_GRACE_PERIOD_MS = 3_000
-const DEFAULT_MAX_RETRIES = 3
-const DEFAULT_MAX_BACKOFF_MS = 8_000
-const DEFAULT_BASE_BACKOFF_MS = 1_000
+const DEFAULT_MAX_TOOL_TEXT_RETRIES = 3
+const DEFAULT_MAX_BACKOFF_MS = 600_000
+const DEFAULT_BASE_BACKOFF_MS = 30_000
 const DEFAULT_SUBAGENT_WAIT_MS = 15_000
 const ABORT_CONTINUE_DELAY_MS = 2_000
 const DEFAULT_LOOP_MAX_CONTINUES = 3
@@ -159,8 +160,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     (options?.checkIntervalMs as number) ?? DEFAULT_CHECK_INTERVAL_MS
     const gracePeriodMs: number =
     (options?.gracePeriodMs as number) ?? DEFAULT_GRACE_PERIOD_MS
-    const maxRetries: number =
-    (options?.maxRetries as number) ?? DEFAULT_MAX_RETRIES
+    const maxToolTextRetries: number =
+    (options?.maxRetries as number) ?? DEFAULT_MAX_TOOL_TEXT_RETRIES
     const maxBackoffMs: number =
     (options?.maxBackoffMs as number) ?? DEFAULT_MAX_BACKOFF_MS
     const baseBackoffMs: number =
@@ -226,7 +227,6 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 userCancelled: false,
                 resumeAttempts: 0,
                 lastRetryAt: 0,
-                gaveUp: false,
                 orphanWatchStartAt: null,
                 aborting: false,
                 toolTextRecovered: false,
@@ -236,6 +236,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 continuing: false,
                 todos: [],
                 todoCheckAttempts: 0,
+                toolRunningSince: null,
+                lastToolOutputAt: null,
             }
             sessions.set(sid, w)
         }
@@ -514,7 +516,6 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     function resetSessionFlags(w: SessionWatch) {
         w.userCancelled = false
         w.resumeAttempts = 0
-        w.gaveUp = false
         w.orphanWatchStartAt = null
         w.aborting = false
         w.toolTextRecovered = false
@@ -522,6 +523,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         w.continueTimestamps = []
         w.idleSince = null
         w.continuing = false
+        w.toolRunningSince = null
+        w.lastToolOutputAt = null
     }
 
     function resetIdleFlags(w: SessionWatch) {
@@ -548,7 +551,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         }
 
         // v8.0: Cap tool-text attempts like regular retries
-        if (w.toolTextAttempts >= maxRetries) return
+        if (w.toolTextAttempts >= maxToolTextRetries) return
 
         await log("debug", `${short(sid)} - checking for tool-call-as-text (attempt ${w.toolTextAttempts + 1})`)
 
@@ -648,7 +651,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             await log(
                 "info",
                 `${bestCandidate.source} detected on ${short(sid)}! ` +
-                `Attempt ${w.toolTextAttempts}/${maxRetries}. Sending recovery prompt...`,
+                `Attempt ${w.toolTextAttempts}/${maxToolTextRetries}. Sending recovery prompt...`,
             )
 
             if (isHallucinationLoop(sid)) {
@@ -700,11 +703,13 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             await log("info", `${short(sid)} - abort+continue done`)
             w.orphanWatchStartAt = null
             w.resumeAttempts++
+            w.lastRetryAt = Date.now()
             w.aborting = false
             return true
         } catch (err) {
             const errMsg = err instanceof Error ? err.message : String(err)
             await log("warn", `${short(sid)} - continue after abort failed: ${errMsg}`)
+            w.lastRetryAt = Date.now()
             w.aborting = false
             return false
         }
@@ -731,7 +736,11 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
         w.resumeAttempts++
         const idleSec = Math.round((now - w.lastActivityAt) / 1000)
-        await log("info", `${reason} on ${short(sid)} (${idleSec}s, retry ${w.resumeAttempts}/${maxRetries})`)
+        const backoffSec = Math.round(requiredBackoff / 1000)
+        const toolInfo = w.toolRunningSince
+            ? ` (tool running for ${Math.round((now - w.toolRunningSince) / 1000)}s)`
+            : ""
+        await log("info", `${reason} on ${short(sid)} (${idleSec}s idle, retry #${w.resumeAttempts}, next backoff ${backoffSec}s)${toolInfo}`)
 
         try {
             await sendContinuePrompt(sid, "continue", w)
@@ -790,33 +799,55 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 if (w.orphanWatchStartAt !== null) {
                     const orphanIdle = now - w.orphanWatchStartAt
                     if (orphanIdle >= subagentWaitMs + gracePeriodMs) {
-                        if (w.resumeAttempts < maxRetries) {
-                            const subStatus = await checkSubagentStatus(sid)
-                            if (subStatus.status === "crashed" && subStatus.stuckSid) {
-                                const recovered = await recoverSubagent(subStatus.stuckSid)
-                                if (recovered) {
-                                    await log("info", `Sent recovery prompt to stuck subagent ${short(subStatus.stuckSid)}, waiting...`)
-                                } else {
-                                    await log("info", `Subagent crashed, triggering abort+resume on ${short(sid)}`)
-                                    tryAbortAndResume(sid, w)
-                                }
-                            } else if (subStatus.status === "idle") {
-                                await log("info", `All subagents idle, parent ${short(sid)} stuck. Triggering abort+resume.`)
-                                tryAbortAndResume(sid, w)
+                        const elapsedSinceRetry = now - w.lastRetryAt
+                        const requiredBackoff = backoffMs(w.resumeAttempts)
+                        if (w.lastRetryAt > 0 && elapsedSinceRetry < requiredBackoff) {
+                            continue
+                        }
+                        const subStatus = await checkSubagentStatus(sid)
+                        if (subStatus.status === "crashed" && subStatus.stuckSid) {
+                            const recovered = await recoverSubagent(subStatus.stuckSid)
+                            if (recovered) {
+                                await log("info", `Sent recovery prompt to stuck subagent ${short(subStatus.stuckSid)}, waiting...`)
                             } else {
-                                await log("debug", `Subagent still running, waiting...`)
+                                await log("info", `Subagent crashed, triggering abort+resume on ${short(sid)}`)
+                                tryAbortAndResume(sid, w)
                             }
-                        } else if (!w.gaveUp) {
-                            w.gaveUp = true
-                            w.orphanWatchStartAt = null
-                            w.aborting = false
-                            log("warn", `${short(sid)} - orphan retries exhausted.`)
+                        } else if (subStatus.status === "idle") {
+                            await log("info", `All subagents idle, parent ${short(sid)} stuck. Triggering abort+resume.`)
+                            tryAbortAndResume(sid, w)
+                        } else {
+                            await log("debug", `Subagent still running, waiting...`)
                         }
                     }
                     continue
                 }
 
-                if (numBusy > 1) continue
+                if (numBusy > 1) {
+                    const idle = now - w.lastActivityAt
+                    const multiBusyTimeout = chunkTimeoutMs * 4 + gracePeriodMs
+                    if (idle >= multiBusyTimeout) {
+                        const elapsedSinceRetry = now - w.lastRetryAt
+                        const requiredBackoff = backoffMs(w.resumeAttempts)
+                        if (!(w.lastRetryAt > 0 && elapsedSinceRetry < requiredBackoff)) {
+                            await log("info", `Multi-session stall on ${short(sid)} (${Math.round(idle / 1000)}s idle, ${numBusy} busy). Checking subagent status.`)
+                            const subStatus = await checkSubagentStatus(sid)
+                            if (subStatus.status === "crashed" && subStatus.stuckSid) {
+                                const recovered = await recoverSubagent(subStatus.stuckSid)
+                                if (recovered) {
+                                    await log("info", `Recovered stuck subagent ${short(subStatus.stuckSid)} during multi-busy stall.`)
+                                    w.lastRetryAt = now
+                                }
+                            } else if (subStatus.status === "idle") {
+                                await log("info", `No active subagents for ${short(sid)} during multi-busy stall. Triggering abort+resume.`)
+                                tryAbortAndResume(sid, w)
+                            } else {
+                                tryResume(sid, w, "Multi-session stall")
+                            }
+                        }
+                    }
+                    continue
+                }
 
                 if (w.lastActivityAt > 0 && (now - w.lastActivityAt) > subagentWaitMs) {
                     const subStatus = await checkSubagentStatus(sid)
@@ -838,16 +869,10 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
                 const idle = now - w.lastActivityAt
                 if (idle >= chunkTimeoutMs + gracePeriodMs) {
-                    if (w.resumeAttempts < maxRetries) {
-                        tryResume(sid, w, "Stream stall")
-                    } else if (!w.gaveUp) {
-                        w.gaveUp = true
-                        log("warn", `${short(sid)} - all ${maxRetries} retries exhausted.`)
-                    }
+                    tryResume(sid, w, "Stream stall")
                 }
             }
 
-            // v8.0: Periodic cleanup
             cleanupIdleSessions()
         }, checkIntervalMs)
 
@@ -906,7 +931,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     log("debug", `${short(sid)} -> idle (${currentBusy})`)
 
                     // v8.0: TOOL-CALL-AS-TEXT CHECK — runs regardless of busyCount
-                    if (!w.toolTextRecovered && w.toolTextAttempts < maxRetries) {
+                    if (!w.toolTextRecovered && w.toolTextAttempts < maxToolTextRetries) {
                         setTimeout(() => {
                             checkForToolCallAsText(sid, w)
                         }, TOOL_TEXT_CHECK_DELAY_MS)
@@ -938,10 +963,38 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     resetIdleFlags(w)
 
                     // v8.0: Also check for tool-call-as-text on legacy idle event
-                    if (!w.toolTextRecovered && w.toolTextAttempts < maxRetries) {
+                    if (!w.toolTextRecovered && w.toolTextAttempts < maxToolTextRetries) {
                         setTimeout(() => {
                             checkForToolCallAsText(sid, w)
                         }, TOOL_TEXT_CHECK_DELAY_MS)
+                    }
+                }
+                break
+            }
+
+            case "message.part.updated": {
+                if (!sid) break
+                const w = sessions.get(sid)
+                if (!w) break
+                const props = ev.properties as Record<string, unknown> | undefined
+                const part = (props?.part ?? ev.part) as Record<string, unknown> | undefined
+                if (!part) break
+
+                const partType = part.type as string | undefined
+
+                if (partType === "tool" || partType === "tool-invocation") {
+                    const state = (part.state ?? part.toolInvocation) as Record<string, unknown> | undefined
+                    const status = (state?.status ?? state?.state) as string | undefined
+
+                    if (status === "running" || status === "call") {
+                        if (!w.toolRunningSince) {
+                            w.toolRunningSince = Date.now()
+                            log("debug", `${short(sid)} - tool call started running`)
+                        }
+                    } else if (status === "completed" || status === "error" || status === "result") {
+                        w.toolRunningSince = null
+                        w.lastToolOutputAt = Date.now()
+                        log("debug", `${short(sid)} - tool call ended (${status})`)
                     }
                 }
                 break
@@ -1006,7 +1059,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         event: async ({ event }) => {
             if (!initialised) {
                 initialised = true
-                log("info", `opencode-auto-resume ready. timeout=${chunkTimeoutMs}ms, orphan=${subagentWaitMs}ms, loop=${loopMaxContinues}x/${loopWindowMs / 1000}s`)
+                log("info", `opencode-auto-resume ready. timeout=${chunkTimeoutMs / 1000}s, backoff=${baseBackoffMs / 1000}s-${maxBackoffMs / 1000}s, continuous retry, orphan=${subagentWaitMs / 1000}s, loop=${loopMaxContinues}x/${loopWindowMs / 1000}s`)
             }
             handleEvent(event as Record<string, unknown>)
         },
@@ -1016,7 +1069,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             if (ctx.ui && typeof ctx.ui.toast === "function") {
                 ctx.ui.toast({
                     title: "Auto-Resume Plugin",
-                    message: `Loaded with ${chunkTimeoutMs}ms timeout, ${loopMaxContinues} loop attempts`,
+                    message: `Loaded: ${chunkTimeoutMs / 1000}s timeout, continuous retry (${baseBackoffMs / 1000}s-${maxBackoffMs / 1000}s backoff)`,
                     variant: "success",
                     duration: 5000
                 })

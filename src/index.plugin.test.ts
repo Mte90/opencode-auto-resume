@@ -105,27 +105,27 @@ describe("Resume Logic", () => {
 
     test("calculates exponential backoff", () => {
         function backoffMs(attempt: number): number {
-            return Math.min(5000 * Math.pow(2, attempt), 160000)
+            return Math.min(30000 * Math.pow(2, attempt - 1), 600000)
         }
         
-        expect(backoffMs(0)).toBe(5000)
-        expect(backoffMs(1)).toBe(10000)
-        expect(backoffMs(2)).toBe(20000)
-        expect(backoffMs(3)).toBe(40000)
-        expect(backoffMs(4)).toBe(80000)
-        expect(backoffMs(5)).toBe(160000)
-        expect(backoffMs(10)).toBe(160000)
+        expect(backoffMs(1)).toBe(30000)
+        expect(backoffMs(2)).toBe(60000)
+        expect(backoffMs(3)).toBe(120000)
+        expect(backoffMs(4)).toBe(240000)
+        expect(backoffMs(5)).toBe(480000)
+        expect(backoffMs(6)).toBe(600000)
+        expect(backoffMs(10)).toBe(600000)
     })
 
     test("blocks retry during backoff period", () => {
         const now = Date.now()
-        const lastRetryAt = now - 3000
-        const backoff = 5000
+        const lastRetryAt = now - 10000
+        const backoff = 30000
         
         const canRetry = (now - lastRetryAt) >= backoff
         expect(canRetry).toBe(false)
         
-        const later = now + 3000
+        const later = now + 25000
         const canRetryLater = (later - lastRetryAt) >= backoff
         expect(canRetryLater).toBe(true)
     })

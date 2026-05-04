@@ -5,8 +5,7 @@ function short(id: string): string {
 }
 
 function backoffMs(attempt: number): number {
-    // v8.0: exponential backoff: 5s, 10s, 20s, 40s, 80s, 160s
-    return Math.min(5000 * Math.pow(2, attempt), 160000)
+    return Math.min(30000 * Math.pow(2, attempt - 1), 600000)
 }
 
 function getSid(ev: Record<string, unknown>): string | undefined {
@@ -52,20 +51,22 @@ describe("short()", () => {
 // -----------------------------------------------------------------------
 
 describe("backoffMs()", () => {
-    test("returns 5000ms for attempt 0", () => {
-        expect(backoffMs(0)).toBe(5000)
+    test("returns 30000ms for attempt 1 (first retry)", () => {
+        expect(backoffMs(1)).toBe(30000)
     })
 
-    test("doubles each attempt (0-indexed)", () => {
-        expect(backoffMs(1)).toBe(10000)
-        expect(backoffMs(2)).toBe(20000)
-        expect(backoffMs(3)).toBe(40000)
-        expect(backoffMs(4)).toBe(80000)
+    test("doubles each attempt (1-indexed)", () => {
+        expect(backoffMs(1)).toBe(30000)
+        expect(backoffMs(2)).toBe(60000)
+        expect(backoffMs(3)).toBe(120000)
+        expect(backoffMs(4)).toBe(240000)
+        expect(backoffMs(5)).toBe(480000)
     })
 
-    test("caps at 160000ms (160s)", () => {
-        expect(backoffMs(10)).toBe(160000)
-        expect(backoffMs(100)).toBe(160000)
+    test("caps at 600000ms (10 minutes)", () => {
+        expect(backoffMs(6)).toBe(600000)
+        expect(backoffMs(10)).toBe(600000)
+        expect(backoffMs(100)).toBe(600000)
     })
 })
 

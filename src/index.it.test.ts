@@ -91,20 +91,20 @@ describe("Plugin Core Logic", () => {
 
         test("detects when backoff is required", () => {
             function backoffMs(attempt: number): number {
-                return Math.min(5000 * Math.pow(2, attempt), 160000)
+                return Math.min(30000 * Math.pow(2, attempt - 1), 600000)
             }
 
-            expect(backoffMs(0)).toBe(5000)
-            expect(backoffMs(1)).toBe(10000)
+            expect(backoffMs(1)).toBe(30000)
+            expect(backoffMs(2)).toBe(60000)
             
             const now = Date.now()
-            const lastRetryAt = now - 3000
+            const lastRetryAt = now - 10000
             const elapsed = now - lastRetryAt
-            expect(elapsed < backoffMs(0)).toBe(true)
+            expect(elapsed < backoffMs(1)).toBe(true)
             
-            const lastRetryAt2 = now - 10000
+            const lastRetryAt2 = now - 40000
             const elapsed2 = now - lastRetryAt2
-            expect(elapsed2 >= backoffMs(0)).toBe(true)
+            expect(elapsed2 >= backoffMs(1)).toBe(true)
         })
     })
 
