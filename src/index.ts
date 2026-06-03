@@ -112,15 +112,32 @@ const READY_TO_CONTINUE_PATTERNS = [
     /moving on to task/i,
 ]
 
+/**
+ * Strip fenced code blocks (``` ... ```) and inline code (`...`) from text
+ * before scanning for tool-call patterns, to avoid false positives when
+ * the assistant is explaining or documenting XML tool syntax.
+ */
+function stripCodeBlocks(text: string): string {
+    // Remove fenced code blocks (``` ... ```) including language hints
+    let stripped = text.replace(/```[\s\S]*?```/g, "")
+    // Remove inline code (`...`)
+    stripped = stripped.replace(/`[^`\n]+`/g, "")
+    return stripped
+}
+
 function containsToolCallAsText(text: string): boolean {
     if (text.length <= 10) return false
 
+    // Strip code blocks before pattern matching to avoid false positives
+    // on documentation/explanation text that contains XML examples.
+    const stripped = stripCodeBlocks(text)
+
     // Check direct pattern matches
-    if (TOOL_TEXT_PATTERNS.some((pat) => pat.test(text))) return true
+    if (TOOL_TEXT_PATTERNS.some((pat) => pat.test(stripped))) return true
 
     // Check for truncated XML: opening tag present but no closing tag
     for (const { open, close } of TRUNCATED_XML_PATTERNS) {
-        if (open.test(text) && !close.test(text)) return true
+        if (open.test(stripped) && !close.test(stripped)) return true
     }
 
     return false
