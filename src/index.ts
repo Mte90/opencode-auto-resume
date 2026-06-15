@@ -660,10 +660,10 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                             // Todos exist but all are completed - check if we've tried enough times
                             w.todoCheckAttempts++
                             if (w.todoCheckAttempts >= 2) {
-                                await log("info", `${short(sid)} - todos completed but agent hasn't closed them. Sending reminder...`)
+                                await log("info", `${short(sid)} - todos completed but agent hasn't closed them. Sending continue...`)
                                 const candidate = {
-                                    prompt: "Please close all completed todos and finish your message.",
-                                    source: "todo-reminder",
+                                    prompt: "continue",
+                                    source: "todo-completed-continue",
                                     priority: 1,
                                 }
                                 if (!bestCandidate || candidate.priority < bestCandidate.priority) {
@@ -744,7 +744,10 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     // -----------------------------------------------------------------------
 
     async function tryAbortAndResume(sid: string, w: SessionWatch): Promise<boolean> {
-        if (typeof sid !== "string" || !sid) return false
+        if (typeof sid !== "string" || !sid || !sid.startsWith("ses_")) {
+            await log("warn", `Invalid sid for abort: ${sid} (must start with "ses_")`)
+            return false
+        }
         if (w.aborting) return false
         w.aborting = true
 
