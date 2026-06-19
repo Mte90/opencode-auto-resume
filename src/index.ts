@@ -79,7 +79,7 @@ const THINKING_TOOL_RECOVERY_PROMPT =
 
 // ---------------------------------------------------------------------------
 // Patterns that indicate a tool call was printed as text, not executed.
-// v8.0: Expanded to cover truncated tags, alternative formats, and partial XML.
+// Expanded to cover truncated tags, alternative formats, and partial XML.
 // ---------------------------------------------------------------------------
 
 const TOOL_TEXT_PATTERNS = [
@@ -172,7 +172,9 @@ const DONE_CLAIM_PATTERNS = [
     /^finished[.!]*$/im,
     /^complete[.!]*$/im,
     /^task\s+complete[.!]*$/im,
+    /^task\s+completed[.!]*$/im,
     /^all\s+tasks?\s+complete[.!]*$/im,
+    /^all\s+tasks?\s+completed[.!]*$/im,
     /^(?:i['']?m\s+)?done\s+with\s+task/im,
 ]
 
@@ -219,7 +221,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     let prevBusyCount = 0
 
     // -----------------------------------------------------------------
-    // Per-session hallucination loop detection (v8.0)
+    // Per-session hallucination loop detection
     // -----------------------------------------------------------------
 
     function recordContinue(sid: string): void {
@@ -286,7 +288,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         return w
     }
 
-    /** v8.0: Only touch the specific session that emitted the event.
+    /** Only touch the specific session that emitted the event.
      *  Previously this reset ALL busy sessions, masking real stalls
      *  when a subagent was active. */
     function touchSession(sid: string) {
@@ -356,7 +358,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         return Math.min(baseBackoffMs * Math.pow(2, attempt - 1), maxBackoffMs)
     }
 
-    /** v8.0: Clean up idle sessions that have been idle too long. */
+    /** Clean up idle sessions that have been idle too long. */
     function cleanupIdleSessions() {
         const now = Date.now()
         const toDelete: string[] = []
@@ -593,7 +595,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     }
 
     // -----------------------------------------------------------------------
-    // Tool-call-as-text detection (v8.0: no busyCount guard, backoff,
+    // Tool-call-as-text detection: no busyCount guard, backoff,
     // specific recovery prompt)
     // -----------------------------------------------------------------------
 
@@ -604,14 +606,14 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         if (w.checkingToolText) return
         w.checkingToolText = true
 
-        // v8.0: Backoff for tool-text recovery
+        // Backoff for tool-text recovery
         if (w.toolTextAttempts > 0) {
             const elapsed = Date.now() - w.lastRetryAt
             const requiredBackoff = backoffMs(w.toolTextAttempts)
             if (elapsed < requiredBackoff) return
         }
 
-        // v8.0: Cap tool-text attempts like regular retries
+        // Cap tool-text attempts like regular retries
         if (w.toolTextAttempts >= maxRetries) return
 
         await log("debug", `${short(sid)} - checking for tool-call-as-text (attempt ${w.toolTextAttempts + 1})`)
@@ -724,6 +726,22 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                             bestCandidate = candidate
                         }
                     }
+                    
+                    // Also trigger on done-claim patterns even without "ready to continue" text
+                    // This catches cases where model says "task completed" but doesn't use 🎉 or tool_call
+                    if (!bestCandidate && containsDoneClaimPattern(text)) {
+                        const todos = w.todos || []
+                        const hasOpenTodos = todos.some(t => t.status === "pending" || t.status === "in_progress")
+                        
+                        if (hasOpenTodos) {
+                            await log("info", `${short(sid)} - model claims done but todos remain open. Sending recovery prompt...`)
+                            bestCandidate = {
+                                prompt: DONE_WITHOUT_WORK_PROMPT,
+                                source: "done-claim-no-emoji",
+                                priority: 1,
+                            }
+                        }
+                    }
                 }
             }
 
@@ -735,6 +753,22 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 w.toolTextRecovered = true
                 if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
                 return
+            }
+
+            // AUTO-CONTINUE when todos exist and are open, but model just stopped
+            if (!bestCandidate) {
+                const todos = w.todos || []
+                const hasOpenTodos = todos.some(t => t.status === "pending" || t.status === "in_progress")
+                
+                if (hasOpenTodos) {
+                    // Model stopped without any signal, but work remains
+                    await log("info", `${short(sid)} - no activity detected but todos remain open (${todos.filter(t => t.status === "pending" || t.status === "in_progress").length} tasks). Sending continue...`)
+                    bestCandidate = {
+                        prompt: "continue",
+                        source: "idle-with-open-todos",
+                        priority: 2,
+                    }
+                }
             }
 
             if (!bestCandidate) return
@@ -882,7 +916,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     }
 
     // -----------------------------------------------------------------------
-    // Timer (v8.0: cleanup + session discovery)
+    // Timer: cleanup + session discovery)
     // -----------------------------------------------------------------------
 
     function startTimer() {
@@ -960,13 +994,13 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 }
             }
 
-            // v8.0: Periodic cleanup
+            // Periodic cleanup
             cleanupIdleSessions()
         }, checkIntervalMs)
 
         if (timer.unref) timer.unref()
 
-        // v8.0: Periodic session discovery
+        // Periodic session discovery
         discoveryTimer = setInterval(() => {
             discoverSessions()
         }, SESSION_DISCOVERY_INTERVAL_MS)
@@ -986,7 +1020,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         const type = ev.type as string
         const sid = getSid(ev)
 
-        // v8.0: Only touch the session that emitted the event
+        // Only touch the session that emitted the event
         if (sid) {
             touchSession(sid)
         }
@@ -1018,7 +1052,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     prevBusyCount = currentBusy
                     log("debug", `${short(sid)} -> idle (${currentBusy})${statusType === "interrupted" ? " (interrupted)" : ""}`)
 
-                    // v8.0: TOOL-CALL-AS-TEXT CHECK — runs regardless of busyCount
+                    // TOOL-CALL-AS-TEXT CHECK — runs regardless of busyCount
                     if (!w.toolTextRecovered && w.toolTextAttempts < maxRetries) {
                         if (w.toolTextTimer) clearTimeout(w.toolTextTimer)
                         // If interrupted, check immediately (no delay) since generation was cut off
@@ -1053,7 +1087,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     w.status = "idle"
                     resetIdleFlags(w)
 
-                    // v8.0: Also check for tool-call-as-text on legacy idle event
+                    // Also check for tool-call-as-text on legacy idle event
                     if (!w.toolTextRecovered && w.toolTextAttempts < maxRetries) {
                         if (w.toolTextTimer) clearTimeout(w.toolTextTimer)
                         w.toolTextTimer = setTimeout(() => {

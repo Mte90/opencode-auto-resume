@@ -5,7 +5,7 @@ function short(id: string): string {
 }
 
 function backoffMs(attempt: number): number {
-    // v8.0: exponential backoff: 5s, 10s, 20s, 40s, 80s, 160s
+    // exponential backoff: 5s, 10s, 20s, 40s, 80s, 160s
     return Math.min(5000 * Math.pow(2, attempt), 160000)
 }
 
