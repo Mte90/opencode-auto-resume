@@ -1,16 +1,10 @@
 /**
  * OpenCode Auto-Resume Plugin
- *
- * Detects when an LLM session stalls mid-stream and automatically
- * sends a continuation prompt.
+ * Detects when an LLM session stalls mid-stream and automatically sends a continuation prompt.
  */
 
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
 
 interface Todo {
     content: string
@@ -45,11 +39,8 @@ interface SessionWatch {
     interruptedContinueCount: number
     recentToolCalls: ToolCallRecord[]
     toolLoopAttempts: number
+    isSubagent: boolean
 }
-
-// ---------------------------------------------------------------------------
-// Defaults
-// ---------------------------------------------------------------------------
 
 const DEFAULT_CHUNK_TIMEOUT_MS = 45_000
 const DEFAULT_CHECK_INTERVAL_MS = 5_000
@@ -61,41 +52,25 @@ const DEFAULT_SUBAGENT_WAIT_MS = 15_000
 const ABORT_CONTINUE_DELAY_MS = 2_000
 const DEFAULT_LOOP_MAX_CONTINUES = 3
 const DEFAULT_LOOP_WINDOW_MS = 10 * 60_000
-
-/** Delay after session goes idle before checking for tool-call-as-text. */
 const TOOL_TEXT_CHECK_DELAY_MS = 3_000
-
-/** Max idle sessions to keep in memory before cleanup. */
 const MAX_IDLE_SESSIONS = 50
-
-/** How long an idle session stays in memory before cleanup (10 min). */
 const IDLE_CLEANUP_MS = 10 * 60_000
-
-/** Interval for periodic session discovery via session.list(). */
 const SESSION_DISCOVERY_INTERVAL_MS = 60_000
 
-/** Specific recovery prompt for tool-call-as-text. */
 const TOOL_TEXT_RECOVERY_PROMPT =
     "Your last message contained a raw tool call printed as text instead of being executed. " +
     "Please use the proper tool calling mechanism to execute it."
 
-/** Recovery prompt for function calls stuck in thinking (ReasoningPart). */
 const THINKING_TOOL_RECOVERY_PROMPT =
     "I noticed you have a tool call generated in your thinking/reasoning. " +
     "Please execute it using the proper tool calling mechanism instead of keeping it in reasoning."
 
-/** Recovery prompt for tool call loops (same tool called repeatedly without progress). */
 const TOOL_LOOP_RECOVERY_PROMPT =
     "I notice you've been calling the same tool multiple times in a row without making progress. " +
     "Please step back and reassess your approach. Consider: " +
     "1) Are you stuck in a loop? 2) Do you need different information first? " +
     "3) Should you try a different tool or break the task into smaller steps? " +
     "Take a moment to think about what's blocking you and propose a different strategy."
-
-// ---------------------------------------------------------------------------
-// Patterns that indicate a tool call was printed as text, not executed.
-// Expanded to cover truncated tags, alternative formats, and partial XML.
-// ---------------------------------------------------------------------------
 
 const TOOL_TEXT_PATTERNS = [
     /<function\s*=/i,
@@ -175,10 +150,6 @@ function containsDoneClaimPattern(text: string): boolean {
     const lastLines = lines.slice(-3).join('\n')
     return DONE_CLAIM_PATTERNS.some((pat) => pat.test(lastLines))
 }
-
-// ---------------------------------------------------------------------------
-// Plugin
-// ---------------------------------------------------------------------------
 
 export const AutoResumePlugin: Plugin = async (ctx, options) => {
     const chunkTimeoutMs: number =
@@ -262,6 +233,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 interruptedContinueCount: 0,
                 recentToolCalls: [],
                 toolLoopAttempts: 0,
+                isSubagent: false,
             }
             sessions.set(sid, w)
         }
@@ -551,15 +523,18 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         w.gaveUp = false
         w.orphanWatchStartAt = null
         w.aborting = false
-        w.toolTextRecovered = false
+        // Only reset toolTextRecovered for subagents - parent sessions keep it if set
+        if (w.isSubagent) {
+            w.toolTextRecovered = false
+        }
         w.toolTextAttempts = 0
         w.continueTimestamps = []
         w.idleSince = null
         w.continuing = false
         w.todoCheckAttempts = 0
         w.checkingToolText = false
-        w.interruptedContinueCount = 0 // Reset interrupted continue counter on new activity
-        w.recentToolCalls = [] // Clear tool call history on new activity
+        w.interruptedContinueCount = 0
+        w.recentToolCalls = []
         w.toolLoopAttempts = 0
         if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
     }
@@ -1108,16 +1083,25 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         const lone = getLoneBusySession()
                         if (lone && lone.w.orphanWatchStartAt === null) {
                             lone.w.orphanWatchStartAt = Date.now()
+                            w.isSubagent = true
                             log("info", `Subagent finished, parent ${short(lone.sid)} stuck. Orphan watch (${subagentWaitMs / 1000}s).`)
                         }
                     }
                     prevBusyCount = currentBusy
                     log("debug", `${short(sid)} -> idle (${currentBusy})${statusType === "interrupted" ? " (interrupted)" : ""}`)
 
-                    // TOOL-CALL-AS-TEXT CHECK — runs regardless of busyCount
+                    if (!w.isSubagent) {
+                        const todos = w.todos || []
+                        const hasOpenTodos = todos.some(t => t.status === "pending" || t.status === "in_progress")
+                        
+                        if (hasOpenTodos && currentBusy === 1 && !w.toolTextRecovered) {
+                            await log("info", `${short(sid)} - idle with ${todos.filter(t => t.status === "pending" || t.status === "in_progress").length} open todos. Sending continue...`)
+                            tryResume(sid, w, "Idle with open todos")
+                        }
+                    }
+
                     if (!w.toolTextRecovered && w.toolTextAttempts < maxRetries) {
                         if (w.toolTextTimer) clearTimeout(w.toolTextTimer)
-                        // If interrupted, check immediately (no delay) since generation was cut off
                         const checkDelay = statusType === "interrupted" ? 500 : TOOL_TEXT_CHECK_DELAY_MS
                         w.toolTextTimer = setTimeout(() => {
                             checkForToolCallAsText(sid, w)
@@ -1262,9 +1246,13 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         execute: async (_args, ctx) => {
             const w = sessions.get(ctx.sessionID)
             if (w) {
-                w.toolTextRecovered = true
-                if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
-                log("info", `${short(ctx.sessionID)} - task_complete called, agent done`)
+                // Only set toolTextRecovered for PARENT sessions
+                // Subagents can call task_complete without blocking future continues
+                if (!w.isSubagent) {
+                    w.toolTextRecovered = true
+                    if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
+                }
+                log("info", `${short(ctx.sessionID)} - task_complete called, ${w.isSubagent ? 'subagent' : 'agent'} done`)
             }
             return "Task completion acknowledged. No further continuation will be sent."
         },
