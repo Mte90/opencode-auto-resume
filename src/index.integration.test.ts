@@ -159,6 +159,58 @@ describe("Plugin Integration", () => {
         await hooks.event({ event: { type: "message", sessionID: "session-1", properties: { delta: { text: "working" } } } })
         await hooks.event({ event: { type: "session.status", sessionID: "session-1", properties: { status: "idle" } } })
     })
+
+    test("string idle status schedules tool-text recovery", async () => {
+        const sid = "ses_tool_text"
+        const promptCalls: Array<{ sid: string; body: string }> = []
+        const ctx = {
+            client: {
+                app: {
+                    log: mock(async () => {})
+                },
+                session: {
+                    list: mock(async () => ({ data: [{ id: sid, status: "idle" }] })),
+                    messages: mock(async (input: { path?: { id: string }; id?: string }) => {
+                        const id = input.path?.id ?? input.id
+                        if (id !== sid) return []
+                        return [
+                            {
+                                role: "user",
+                                agent: "sisyphus",
+                                model: { providerID: "anthropic", modelID: "claude-3" },
+                            },
+                            {
+                                role: "assistant",
+                                parts: [
+                                    {
+                                        type: "text",
+                                        text: "<function=edit><parameter name=\"file\">src/index.ts</parameter>",
+                                    },
+                                ],
+                            },
+                        ]
+                    }),
+                    prompt: mock(async (config: { path: { id: string }; body: { parts: Array<{ text: string }> } }) => {
+                        promptCalls.push({
+                            sid: config.path.id,
+                            body: config.body.parts.map((part) => part.text).join(""),
+                        })
+                        return {}
+                    }),
+                    abort: mock(async () => ({})),
+                },
+            },
+        } as any
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, maxRetries: 1 })
+
+        await hooks.event({ event: { type: "session.status", sessionID: sid, properties: { status: "idle" } } })
+        await new Promise((resolve) => setTimeout(resolve, 3200))
+
+        expect(ctx.client.session.messages).toHaveBeenCalled()
+        expect(promptCalls).toHaveLength(1)
+        expect(promptCalls[0].sid).toBe(sid)
+        expect(promptCalls[0].body).toContain("raw tool call")
+    })
 })
 
 describe("Agent Extraction Flow", () => {

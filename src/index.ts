@@ -281,12 +281,15 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         )
     }
 
-    function getStatus(ev: Record<string, unknown>): Record<string, unknown> | undefined {
+    function getStatusType(ev: Record<string, unknown>): string {
         const props = ev.properties as Record<string, unknown> | undefined
-        return (
-            (ev.status as Record<string, unknown> | undefined) ??
-            (props?.status as Record<string, unknown> | undefined)
-        )
+        const rawStatus = ev.status ?? props?.status
+        if (typeof rawStatus === "string") return rawStatus
+        if (rawStatus && typeof rawStatus === "object") {
+            const type = (rawStatus as Record<string, unknown>).type
+            if (typeof type === "string") return type
+        }
+        return "unknown"
     }
 
     function short(sid: string): string {
@@ -1174,8 +1177,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         switch (type) {
             case "session.status": {
                 if (!sid) break
-                const status = getStatus(ev)
-                const statusType = (status?.type as string) ?? "unknown"
+                const statusType = getStatusType(ev)
                 const w = ensureWatch(sid)
                 w.status = statusType as SessionWatch["status"]
 
