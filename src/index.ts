@@ -712,6 +712,22 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     }
 
                     if (containsToolCallAsText(text)) {
+                        const toolMatch = text.match(/<function=([a-zA-Z_]+)/) || text.match(/<invoke\s+name=([a-zA-Z_]+)/) || text.match(/"name":\s*"([a-zA-Z_]+)/)
+                        if (toolMatch) {
+                            const toolName = toolMatch[1] || "unknown"
+                            const isLoop = trackToolCall(w, toolName)
+                            if (isLoop && w.toolLoopAttempts < 2) {
+                                w.toolLoopAttempts++
+                                const loopCandidate = {
+                                    prompt: TOOL_LOOP_RECOVERY_PROMPT,
+                                    source: "tool-text-loop",
+                                    priority: 0,
+                                }
+                                if (!bestCandidate || loopCandidate.priority < bestCandidate.priority) {
+                                    bestCandidate = loopCandidate
+                                }
+                            }
+                        }
                         const candidate = {
                             prompt: isReasoning ? THINKING_TOOL_RECOVERY_PROMPT : TOOL_TEXT_RECOVERY_PROMPT,
                             source: isReasoning ? "reasoning" : "text",
