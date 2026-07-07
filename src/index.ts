@@ -477,7 +477,6 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
     async function checkSessionHasActiveTool(sid: string): Promise<boolean> {
         try {
-            // First check: if the session itself is busy, it's likely executing a tool
             const listResponse = await ctx.client.session.list()
             const sessions = extractMessages(listResponse as Record<string, unknown>)
             const currentSession = sessions.find((s: Record<string, unknown>) => s.id === sid)
@@ -488,7 +487,6 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 return true
             }
             
-            // Second check: look for toolCall in recent messages (for edge cases)
             const response = await ctx.client.session.messages({ path: { id: sid } })
             const messages = extractMessages(response as Record<string, unknown>)
             const lastMsg = messages[messages.length - 1]
@@ -881,6 +879,12 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             }
 
             if (isHallucinationLoop(sid)) {
+                // Check if session has an active tool before aborting
+                const hasActiveTool = await checkSessionHasActiveTool(sid)
+                if (hasActiveTool) {
+                    await log("debug", `Session ${short(sid)} has active tool, skipping hallucination abort`)
+                    return
+                }
                 await log("warn", `Hallucination loop detected on ${short(sid)} — aborting instead`)
                 await tryAbortAndResume(sid, w)
             } else {
@@ -959,6 +963,13 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         if (w.lastRetryAt > 0 && elapsedSinceRetry < requiredBackoff) return false
 
         if (isHallucinationLoop(sid)) {
+            // Check if session has an active tool before aborting
+            const hasActiveTool = await checkSessionHasActiveTool(sid)
+            if (hasActiveTool) {
+                await log("debug", `Session ${short(sid)} has active tool, skipping hallucination abort`)
+                w.lastRetryAt = now
+                return false
+            }
             await log("warn", `Hallucination loop on ${short(sid)}! Aborting...`)
             return await tryAbortAndResume(sid, w)
         }
@@ -1017,6 +1028,20 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             const numBusy = busyCount()
 
             for (const [sid, w] of sessions) {
+                // Check real session status from API (not just local w.status)
+                try {
+                    const listResponse = await ctx.client.session.list()
+                    const allSessions = extractMessages(listResponse as Record<string, unknown>)
+                    const realSession = allSessions.find((s: Record<string, unknown>) => s.id === sid)
+                    const realStatus = realSession?.status as string | undefined
+                    
+                    // Sync local status with real status
+                    if (realStatus && realStatus !== w.status) {
+                        w.status = realStatus
+                        if (realStatus === "busy") w.idleSince = null
+                    }
+                } catch { /* ignore API errors */ }
+                
                 if (w.status !== "busy") continue
                 if (w.userCancelled) continue
                 if (w.aborting) continue
@@ -1062,11 +1087,22 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 w.lastSubagentCheckAt = now
 
                 if (w.lastActivityAt > 0 && (now - w.lastActivityAt) > subagentWaitMs) {
-                    // Check if main session has an active tool call - if so, don't abort
-                    // Long-running tools (aft_edit, bash, etc.) don't fire SSE events but are still working
-                    const hasActiveTool = await checkSessionHasActiveTool(sid)
+                    // Check real session status from API
+                try {
+                    const listResponse = await ctx.client.session.list()
+                const allSessions = extractMessages(listResponse as Record<string, unknown>)
+                    const realStatus = realSession?.status as string | undefined
+                    
+                    if (realStatus === "busy") {
+                    await log("debug", `Session ${short(sid)} is still busy (real status), skipping abort`)
+                    w.lastSubagentCheckAt = now
+                    continue
+                }
+            } catch { /* ignore API errors */ }
+            
+            const hasActiveTool = await checkSessionHasActiveTool(sid)
                     if (hasActiveTool) {
-                        await log("debug", `Parent ${short(sid)} has active tool call, skipping abort check`)
+                        await log("debug", `Session ${short(sid)} has active tool call, skipping abort check`)
                         w.lastSubagentCheckAt = now
                         continue
                     }
@@ -1090,7 +1126,12 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
                 const idle = now - w.lastActivityAt
                 if (idle >= chunkTimeoutMs + gracePeriodMs) {
-                    if (w.resumeAttempts < maxRetries) {
+                    // Check if main session has an active tool call - if so, don't resume
+                    const hasActiveTool = await checkSessionHasActiveTool(sid)
+                    if (hasActiveTool) {
+                        await log("debug", `Session ${short(sid)} has active tool call, skipping stall recovery`)
+                        w.lastSubagentCheckAt = now
+                    } else if (w.resumeAttempts < maxRetries) {
                         tryResume(sid, w, "Stream stall")
                     } else if (!w.gaveUp) {
                         w.gaveUp = true
