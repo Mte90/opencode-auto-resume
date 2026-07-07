@@ -31,11 +31,11 @@ jobs:
       - name: Run tests
         run: bun test
 
-      - name: Publish to npm
+      - name: Setup Node.js 24 (required for Trusted Publishing)
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org'
-        
-      - name: npm publish
-        run: npm publish --access public
+
+      - name: Publish to npm (Trusted Publishing)
+        run: npm publish --access public --no-provenance
