@@ -83,6 +83,9 @@ const createRealisticContext = () => {
             },
             session: {
                 list: mock(async () => ({ data: realSessions })),
+                status: mock(async () => ({
+                    data: { "session-1": { type: "idle" }, "session-2": { type: "idle" } }
+                })),
                 messages: mock(async (path: { id: string }) => {
                     return realMessages.get(path.id) ?? []
                 }),
@@ -210,6 +213,138 @@ describe("Plugin Integration", () => {
         expect(promptCalls).toHaveLength(1)
         expect(promptCalls[0].sid).toBe(sid)
         expect(promptCalls[0].body).toContain("raw tool call")
+    })
+
+    test("busy session status prevents abort", async () => {
+        const sid = "ses_busy_abort"
+        const abortCalls: string[] = []
+        const statusCalls: number[] = []
+        const ctx = {
+            client: {
+                app: {
+                    log: mock(async () => {})
+                },
+                session: {
+                    list: mock(async () => ({ data: [] })),
+                    status: mock(async () => {
+                        statusCalls.push(Date.now())
+                        return { data: { [sid]: { type: "busy" } } }
+                    }),
+                    messages: mock(async () => []),
+                    prompt: mock(async () => ({})),
+                    abort: mock(async (config: { path: { id: string } }) => {
+                        abortCalls.push(config.path.id)
+                        return {}
+                    }),
+                },
+            },
+        } as any
+        const hooks = await AutoResumePlugin(ctx, {
+            enabled: true,
+            checkIntervalMs: 50,
+            subagentWaitMs: 50,
+            gracePeriodMs: 0,
+            maxRetries: 3,
+        })
+
+        await hooks.event({ event: { type: "session.status", sessionID: sid, properties: { status: "busy" } } } as any)
+        await hooks.event({ event: { type: "message", sessionID: sid, properties: { delta: { text: "x" } } } } as any)
+
+        await new Promise((resolve) => setTimeout(resolve, 300))
+
+        expect(statusCalls.length).toBeGreaterThan(0)
+        expect(abortCalls).toHaveLength(0)
+    })
+
+    test("active tool in messages prevents abort via checkSessionHasActiveTool fallback", async () => {
+        const sid = "ses_tool_fallback"
+        const abortCalls: string[] = []
+        const messagesCalls: string[] = []
+        const ctx = {
+            client: {
+                app: {
+                    log: mock(async () => {})
+                },
+                session: {
+                    list: mock(async () => ({ data: [] })),
+                    status: mock(async () => ({ data: {} })),
+                    messages: mock(async (input: { path?: { id: string }; id?: string }) => {
+                        const id = input.path?.id ?? input.id
+                        if (id !== sid) return []
+                        messagesCalls.push(id)
+                        return [
+                            { role: "user", agent: "sisyphus" },
+                            {
+                                role: "assistant",
+                                parts: [{ type: "tool-call", tool: "edit" }],
+                            },
+                        ]
+                    }),
+                    prompt: mock(async () => ({})),
+                    abort: mock(async (config: { path: { id: string } }) => {
+                        abortCalls.push(config.path.id)
+                        return {}
+                    }),
+                },
+            },
+        } as any
+        const hooks = await AutoResumePlugin(ctx, {
+            enabled: true,
+            checkIntervalMs: 50,
+            subagentWaitMs: 50,
+            gracePeriodMs: 0,
+            maxRetries: 3,
+        })
+
+        await hooks.event({ event: { type: "session.status", sessionID: sid, properties: { status: "busy" } } } as any)
+        await hooks.event({ event: { type: "message", sessionID: sid, properties: { delta: { text: "x" } } } } as any)
+
+        await new Promise((resolve) => setTimeout(resolve, 300))
+
+        expect(messagesCalls.length).toBeGreaterThan(0)
+        expect(abortCalls).toHaveLength(0)
+    })
+
+    test("orphan watch does not abort parent with active tool (Path A regression)", async () => {
+        const parentSid = "ses_parent_orphan"
+        const subagentSid = "ses_sub_orphan"
+        const abortCalls: string[] = []
+        const ctx = {
+            client: {
+                app: {
+                    log: mock(async () => {}),
+                },
+                session: {
+                    list: mock(async () => ({ data: [] })),
+                    status: mock(async () => ({
+                        data: { [parentSid]: { type: "busy" } },
+                    })),
+                    messages: mock(async () => []),
+                    prompt: mock(async () => ({})),
+                    abort: mock(async (config: { path: { id: string } }) => {
+                        abortCalls.push(config.path.id)
+                        return {}
+                    }),
+                },
+            },
+        } as any
+        const hooks = await AutoResumePlugin(ctx, {
+            enabled: true,
+            checkIntervalMs: 50,
+            subagentWaitMs: 50,
+            gracePeriodMs: 0,
+            maxRetries: 3,
+        })
+
+        // Two sessions busy, then subagent goes idle → triggers orphan watch on parent
+        await hooks.event({ event: { type: "session.status", sessionID: parentSid, properties: { status: "busy" } } } as any)
+        await hooks.event({ event: { type: "session.status", sessionID: subagentSid, properties: { status: "busy" } } } as any)
+        await hooks.event({ event: { type: "session.status", sessionID: subagentSid, properties: { status: "idle" } } } as any)
+
+        // Wait for orphan watch to fire (subagentWaitMs + gracePeriodMs + checkIntervalMs)
+        await new Promise((resolve) => setTimeout(resolve, 400))
+
+        expect(abortCalls).toHaveLength(0)
     })
 })
 
@@ -470,5 +605,165 @@ describe("Integration: Realistic Scenarios", () => {
         
         expect(lastAssistant).toBeDefined()
         expect(promptCalls.length).toBeGreaterThanOrEqual(0)
+    })
+})
+
+describe("Hallucination Guard Regression Tests (MT1 + MT2)", () => {
+    // MT1: checkForToolCallAsText hallucination guard (src/index.ts:897-905)
+    // When isHallucinationLoop returns true, the guard must call tryAbortAndResume
+    // (which calls abort) instead of sendContinuePrompt (which calls prompt with
+    // recovery text). Without the guard, a recovery prompt is sent and no abort
+    // happens — the test must fail in that case.
+    test("MT1: checkForToolCallAsText hallucination guard aborts instead of sending recovery prompt", async () => {
+        const sid = "ses_mt1_guard"
+        const promptCalls: Array<{ sid: string; body: string }> = []
+        const abortCalls: string[] = []
+
+        const ctx = {
+            client: {
+                app: {
+                    log: mock(async () => {}),
+                },
+                session: {
+                    list: mock(async () => ({ data: [] })),
+                    status: mock(async () => ({ data: { [sid]: { type: "idle" } } })),
+                    messages: mock(async (input: { path?: { id: string }; id?: string }) => {
+                        const id = input.path?.id ?? input.id
+                        if (id !== sid) return []
+                        return [
+                            { role: "user", agent: "sisyphus" },
+                            {
+                                role: "assistant",
+                                parts: [
+                                    {
+                                        type: "text",
+                                        text: '<function=edit><parameter name="file">src/index.ts</parameter>',
+                                    },
+                                ],
+                            },
+                        ]
+                    }),
+                    prompt: mock(async (config: { path: { id: string }; body: { parts: Array<{ text: string }> } }) => {
+                        promptCalls.push({
+                            sid: config.path.id,
+                            body: config.body.parts.map((p) => p.text).join(""),
+                        })
+                        return {}
+                    }),
+                    abort: mock(async (config: { path: { id: string } }) => {
+                        abortCalls.push(config.path.id)
+                        return {}
+                    }),
+                },
+            },
+        } as any
+
+        // loopMaxContinues: 1 makes isHallucinationLoop return true on the FIRST
+        // call — no need for prior tryResume cycles to pre-populate timestamps.
+        const hooks = await AutoResumePlugin(ctx, {
+            enabled: true,
+            loopMaxContinues: 1,
+            maxRetries: 3,
+            checkIntervalMs: 60000,
+        })
+
+        // Session goes idle with tool-call-as-text in messages.
+        await hooks.event({ event: { type: "session.status", sessionID: sid, properties: { status: "idle" } } } as any)
+
+        // Wait for checkForToolCallAsText timer (TOOL_TEXT_CHECK_DELAY_MS = 3000ms).
+        await new Promise((resolve) => setTimeout(resolve, 3200))
+
+        // With the guard: abort called, prompt NOT called yet (tryAbortAndResume
+        // waits ABORT_CONTINUE_DELAY_MS=2000ms before sendContinuePrompt).
+        // Without the guard: prompt called with recovery text, abort NOT called.
+        expect(abortCalls.length).toBeGreaterThanOrEqual(1)
+        expect(abortCalls[0]).toBe(sid)
+        expect(promptCalls).toHaveLength(0)
+    })
+
+    // MT2: tryResume hallucination guard (src/index.ts:981-991)
+    // When isHallucinationLoop returns true inside tryResume, the guard must call
+    // tryAbortAndResume (abort) instead of falling through to sendContinuePrompt
+    // (prompt with "continue"). Without the guard, a continue prompt is sent and
+    // no abort happens — the test must fail in that case.
+    test("MT2: tryResume hallucination guard aborts instead of continuing on loop", async () => {
+        const parentSid = "ses_mt2_parent"
+        const targetSid = "ses_mt2_target"
+        const promptCalls: Array<{ sid: string; body: string }> = []
+        const abortCalls: string[] = []
+
+        const ctx = {
+            client: {
+                app: {
+                    log: mock(async () => {}),
+                },
+                session: {
+                    list: mock(async () => ({ data: [] })),
+                    status: mock(async () => ({
+                        data: {
+                            [parentSid]: { type: "busy" },
+                            [targetSid]: { type: "idle" },
+                        },
+                    })),
+                    messages: mock(async (input: { path?: { id: string }; id?: string }) => {
+                        const id = input.path?.id ?? input.id
+                        if (id !== targetSid) return []
+                        return [
+                            { role: "user", agent: "sisyphus" },
+                            { role: "assistant", parts: [{ type: "text", text: "working" }] },
+                        ]
+                    }),
+                    prompt: mock(async (config: { path: { id: string }; body: { parts: Array<{ text: string }> } }) => {
+                        promptCalls.push({
+                            sid: config.path.id,
+                            body: config.body.parts.map((p) => p.text).join(""),
+                        })
+                        return {}
+                    }),
+                    abort: mock(async (config: { path: { id: string } }) => {
+                        abortCalls.push(config.path.id)
+                        return {}
+                    }),
+                },
+            },
+        } as any
+
+        // loopMaxContinues: 1 triggers the hallucination guard on the FIRST
+        // tryResume call — no need for multiple cycles or backoff waits.
+        const hooks = await AutoResumePlugin(ctx, {
+            enabled: true,
+            loopMaxContinues: 1,
+            maxRetries: 3,
+            checkIntervalMs: 60000,
+        })
+
+        // Create the target session watch first — todo.updated uses
+        // sessions.get() (not ensureWatch), so the watch must already exist.
+        await hooks.event({ event: { type: "session.created", sessionID: targetSid } } as any)
+
+        // Set up parent as busy (needed for currentBusy === 1 check in the
+        // idle handler that gates tryResume).
+        await hooks.event({ event: { type: "session.status", sessionID: parentSid, properties: { status: "busy" } } } as any)
+
+        // Set up open todos on target so the idle handler calls tryResume.
+        await hooks.event({ event: { type: "todo.updated", sessionID: targetSid, properties: { todos: [{ content: "task", status: "pending" }] } } } as any)
+
+        // Target goes idle → tryResume called (fire-and-forget, not awaited).
+        // currentBusy === 1 because parent is busy.
+        await hooks.event({ event: { type: "session.status", sessionID: targetSid, properties: { status: "idle" } } } as any)
+
+        // Wait for the tryResume async chain to reach tryAbortAndResume and
+        // call abort. The chain is: tryResume → isHallucinationLoop (sync, true)
+        // → await checkSessionHasActiveTool (mock resolves immediately) →
+        // await tryAbortAndResume → await abort. All within a few microtask
+        // ticks. 500ms is more than enough.
+        await new Promise((resolve) => setTimeout(resolve, 500))
+
+        // With the guard: abort called, prompt NOT called yet (tryAbortAndResume
+        // waits ABORT_CONTINUE_DELAY_MS=2000ms before sendContinuePrompt).
+        // Without the guard: prompt called with "continue", abort NOT called.
+        expect(abortCalls.length).toBeGreaterThanOrEqual(1)
+        expect(abortCalls[0]).toBe(targetSid)
+        expect(promptCalls).toHaveLength(0)
     })
 })

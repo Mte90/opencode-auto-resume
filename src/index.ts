@@ -350,8 +350,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         let model: { providerID: string; modelID: string } | undefined
         
         try {
-            const msgResp = await ctx.client.session.messages({ path: { id: sid } })
-            const msgs = extractMessages(msgResp as Record<string, unknown>)
+            const msgs = await getSessionMessages(sid)
 
             for (let i = msgs.length - 1; i >= 0; i--) {
                 const msg = msgs[i]
@@ -440,7 +439,40 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         return []
     }
 
-        const SUBAGENT_STUCK_MS = 60_000
+    async function getSessionMessages(sid: string): Promise<Array<Record<string, unknown>>> {
+        const response = await ctx.client.session.messages({ path: { id: sid } })
+        return extractMessages(response as Record<string, unknown>)
+    }
+
+    function roleOf(msg: Record<string, unknown> | undefined): string | undefined {
+        if (!msg) return undefined
+        return (msg.role as string) ?? ((msg.info as Record<string, unknown> | undefined)?.role as string)
+    }
+
+    async function getSessionStatusMap(): Promise<Record<string, string>> {
+        try {
+            const response = await ctx.client.session.status()
+            const raw = ((response as Record<string, unknown>).data ?? response) as Record<string, unknown>
+            const result: Record<string, string> = {}
+            if (raw && typeof raw === "object") {
+                for (const [sid, val] of Object.entries(raw)) {
+                    if (typeof val === "string") {
+                        result[sid] = val
+                    } else if (val && typeof val === "object") {
+                        const type = (val as Record<string, unknown>).type
+                        if (typeof type === "string") result[sid] = type
+                    }
+                }
+            }
+            return result
+        } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err)
+            await log("debug", `session.status() failed: ${errMsg}`)
+            return {}
+        }
+    }
+
+    const SUBAGENT_STUCK_MS = 60_000
 
     const SUBAGENT_RECOVERY_PROMPT = "It looks like you may have stalled or timed out. Please retry the last operation or continue with the task."
 
@@ -459,16 +491,12 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         }
     }
 
-    async function hasBusySubagents(parentSid: string): Promise<boolean> {
+        async function hasBusySubagents(parentSid: string): Promise<boolean> {
         try {
-            const response = await ctx.client.session.list()
-            const allSessions = extractMessages(response as Record<string, unknown>)
-
-            for (const s of allSessions) {
-                const sId = s.id as string
+            const statusMap = await getSessionStatusMap()
+            for (const [sId, statusType] of Object.entries(statusMap)) {
                 if (!sId || sId === parentSid) continue
-                const status = s.status as string | undefined
-                if (status === "busy") return true
+                if (statusType === "busy") return true
             }
             return false
         } catch (err) {
@@ -478,35 +506,29 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         }
     }
 
-    async function checkSessionHasActiveTool(sid: string): Promise<boolean> {
+        async function checkSessionHasActiveTool(sid: string): Promise<boolean> {
         try {
-            const listResponse = await ctx.client.session.list()
-            const sessions = extractMessages(listResponse as Record<string, unknown>)
-            const currentSession = sessions.find((s: Record<string, unknown>) => s.id === sid)
-            const status = currentSession?.status as string | undefined
-            
-            if (status === "busy") {
+            const statusMap = await getSessionStatusMap()
+            if (statusMap[sid] === "busy") {
                 await log("debug", `Session ${short(sid)} is busy, likely executing a tool`)
                 return true
             }
-            
-            const response = await ctx.client.session.messages({ path: { id: sid } })
-            const messages = extractMessages(response as Record<string, unknown>)
+
+            const messages = await getSessionMessages(sid)
             const lastMsg = messages[messages.length - 1]
-            
+
             if (!lastMsg) return false
-            
-            const rawRole = (lastMsg?.role ?? (lastMsg?.info as Record<string, unknown> | undefined)?.role) as string | undefined
-            if (rawRole !== "assistant") return false
-            
+
+            if (roleOf(lastMsg) !== "assistant") return false
+
             const toolCall = lastMsg.toolCall as Record<string, unknown> | undefined
             const toolCalls = lastMsg.tool_calls as Array<Record<string, unknown>> | undefined
             const parts = lastMsg.parts as Array<Record<string, unknown>> | undefined
-            
+
             const hasToolCall = toolCall !== undefined
                 || (toolCalls?.length ?? 0) > 0
                 || (parts?.some((p: Record<string, unknown>) => p.type === "tool-call" || p.type === "tool_use") ?? false)
-            
+
             return hasToolCall
         } catch (err) {
             const errMsg = err instanceof Error ? err.message : String(err)
@@ -515,42 +537,36 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         }
     }
 
-    async function checkSubagentStatus(parentSid: string): Promise<{ status: "crashed" | "idle" | "busy" | "unknown"; stuckSid?: string }> {
+        async function checkSubagentStatus(parentSid: string): Promise<{ status: "crashed" | "idle" | "busy" | "unknown"; stuckSid?: string }> {
         try {
-            const response = await ctx.client.session.list()
-            const allSessions = extractMessages(response as Record<string, unknown>)
+            const statusMap = await getSessionStatusMap()
             const now = Date.now()
 
             let hasBusySubagent = false
 
-            for (const s of allSessions) {
-                const sId = s.id as string
+            for (const [sId, statusType] of Object.entries(statusMap)) {
                 if (!sId || sId === parentSid) continue
 
-                const status = s.status as string
-
-                if (status === "busy") {
+                if (statusType === "busy") {
                     hasBusySubagent = true
-                    const msgResponse = await ctx.client.session.messages({ path: { id: sId } })
-                    const messages = extractMessages(msgResponse as Record<string, unknown>)
+                    const messages = await getSessionMessages(sId)
                     const lastMsg = messages[messages.length - 1]
 
-                    const rawRole = (lastMsg?.role ?? (lastMsg?.info as Record<string, unknown> | undefined)?.role) as string | undefined
-                    if (lastMsg && rawRole === "assistant" && ("error" in lastMsg || (lastMsg.info && "error" in (lastMsg.info as Record<string, unknown>)))) {
+                    if (lastMsg && roleOf(lastMsg) === "assistant" && ("error" in lastMsg || (lastMsg.info && "error" in (lastMsg.info as Record<string, unknown>)))) {
                         await log("debug", `Subagent ${short(sId)} appears crashed`)
                         return { status: "crashed" }
                     }
 
                     const msgTime = (lastMsg?.time as Record<string, number> | undefined)?.created ?? (lastMsg?.time as number | undefined)
                     if (!msgTime) continue
-                    
+
                     const toolCall = lastMsg.toolCall as Record<string, unknown> | undefined
                     const toolCalls = lastMsg.tool_calls as Array<Record<string, unknown>> | undefined
                     const parts = lastMsg.parts as Array<Record<string, unknown>> | undefined
                     const hasToolCall = toolCall !== undefined
                         || (toolCalls?.length ?? 0) > 0
                         || (parts?.some((p: Record<string, unknown>) => p.type === "tool-call") ?? false)
-                    
+
                     const isStuck = hasToolCall
                         ? now - msgTime > SUBAGENT_STUCK_MS * 3
                         : now - msgTime > SUBAGENT_STUCK_MS
@@ -666,10 +682,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         await log("debug", `${short(sid)} - checking for tool-call-as-text (attempt ${w.toolTextAttempts + 1})`)
 
         try {
-            const response = await ctx.client.session.messages({
-                path: { id: sid },
-            })
-            const messages = extractMessages(response as Record<string, unknown>)
+            const messages = await getSessionMessages(sid)
             const recent = messages.slice(-3)
 
             let bestCandidate: {
@@ -1029,21 +1042,14 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         timer = setInterval(async () => {
             const now = Date.now()
             const numBusy = busyCount()
+            const statusMap = await getSessionStatusMap()
 
             for (const [sid, w] of sessions) {
-                // Check real session status from API (not just local w.status)
-                try {
-                    const listResponse = await ctx.client.session.list()
-                    const allSessions = extractMessages(listResponse as Record<string, unknown>)
-                    const realSession = allSessions.find((s: Record<string, unknown>) => s.id === sid)
-                    const realStatus = realSession?.status as string | undefined
-                    
-                    // Sync local status with real status
-                    if (realStatus && realStatus !== w.status) {
-                        w.status = realStatus
-                        if (realStatus === "busy") w.idleSince = null
-                    }
-                } catch { /* ignore API errors */ }
+                const realStatus = statusMap[sid]
+                if (realStatus && realStatus !== w.status) {
+                    w.status = realStatus as SessionWatch["status"]
+                    if (realStatus === "busy") w.idleSince = null
+                }
                 
                 if (w.status !== "busy") continue
                 if (w.userCancelled) continue
@@ -1053,6 +1059,17 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     const orphanIdle = now - w.orphanWatchStartAt
                     if (orphanIdle >= subagentWaitMs + gracePeriodMs) {
                         if (w.resumeAttempts < maxRetries) {
+                            // Guard: never abort the parent while it is running a tool.
+                            // Paths B (subagentWait) and C (chunkTimeout) already check
+                            // checkSessionHasActiveTool before aborting; path A was missing
+                            // it, so a long-running parent tool was killed when a subagent
+                            // finished and the orphan timer expired.
+                            const hasActiveTool = await checkSessionHasActiveTool(sid)
+                            if (hasActiveTool) {
+                                await log("debug", `Parent ${short(sid)} has active tool call, skipping orphan-watch abort`)
+                                w.orphanWatchStartAt = now
+                                continue
+                            }
                             const subStatus = await checkSubagentStatus(sid)
                             if (subStatus.status === "crashed" && subStatus.stuckSid) {
                                 const recovered = await recoverSubagent(subStatus.stuckSid)
@@ -1090,20 +1107,13 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 w.lastSubagentCheckAt = now
 
                 if (w.lastActivityAt > 0 && (now - w.lastActivityAt) > subagentWaitMs) {
-                    // Check real session status from API
-                try {
-                    const listResponse = await ctx.client.session.list()
-                const allSessions = extractMessages(listResponse as Record<string, unknown>)
-                    const realStatus = realSession?.status as string | undefined
-                    
                     if (realStatus === "busy") {
-                    await log("debug", `Session ${short(sid)} is still busy (real status), skipping abort`)
-                    w.lastSubagentCheckAt = now
-                    continue
-                }
-            } catch { /* ignore API errors */ }
-            
-            const hasActiveTool = await checkSessionHasActiveTool(sid)
+                        await log("debug", `Session ${short(sid)} is still busy (real status), skipping abort`)
+                        w.lastSubagentCheckAt = now
+                        continue
+                    }
+
+                    const hasActiveTool = await checkSessionHasActiveTool(sid)
                     if (hasActiveTool) {
                         await log("debug", `Session ${short(sid)} has active tool call, skipping abort check`)
                         w.lastSubagentCheckAt = now
@@ -1184,7 +1194,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 if (statusType === "busy") {
                     w.lastActivityAt = Date.now()
                     resetSessionFlags(w)
-                    log("debug", `${short(sid)} -> busy (${busyCount()})`)
+                    prevBusyCount = busyCount()
+                    log("debug", `${short(sid)} -> busy (${prevBusyCount})`)
                 } else if (statusType === "idle" || statusType === "interrupted") {
                     w.status = "idle"
                     resetIdleFlags(w)
