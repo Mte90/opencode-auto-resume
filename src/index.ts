@@ -53,6 +53,7 @@ const ABORT_CONTINUE_DELAY_MS = 2_000
 const DEFAULT_LOOP_MAX_CONTINUES = 3
 const DEFAULT_LOOP_WINDOW_MS = 10 * 60_000
 const TOOL_TEXT_CHECK_DELAY_MS = 3_000
+const MIN_ACTIVITY_GAP_MS = 1_000
 const MAX_IDLE_SESSIONS = 50
 const IDLE_CLEANUP_MS = 10 * 60_000
 const SESSION_DISCOVERY_INTERVAL_MS = 60_000
@@ -447,6 +448,29 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     function roleOf(msg: Record<string, unknown> | undefined): string | undefined {
         if (!msg) return undefined
         return (msg.role as string) ?? ((msg.info as Record<string, unknown> | undefined)?.role as string)
+    }
+
+    async function lastAssistantEndsWithCelebration(sid: string): Promise<boolean> {
+        try {
+            const msgs = await getSessionMessages(sid)
+            for (let i = msgs.length - 1; i >= 0; i--) {
+                const msg = msgs[i]
+                if (roleOf(msg) !== "assistant") continue
+                const parts = msg.parts as Array<Record<string, unknown>> | undefined
+                if (!parts) continue
+                let text = ""
+                for (const part of parts) {
+                    if (part.type === "text") {
+                        text += (part.text as string) ?? ""
+                    }
+                }
+                const normalized = text.trim().replace(/[.!?]+$/, '')
+                return normalized.endsWith('🎉')
+            }
+        } catch {
+            // on error, don't block continue
+        }
+        return false
     }
 
     async function getSessionStatusMap(): Promise<Record<string, string>> {
@@ -864,14 +888,14 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 const todos = w.todos || []
                 const hasOpenTodos = todos.some(t => t.status === "pending" || t.status === "in_progress")
                 
-                if (hasOpenTodos && busyCount() === 1) {
+                if (hasOpenTodos && busyCount() === 0) {
                     await log("info", `${short(sid)} - no activity detected but todos remain open (${todos.filter(t => t.status === "pending" || t.status === "in_progress").length} tasks). Sending continue...`)
                     bestCandidate = {
                         prompt: "continue",
                         source: "idle-with-open-todos",
                         priority: 2,
                     }
-                } else if (hasOpenTodos && busyCount() > 1) {
+                } else if (hasOpenTodos && busyCount() > 0) {
                     await log("debug", `${short(sid)} - todos remain open but ${busyCount()} sessions busy (subagents running), skipping continue`)
                 }
             }
@@ -889,7 +913,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
             // Guard: don't send if another plugin or user recently sent a prompt
             const timeSinceActivity = Date.now() - w.lastActivityAt
-            if (timeSinceActivity < TOOL_TEXT_CHECK_DELAY_MS) {
+            if (timeSinceActivity < MIN_ACTIVITY_GAP_MS) {
                 await log("info", `${short(sid)} - skipping ${bestCandidate.source}, session was active ${Math.round(timeSinceActivity / 1000)}s ago`)
                 return
             }
@@ -1216,9 +1240,16 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         const todos = w.todos || []
                         const hasOpenTodos = todos.some(t => t.status === "pending" || t.status === "in_progress")
                         
-                        if (hasOpenTodos && currentBusy === 1 && !w.toolTextRecovered) {
-                            await log("info", `${short(sid)} - idle with ${todos.filter(t => t.status === "pending" || t.status === "in_progress").length} open todos. Sending continue...`)
-                            tryResume(sid, w, "Idle with open todos")
+                        if (hasOpenTodos && currentBusy === 0 && !w.toolTextRecovered) {
+                            const isCelebration = await lastAssistantEndsWithCelebration(sid)
+                            if (isCelebration) {
+                                await log("info", `${short(sid)} - 🎉 detected in idle handler, skipping continue`)
+                                w.toolTextRecovered = true
+                                if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
+                            } else {
+                                await log("info", `${short(sid)} - idle with ${todos.filter(t => t.status === "pending" || t.status === "in_progress").length} open todos. Sending continue...`)
+                                tryResume(sid, w, "Idle with open todos")
+                            }
                         }
                     }
 
@@ -1312,14 +1343,12 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 const props = ev.properties as Record<string, unknown> | undefined
                 const todos = (props?.todos as Array<Record<string, unknown>>) ?? []
                 
-                const w = sessions.get(sid)
-                if (w) {
-                    w.todos = todos.map((t) => ({
-                        content: (t.content as string) ?? "",
-                        status: (t.status as Todo["status"]) ?? "pending",
-                        priority: (t.priority as Todo["priority"]) ?? "medium",
-                    }))
-                }
+                const w = ensureWatch(sid)
+                w.todos = todos.map((t) => ({
+                    content: (t.content as string) ?? "",
+                    status: (t.status as Todo["status"]) ?? "pending",
+                    priority: (t.priority as Todo["priority"]) ?? "medium",
+                }))
                 break
             }
 

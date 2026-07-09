@@ -741,15 +741,14 @@ describe("Hallucination Guard Regression Tests (MT1 + MT2)", () => {
         // sessions.get() (not ensureWatch), so the watch must already exist.
         await hooks.event({ event: { type: "session.created", sessionID: targetSid } } as any)
 
-        // Set up parent as busy (needed for currentBusy === 1 check in the
-        // idle handler that gates tryResume).
-        await hooks.event({ event: { type: "session.status", sessionID: parentSid, properties: { status: "busy" } } } as any)
-
         // Set up open todos on target so the idle handler calls tryResume.
+        // currentBusy must be 0 (no other busy sessions) for the idle
+        // handler to call tryResume — a continue is only sent when no
+        // subagents are running.
         await hooks.event({ event: { type: "todo.updated", sessionID: targetSid, properties: { todos: [{ content: "task", status: "pending" }] } } } as any)
 
         // Target goes idle → tryResume called (fire-and-forget, not awaited).
-        // currentBusy === 1 because parent is busy.
+        // currentBusy === 0 because no other sessions are busy.
         await hooks.event({ event: { type: "session.status", sessionID: targetSid, properties: { status: "idle" } } } as any)
 
         // Wait for the tryResume async chain to reach tryAbortAndResume and
