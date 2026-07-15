@@ -133,7 +133,7 @@ describe("handleEvent - session.status", () => {
 
         expect(promptCalls.length).toBe(1)
         expect(promptCalls[0].sid).toBe("ses_test1")
-        expect(promptCalls[0].body).toBe("continue")
+        expect(promptCalls[0].body).toContain("unfinished task")
     })
 
     test("status 'retry' → touchSession called, no crash, no continue sent", async () => {
@@ -412,7 +412,7 @@ describe("handleEvent - todo.updated", () => {
         await wait(100)
 
         expect(promptCalls.length).toBe(1)
-        expect(promptCalls[0].body).toBe("continue")
+        expect(promptCalls[0].body).toContain("unfinished task")
     })
 
     test("todo.updated with empty todos → subsequent idle does NOT trigger continue", async () => {

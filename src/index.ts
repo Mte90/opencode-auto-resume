@@ -40,6 +40,8 @@ interface SessionWatch {
     recentToolCalls: ToolCallRecord[]
     toolLoopAttempts: number
     isSubagent: boolean
+    completionSignaled: boolean
+    todoNudgeAttempts: number
 }
 
 const DEFAULT_CHUNK_TIMEOUT_MS = 45_000
@@ -152,6 +154,14 @@ function containsDoneClaimPattern(text: string): boolean {
     return DONE_CLAIM_PATTERNS.some((pat) => pat.test(lastLines))
 }
 
+export function buildOpenTodosReminder(todos: Todo[]): string {
+    const open = todos.filter(t => t.status === "pending" || t.status === "in_progress")
+    if (open.length === 0) return "continue"
+    const list = open.map((t, i) => `${i + 1}. [${t.status}] ${t.content}`).join("\n")
+    const plural = open.length > 1 ? "s" : ""
+    return `You have ${open.length} unfinished task${plural}:\n${list}\n\nPlease continue working on these task${plural}.`
+}
+
 export const AutoResumePlugin: Plugin = async (ctx, options) => {
     const chunkTimeoutMs: number =
     (options?.chunkTimeoutMs as number) ?? DEFAULT_CHUNK_TIMEOUT_MS
@@ -227,6 +237,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 recentToolCalls: [],
                 toolLoopAttempts: 0,
                 isSubagent: false,
+                completionSignaled: false,
+                todoNudgeAttempts: 0,
             }
             sessions.set(sid, w)
         }
@@ -619,10 +631,10 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         w.gaveUp = false
         w.orphanWatchStartAt = null
         w.aborting = false
-        if (w.isSubagent) {
-            w.toolTextRecovered = false
-        }
+        w.toolTextRecovered = false
         w.toolTextAttempts = 0
+        w.completionSignaled = false
+        w.todoNudgeAttempts = 0
         w.continueTimestamps = []
         w.idleSince = null
         w.continuing = false
@@ -880,6 +892,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             if (normalized.endsWith('🎉') && (!bestCandidate || bestCandidate.priority > 0)) {
                 await log("info", `${short(sid)} - 🎉 completion detected, skipping continue`)
                 w.toolTextRecovered = true
+                w.completionSignaled = true
                 if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
                 return
             }
@@ -889,10 +902,11 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 const hasOpenTodos = todos.some(t => t.status === "pending" || t.status === "in_progress")
                 
                 if (hasOpenTodos && busyCount() === 0) {
-                    await log("info", `${short(sid)} - no activity detected but todos remain open (${todos.filter(t => t.status === "pending" || t.status === "in_progress").length} tasks). Sending continue...`)
+                    const reminder = buildOpenTodosReminder(todos)
+                    await log("info", `${short(sid)} - no activity detected but todos remain open (${todos.filter(t => t.status === "pending" || t.status === "in_progress").length} tasks). Sending reminder...`)
                     bestCandidate = {
-                        prompt: "continue",
-                        source: "idle-with-open-todos",
+                        prompt: reminder,
+                        source: "idle-with-open-todos-reminder",
                         priority: 2,
                     }
                 } else if (hasOpenTodos && busyCount() > 0) {
@@ -902,13 +916,22 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
             if (!bestCandidate) return
 
-            w.toolTextRecovered = true
-            w.toolTextAttempts++
+            const isOpenTodosReminder = bestCandidate.source === "idle-with-open-todos-reminder"
+            if (isOpenTodosReminder) {
+                if (w.todoNudgeAttempts >= maxRetries) {
+                    await log("info", `${short(sid)} - max open-todos nudges (${maxRetries}) reached for this idle cycle, waiting for activity`)
+                    return
+                }
+                w.todoNudgeAttempts++
+            } else {
+                w.toolTextRecovered = true
+                w.toolTextAttempts++
+            }
 
             await log(
                 "info",
                 `${bestCandidate.source} detected on ${short(sid)}! ` +
-                `Attempt ${w.toolTextAttempts}/${maxRetries}. Sending recovery prompt...`,
+                `Attempt ${isOpenTodosReminder ? w.todoNudgeAttempts : w.toolTextAttempts}/${maxRetries}. Sending recovery prompt...`,
             )
 
             // Guard: don't send if another plugin or user recently sent a prompt
@@ -992,7 +1015,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     // Resume: normal stall
     // -----------------------------------------------------------------------
 
-    async function tryResume(sid: string, w: SessionWatch, reason: string): Promise<boolean> {
+    async function tryResume(sid: string, w: SessionWatch, reason: string, prompt?: string): Promise<boolean> {
         if (typeof sid !== "string" || !sid) {
             await log("warn", `tryResume called with invalid sid: ${sid}`)
             return false
@@ -1019,7 +1042,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         await log("info", `${reason} on ${short(sid)} (${idleSec}s, retry ${w.resumeAttempts}/${maxRetries})`)
 
         try {
-            await sendContinuePrompt(sid, "continue", w)
+            await sendContinuePrompt(sid, prompt ?? "continue", w)
             await log("info", `${short(sid)} - retry sent`)
             return true
         } catch (err) {
@@ -1240,20 +1263,22 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         const todos = w.todos || []
                         const hasOpenTodos = todos.some(t => t.status === "pending" || t.status === "in_progress")
                         
-                        if (hasOpenTodos && currentBusy === 0 && !w.toolTextRecovered) {
+                        if (hasOpenTodos && currentBusy === 0 && !w.completionSignaled) {
                             const isCelebration = await lastAssistantEndsWithCelebration(sid)
                             if (isCelebration) {
                                 await log("info", `${short(sid)} - 🎉 detected in idle handler, skipping continue`)
                                 w.toolTextRecovered = true
+                                w.completionSignaled = true
                                 if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
                             } else {
-                                await log("info", `${short(sid)} - idle with ${todos.filter(t => t.status === "pending" || t.status === "in_progress").length} open todos. Sending continue...`)
-                                tryResume(sid, w, "Idle with open todos")
+                                const reminder = buildOpenTodosReminder(todos)
+                                await log("info", `${short(sid)} - idle with ${todos.filter(t => t.status === "pending" || t.status === "in_progress").length} open todos. Sending reminder...`)
+                                tryResume(sid, w, "Idle with open todos", reminder)
                             }
                         }
                     }
 
-                    if (!w.toolTextRecovered && w.toolTextAttempts < maxRetries) {
+                    if (!w.completionSignaled && w.toolTextAttempts < maxRetries) {
                         if (w.toolTextTimer) clearTimeout(w.toolTextTimer)
                         const checkDelay = statusType === "interrupted" ? 500 : TOOL_TEXT_CHECK_DELAY_MS
                         w.toolTextTimer = setTimeout(() => {
@@ -1401,6 +1426,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 // Subagents can call task_complete without blocking future continues
                 if (!w.isSubagent) {
                     w.toolTextRecovered = true
+                    w.completionSignaled = true
                     if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
                 }
                 log("info", `${short(ctx.sessionID)} - task_complete called, ${w.isSubagent ? 'subagent' : 'agent'} done`)

@@ -215,7 +215,7 @@ describe("checkForToolCallAsText detection", () => {
         await hooks.event(makeStatusEvent("ses_test6", "idle"))
         await wait(3500)
 
-        const continueCall = promptCalls.find(c => c.body === "continue")
+        const continueCall = promptCalls.find(c => c.body.includes("unfinished task"))
         expect(continueCall).toBeDefined()
     })
 
@@ -243,7 +243,7 @@ describe("checkForToolCallAsText detection", () => {
         await wait(3500)
 
         // First attempt sends continue, loop detection needs multiple checkForToolCallAsText cycles
-        const continueCall = promptCalls.find(c => c.body === "continue")
+        const continueCall = promptCalls.find(c => c.body.includes("unfinished task"))
         expect(continueCall).toBeDefined()
     })
 
@@ -273,8 +273,8 @@ describe("checkForToolCallAsText detection", () => {
         await hooks.event(makeStatusEvent("ses_test8", "idle"))
         await wait(3500)
 
-        // Pattern detection needs multiple cycles, first sends continue
-        const continueCall = promptCalls.find(c => c.body === "continue")
+        // Pattern detection needs multiple cycles, first sends reminder
+        const continueCall = promptCalls.find(c => c.body.includes("unfinished task"))
         expect(continueCall).toBeDefined()
     })
 
@@ -299,7 +299,7 @@ describe("checkForToolCallAsText detection", () => {
         await hooks.event(makeStatusEvent("ses_test9", "idle"))
         await wait(3500)
 
-        const continueCall = promptCalls.find(c => c.body === "continue")
+        const continueCall = promptCalls.find(c => c.body.includes("unfinished task"))
         expect(continueCall).toBeDefined()
     })
 
@@ -424,7 +424,7 @@ describe("checkForToolCallAsText detection", () => {
         await hooks.event(makeStatusEvent("ses_test14", "idle"))
         await wait(3500)
 
-        const continueCall = promptCalls.find(c => c.body === "continue")
+        const continueCall = promptCalls.find(c => c.body.includes("unfinished task"))
         expect(continueCall).toBeDefined()
     })
 
@@ -452,8 +452,8 @@ describe("checkForToolCallAsText detection", () => {
         await hooks.event(makeStatusEvent("ses_test15", "idle"))
         await wait(3500)
 
-        // Without internal busy state, continue will be sent
-        const continueCall = promptCalls.find(c => c.body === "continue")
+        // Without internal busy state, reminder will be sent
+        const continueCall = promptCalls.find(c => c.body.includes("unfinished task"))
         expect(continueCall).toBeDefined()
     })
 

@@ -105,7 +105,7 @@ describe("Continue behavior — single session", () => {
         await wait(200)
         expect(promptCalls.length).toBe(1)
         expect(promptCalls[0].sid).toBe("ses_single")
-        expect(promptCalls[0].body).toBe("continue")
+        expect(promptCalls[0].body).toContain("unfinished task")
     })
 
     test("single session idle, all todos completed → NO continue", async () => {
