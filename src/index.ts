@@ -42,6 +42,8 @@ interface SessionWatch {
     isSubagent: boolean
     completionSignaled: boolean
     todoNudgeAttempts: number
+    pendingTools: number
+    pendingCommands: number
 }
 
 const DEFAULT_CHUNK_TIMEOUT_MS = 45_000
@@ -239,6 +241,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 isSubagent: false,
                 completionSignaled: false,
                 todoNudgeAttempts: 0,
+                pendingTools: 0,
+                pendingCommands: 0,
             }
             sessions.set(sid, w)
         }
@@ -250,6 +254,10 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         if (w && w.status === "busy" && !w.userCancelled) {
             w.lastActivityAt = Date.now()
         }
+    }
+
+    function hasInflightTools(w: SessionWatch): boolean {
+        return w.pendingTools > 0 || w.pendingCommands > 0
     }
 
     function busyCount(): number {
@@ -628,6 +636,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     function resetSessionFlags(w: SessionWatch) {
         w.userCancelled = false
         w.resumeAttempts = 0
+        w.pendingTools = 0
+        w.pendingCommands = 0
         w.gaveUp = false
         w.orphanWatchStartAt = null
         w.aborting = false
@@ -651,6 +661,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         w.aborting = false
         w.orphanWatchStartAt = null
         w.idleSince = Date.now()
+        w.pendingTools = 0
+        w.pendingCommands = 0
     }
 
     /**
@@ -942,7 +954,11 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             }
 
             if (isHallucinationLoop(sid)) {
-                // Check if session has an active tool before aborting
+                if (hasInflightTools(w)) {
+                    await log("debug", `Session ${short(sid)} has ${w.pendingTools} tool(s) in-flight, skipping hallucination abort`)
+                    return
+                }
+                // Fallback: polled heuristic for sessions discovered without hooks
                 const hasActiveTool = await checkSessionHasActiveTool(sid)
                 if (hasActiveTool) {
                     await log("debug", `Session ${short(sid)} has active tool, skipping hallucination abort`)
@@ -1026,7 +1042,12 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         if (w.lastRetryAt > 0 && elapsedSinceRetry < requiredBackoff) return false
 
         if (isHallucinationLoop(sid)) {
-            // Check if session has an active tool before aborting
+            if (hasInflightTools(w)) {
+                await log("debug", `Session ${short(sid)} has ${w.pendingTools} tool(s) in-flight, skipping hallucination abort`)
+                w.lastRetryAt = now
+                return false
+            }
+            // Fallback: polled heuristic for sessions discovered without hooks
             const hasActiveTool = await checkSessionHasActiveTool(sid)
             if (hasActiveTool) {
                 await log("debug", `Session ${short(sid)} has active tool, skipping hallucination abort`)
@@ -1107,6 +1128,12 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     if (orphanIdle >= subagentWaitMs + gracePeriodMs) {
                         if (w.resumeAttempts < maxRetries) {
                             // Guard: never abort the parent while it is running a tool.
+                            // Primary: deterministic in-flight counters from hooks.
+                            if (hasInflightTools(w)) {
+                                await log("debug", `Parent ${short(sid)} has ${w.pendingTools} tool(s) in-flight, skipping orphan-watch abort`)
+                                w.orphanWatchStartAt = now
+                                continue
+                            }
                             // Paths B (subagentWait) and C (chunkTimeout) already check
                             // checkSessionHasActiveTool before aborting; path A was missing
                             // it, so a long-running parent tool was killed when a subagent
@@ -1160,6 +1187,12 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         continue
                     }
 
+                    if (hasInflightTools(w)) {
+                        await log("debug", `Session ${short(sid)} has ${w.pendingTools} tool(s) in-flight, skipping abort check`)
+                        w.lastSubagentCheckAt = now
+                        continue
+                    }
+                    
                     const hasActiveTool = await checkSessionHasActiveTool(sid)
                     if (hasActiveTool) {
                         await log("debug", `Session ${short(sid)} has active tool call, skipping abort check`)
@@ -1186,16 +1219,23 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
                 const idle = now - w.lastActivityAt
                 if (idle >= chunkTimeoutMs + gracePeriodMs) {
-                    // Check if main session has an active tool call - if so, don't resume
-                    const hasActiveTool = await checkSessionHasActiveTool(sid)
-                    if (hasActiveTool) {
-                        await log("debug", `Session ${short(sid)} has active tool call, skipping stall recovery`)
+                    // Primary: deterministic in-flight counters from hooks.
+                    // A long-running build/test/command must never be aborted.
+                    if (hasInflightTools(w)) {
+                        await log("debug", `Session ${short(sid)} has ${w.pendingTools} tool(s) in-flight, skipping stall recovery`)
                         w.lastSubagentCheckAt = now
-                    } else if (w.resumeAttempts < maxRetries) {
-                        tryResume(sid, w, "Stream stall")
-                    } else if (!w.gaveUp) {
-                        w.gaveUp = true
-                        log("warn", `${short(sid)} - all ${maxRetries} retries exhausted.`)
+                    } else {
+                        // Fallback: Check if main session has an active tool call - if so, don't resume
+                        const hasActiveTool = await checkSessionHasActiveTool(sid)
+                        if (hasActiveTool) {
+                            await log("debug", `Session ${short(sid)} has active tool call, skipping stall recovery`)
+                            w.lastSubagentCheckAt = now
+                        } else if (w.resumeAttempts < maxRetries) {
+                            tryResume(sid, w, "Stream stall")
+                        } else if (!w.gaveUp) {
+                            w.gaveUp = true
+                            log("warn", `${short(sid)} - all ${maxRetries} retries exhausted.`)
+                        }
                     }
                 }
             }
@@ -1294,7 +1334,9 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
             case "session.created": {
                 if (!sid) break
-                ensureWatch(sid)
+                const w = ensureWatch(sid)
+                w.pendingTools = 0
+                w.pendingCommands = 0
                 log("debug", `New session: ${short(sid)} (${sessions.size})`)
                 break
             }
@@ -1400,12 +1442,23 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     (errorObj?.data as Record<string, unknown>)?.message as string | undefined ??
                     String(errorObj?.data ?? "")
                 log("debug", `Session error: ${errorName} - ${errorMessage}`)
+
+                if (sid) {
+                    const w = sessions.get(sid)
+                    if (w) { w.pendingTools = 0; w.pendingCommands = 0 }
+                }
                 break
             }
 
             case "command.executed": {
                 for (const [, w] of sessions) {
                     resetSessionFlags(w)
+                }
+                if (!sid) break
+                const w = sessions.get(sid)
+                if (w) {
+                    w.pendingCommands = Math.max(0, w.pendingCommands - 1)
+                    w.lastActivityAt = Date.now()
                 }
                 break
             }
@@ -1453,6 +1506,27 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         },
         tool: {
             "task_complete": taskCompleteTool,
+        },
+
+        "tool.execute.before": async (input) => {
+            if (!input?.sessionID) return
+            const w = ensureWatch(input.sessionID)
+            w.pendingTools++
+            w.lastActivityAt = Date.now()
+        },
+
+        "command.execute.before": async (input) => {
+            if (!input?.sessionID) return
+            const w = ensureWatch(input.sessionID)
+            w.pendingCommands++
+            w.lastActivityAt = Date.now()
+        },
+
+        "tool.execute.after": async (input) => {
+            if (!input?.sessionID) return
+            const w = ensureWatch(input.sessionID)
+            w.pendingTools = Math.max(0, w.pendingTools - 1)
+            w.lastActivityAt = Date.now()
         },
     }
 }
