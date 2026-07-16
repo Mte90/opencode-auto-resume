@@ -647,7 +647,6 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     }
 
     function resetIdleFlags(w: SessionWatch) {
-        w.userCancelled = false
         w.aborting = false
         w.orphanWatchStartAt = null
         w.idleSince = Date.now()
@@ -1243,7 +1242,15 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     resetSessionFlags(w)
                     prevBusyCount = busyCount()
                     log("debug", `${short(sid)} -> busy (${prevBusyCount})`)
-                } else if (statusType === "idle" || statusType === "interrupted") {
+                } else if (statusType === "interrupted") {
+                    // User pressed Esc — clear timers, back off, let them write
+                    w.status = "idle"
+                    resetIdleFlags(w)
+                    w.userCancelled = true
+                    if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
+                    prevBusyCount = busyCount()
+                    log("info", `${short(sid)} -> interrupted by user, backing off`)
+                } else if (statusType === "idle") {
                     w.status = "idle"
                     resetIdleFlags(w)
 
@@ -1257,13 +1264,13 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         }
                     }
                     prevBusyCount = currentBusy
-                    log("debug", `${short(sid)} -> idle (${currentBusy})${statusType === "interrupted" ? " (interrupted)" : ""}`)
+                    log("debug", `${short(sid)} -> idle (${currentBusy})`)
 
                     if (!w.isSubagent) {
                         const todos = w.todos || []
                         const hasOpenTodos = todos.some(t => t.status === "pending" || t.status === "in_progress")
                         
-                        if (hasOpenTodos && currentBusy === 0 && !w.completionSignaled) {
+                        if (hasOpenTodos && currentBusy === 0 && !w.completionSignaled && !w.userCancelled) {
                             const isCelebration = await lastAssistantEndsWithCelebration(sid)
                             if (isCelebration) {
                                 await log("info", `${short(sid)} - 🎉 detected in idle handler, skipping continue`)
@@ -1278,12 +1285,11 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         }
                     }
 
-                    if (!w.completionSignaled && w.toolTextAttempts < maxRetries) {
+                    if (!w.completionSignaled && !w.userCancelled && w.toolTextAttempts < maxRetries) {
                         if (w.toolTextTimer) clearTimeout(w.toolTextTimer)
-                        const checkDelay = statusType === "interrupted" ? 500 : TOOL_TEXT_CHECK_DELAY_MS
                         w.toolTextTimer = setTimeout(() => {
                             checkForToolCallAsText(sid, w)
-                        }, checkDelay)
+                        }, TOOL_TEXT_CHECK_DELAY_MS)
                     }
                 } else if (statusType === "retry") {
                     touchSession(sid)
@@ -1326,39 +1332,11 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 if (!sid) break
                 const w = sessions.get(sid)
                 if (w) {
-                    const wasJustContinued = w.continuing || (Date.now() - w.lastRetryAt < 2000)
-                    
                     w.status = "idle"
                     resetIdleFlags(w)
-                    log("debug", `${short(sid)} -> interrupted${wasJustContinued ? " (after continue)" : ""}`)
-
-                    // If we just sent a continue and it got interrupted, retry immediately
-                    // But limit to 3 consecutive interrupted continues to prevent infinite loops
-                    if (wasJustContinued && w.interruptedContinueCount < 3 && !w.toolTextRecovered && w.toolTextAttempts < maxRetries) {
-                        w.interruptedContinueCount++
-                        await log("info", `${short(sid)} - continue was interrupted (${w.interruptedContinueCount}/3), retrying...`)
-                        w.continuing = false // Reset flag so we can send again
-                        try {
-                            await sendContinuePrompt(sid, "continue", w)
-                            await log("info", `${short(sid)} - interrupted continue retried`)
-                        } catch (err) {
-                            const errMsg = err instanceof Error ? err.message : String(err)
-                            await log("warn", `${short(sid)} - interrupted continue retry failed: ${errMsg}`)
-                        }
-                        return // Don't schedule another check
-                    } else if (wasJustContinued && w.interruptedContinueCount >= 3) {
-                        await log("warn", `${short(sid)} - too many interrupted continues (${w.interruptedContinueCount}), stopping retries`)
-                        w.interruptedContinueCount = 0 // Reset counter
-                        // Fall through to normal tool-text check
-                    }
-
-                    // Check immediately for tool calls that were cut off
-                    if (!w.toolTextRecovered && w.toolTextAttempts < maxRetries) {
-                        if (w.toolTextTimer) clearTimeout(w.toolTextTimer)
-                        w.toolTextTimer = setTimeout(() => {
-                            checkForToolCallAsText(sid, w)
-                        }, 500)
-                    }
+                    w.userCancelled = true
+                    if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
+                    log("info", `${short(sid)} -> interrupted by user, backing off`)
                 }
                 break
             }

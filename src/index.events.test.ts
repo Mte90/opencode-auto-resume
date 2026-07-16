@@ -150,7 +150,7 @@ describe("handleEvent - session.status", () => {
         expect(promptCalls.length).toBe(0)
     })
 
-    test("status 'interrupted' → session set to idle, resetIdleFlags called, tool-text timer scheduled at 500ms", async () => {
+    test("status 'interrupted' → userCancelled set, no continue sent, timer cleared", async () => {
         const { ctx, promptCalls } = createMockContext({
             sessions: [{ id: "ses_test1", status: "busy" }],
             messages: {}
@@ -159,12 +159,9 @@ describe("handleEvent - session.status", () => {
 
         await hooks.event({ event: { type: "session.status", sessionID: "ses_test1", properties: { status: "interrupted" } } })
 
-        // Wait for 500ms check to happen
         await wait(600)
 
-        // Should have triggered a check (may or may not send continue depending on messages)
-        // The key is it doesn't crash and uses 500ms delay
-        expect(promptCalls.length).toBeGreaterThanOrEqual(0)
+        expect(promptCalls.length).toBe(0)
     })
 
     test("status with object { type: 'busy' } → treated as busy", async () => {
@@ -214,7 +211,7 @@ describe("handleEvent - session.idle", () => {
 })
 
 describe("handleEvent - session.interrupted", () => {
-    test("session.interrupted without recent continue → status set to idle, tool-text check scheduled at 500ms", async () => {
+    test("session.interrupted → no continue sent, backs off", async () => {
         const { ctx, promptCalls } = createMockContext({
             sessions: [{ id: "ses_test1", status: "busy" }],
             messages: {}
@@ -225,10 +222,10 @@ describe("handleEvent - session.interrupted", () => {
 
         await wait(600)
 
-        expect(promptCalls.length).toBeGreaterThanOrEqual(0)
+        expect(promptCalls.length).toBe(0)
     })
 
-    test("session.interrupted with recent continue → retry continue sent immediately", async () => {
+    test("session.interrupted after continue → NO retry, backs off", async () => {
         const { ctx, promptCalls } = createMockContext({
             sessions: [{ id: "ses_test1", status: "busy" }],
             messages: {
@@ -240,10 +237,8 @@ describe("handleEvent - session.interrupted", () => {
         })
         const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1 })
 
-        // First send busy to register the session
         await hooks.event({ event: { type: "session.status", sessionID: "ses_test1", properties: { status: "busy" } } })
 
-        // Set up open todos so idle triggers continue
         await hooks.event({
             event: {
                 type: "todo.updated",
@@ -252,56 +247,68 @@ describe("handleEvent - session.interrupted", () => {
             }
         })
 
-        // Send idle - this triggers tryResume which sets continuing=true then lastRetryAt
         await hooks.event({ event: { type: "session.status", sessionID: "ses_test1", properties: { status: "idle" } } })
 
-        // Wait for continue to be sent (sendContinuePrompt sets lastRetryAt)
         await wait(150)
-        const afterFirstContinue = promptCalls.length
-        expect(afterFirstContinue).toBe(1) // First continue should have been sent
+        expect(promptCalls.length).toBe(1)
 
-        // Now send interrupted immediately - wasJustContinued should be true because lastRetryAt < 2000ms
         await hooks.event({ event: { type: "session.interrupted", sessionID: "ses_test1" } })
 
-        await wait(100)
+        await wait(200)
 
-        // Should have sent another continue due to interrupted retry logic (lines 1312-1323)
-        expect(promptCalls.length).toBeGreaterThan(afterFirstContinue)
-        expect(promptCalls.length).toBe(2) // Second retry should have been sent
+        expect(promptCalls.length).toBe(1)
     })
 
-    test("session.interrupted max retries (3) → on 4th interrupt, no retry, falls through to tool-text check", async () => {
+    test("after interrupt, subsequent idle does NOT send continue (userCancelled persists)", async () => {
         const { ctx, promptCalls } = createMockContext({
             sessions: [{ id: "ses_test1", status: "busy" }],
-            messages: {
-                "ses_test1": [
-                    { role: "assistant", parts: [{ type: "text", text: "working..." }] },
-                    { role: "user", parts: [{ type: "text", text: "continue" }] }
-                ]
-            }
+            messages: {}
         })
         const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1 })
 
-        // Send busy first
-        await hooks.event({ event: { type: "session.status", sessionID: "ses_test1", properties: { status: "busy" } } })
+        await hooks.event({
+            event: {
+                type: "todo.updated",
+                sessionID: "ses_test1",
+                properties: { todos: [{ id: "t1", content: "task", status: "pending", priority: "high" }] }
+            }
+        })
 
-        // Simulate 3 interrupted continues
-        for (let i = 0; i < 3; i++) {
-            await hooks.event({ event: { type: "session.status", sessionID: "ses_test1", properties: { status: "idle" } } })
-            await wait(100)
-            await hooks.event({ event: { type: "session.interrupted", sessionID: "ses_test1" } })
-            await wait(100)
-        }
-
-        const promptCountAfter3 = promptCalls.length
-
-        // 4th interrupt - should NOT send retry continue
         await hooks.event({ event: { type: "session.interrupted", sessionID: "ses_test1" } })
-        await wait(600)
+        await wait(100)
 
-        // Should not have sent another retry (counter reset, falls to tool-text check)
-        // The exact behavior depends on messages, but interruptedContinueCount should reset
-        expect(promptCalls.length).toBeGreaterThanOrEqual(promptCountAfter3)
+        await hooks.event({ event: { type: "session.status", sessionID: "ses_test1", properties: { status: "idle" } } })
+        await wait(200)
+
+        expect(promptCalls.length).toBe(0)
+    })
+
+    test("after Esc, user writes message → busy clears userCancelled → idle resumes continues", async () => {
+        const { ctx, promptCalls } = createMockContext({
+            sessions: [{ id: "ses_test1", status: "busy" }],
+            messages: {}
+        })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1 })
+
+        await hooks.event({
+            event: {
+                type: "todo.updated",
+                sessionID: "ses_test1",
+                properties: { todos: [{ id: "t1", content: "task", status: "pending", priority: "high" }] }
+            }
+        })
+
+        await hooks.event({ event: { type: "session.interrupted", sessionID: "ses_test1" } })
+        await wait(100)
+        expect(promptCalls.length).toBe(0)
+
+        await hooks.event({ event: { type: "session.status", sessionID: "ses_test1", properties: { status: "busy" } } })
+        await wait(50)
+
+        await hooks.event({ event: { type: "session.status", sessionID: "ses_test1", properties: { status: "idle" } } })
+        await wait(200)
+
+        expect(promptCalls.length).toBe(1)
     })
 })
 
