@@ -670,7 +670,7 @@ describe("Hallucination Guard Regression Tests (MT1 + MT2)", () => {
         // Session goes idle with tool-call-as-text in messages.
         await hooks.event({ event: { type: "session.status", sessionID: sid, properties: { status: "idle" } } } as any)
 
-        // Wait for checkForToolCallAsText timer (TOOL_TEXT_CHECK_DELAY_MS = 3000ms).
+        // Wait for checkForToolCallAsText timer (default toolTextCheckDelayMs = 3000ms).
         await new Promise((resolve) => setTimeout(resolve, 3200))
 
         // With the guard: abort called, prompt NOT called yet (tryAbortAndResume

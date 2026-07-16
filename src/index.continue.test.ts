@@ -335,7 +335,7 @@ describe("Continue behavior — repeated continues until done", () => {
         expect(promptCalls.length).toBe(2)
     })
 
-    test("continue fires 4+ times — no hard retry limit on idle-with-open-todos path", async () => {
+    test("continue fires repeatedly — todoNudgeAttempts persists across busy/idle cycles", async () => {
         const messages = {
             ses_persist: [
                 { role: "user", parts: [{ type: "text", text: "do work" }] },
@@ -346,7 +346,7 @@ describe("Continue behavior — repeated continues until done", () => {
             sessions: [{ id: "ses_persist", status: "busy" }],
             messages
         })
-        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1 })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, maxRetries: 10 })
 
         await hooks.event(makeTodoUpdatedEvent("ses_persist", OPEN_TODOS))
 
@@ -365,7 +365,6 @@ describe("Continue behavior — repeated continues until done", () => {
             }
         }
 
-        // 5 continues fired — no hard limit on the idle-with-open-todos path
         expect(promptCalls.length).toBe(5)
     })
 })

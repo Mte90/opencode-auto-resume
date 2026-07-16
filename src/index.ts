@@ -42,6 +42,8 @@ interface SessionWatch {
     isSubagent: boolean
     completionSignaled: boolean
     todoNudgeAttempts: number
+    taskCompleteOverrides: number
+    doneClaimNoTodosAttempts: number
     pendingTools: number
     pendingCommands: number
 }
@@ -56,8 +58,8 @@ const DEFAULT_SUBAGENT_WAIT_MS = 15_000
 const ABORT_CONTINUE_DELAY_MS = 2_000
 const DEFAULT_LOOP_MAX_CONTINUES = 3
 const DEFAULT_LOOP_WINDOW_MS = 10 * 60_000
-const TOOL_TEXT_CHECK_DELAY_MS = 3_000
-const MIN_ACTIVITY_GAP_MS = 1_000
+const DEFAULT_TOOL_TEXT_CHECK_DELAY_MS = 3_000
+const DEFAULT_MIN_ACTIVITY_GAP_MS = 1_000
 const MAX_IDLE_SESSIONS = 50
 const IDLE_CLEANUP_MS = 10 * 60_000
 const SESSION_DISCOVERY_INTERVAL_MS = 60_000
@@ -183,6 +185,10 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     (options?.loopMaxContinues as number) ?? DEFAULT_LOOP_MAX_CONTINUES
     const loopWindowMs: number =
     (options?.loopWindowMs as number) ?? DEFAULT_LOOP_WINDOW_MS
+    const toolTextCheckDelayMs: number =
+    (options?.toolTextCheckDelayMs as number) ?? DEFAULT_TOOL_TEXT_CHECK_DELAY_MS
+    const minActivityGapMs: number =
+    (options?.minActivityGapMs as number) ?? DEFAULT_MIN_ACTIVITY_GAP_MS
 
     const sessions = new Map<string, SessionWatch>()
     let timer: ReturnType<typeof setInterval> | null = null
@@ -241,6 +247,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 isSubagent: false,
                 completionSignaled: false,
                 todoNudgeAttempts: 0,
+                taskCompleteOverrides: 0,
+                doneClaimNoTodosAttempts: 0,
                 pendingTools: 0,
                 pendingCommands: 0,
             }
@@ -448,9 +456,9 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         // Deferred check: verify the session went busy after prompt
         setTimeout(async () => {
             if (w.status !== "busy") {
-                await log("warn", `${short(sid)} - prompt sent >${TOOL_TEXT_CHECK_DELAY_MS / 1000}s ago but session is still ${w.status}`)
+                await log("warn", `${short(sid)} - prompt sent >${toolTextCheckDelayMs / 1000}s ago but session is still ${w.status}`)
             }
-        }, TOOL_TEXT_CHECK_DELAY_MS)
+        }, toolTextCheckDelayMs)
     }
 
     function extractMessages(response: Record<string, unknown>): Array<Record<string, unknown>> {
@@ -644,7 +652,6 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         w.toolTextRecovered = false
         w.toolTextAttempts = 0
         w.completionSignaled = false
-        w.todoNudgeAttempts = 0
         w.continueTimestamps = []
         w.idleSince = null
         w.continuing = false
@@ -886,14 +893,21 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         const todos = w.todos || []
                         const hasOpenTodos = todos.some(t => t.status === "pending" || t.status === "in_progress")
                         
-                        if (hasOpenTodos) {
-                            await log("info", `${short(sid)} - model claims done but todos remain open. Sending recovery prompt...`)
-                            bestCandidate = {
-                                prompt: DONE_WITHOUT_WORK_PROMPT,
-                                source: "done-claim-no-emoji",
-                                priority: 1,
-                            }
+                    if (hasOpenTodos) {
+                        await log("info", `${short(sid)} - model claims done but todos remain open. Sending recovery prompt...`)
+                        bestCandidate = {
+                            prompt: DONE_WITHOUT_WORK_PROMPT,
+                            source: "done-claim-no-emoji",
+                            priority: 1,
                         }
+                    } else if (w.doneClaimNoTodosAttempts < maxRetries) {
+                        await log("info", `${short(sid)} - model claims done with no open todos. Sending verification prompt (attempt ${w.doneClaimNoTodosAttempts + 1}/${maxRetries})...`)
+                        bestCandidate = {
+                            prompt: DONE_WITHOUT_WORK_PROMPT,
+                            source: "done-claim-no-todos",
+                            priority: 1,
+                        }
+                    }
                     }
                 }
             }
@@ -928,26 +942,30 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             if (!bestCandidate) return
 
             const isOpenTodosReminder = bestCandidate.source === "idle-with-open-todos-reminder"
+            const isDoneClaimNoTodos = bestCandidate.source === "done-claim-no-todos"
             if (isOpenTodosReminder) {
                 if (w.todoNudgeAttempts >= maxRetries) {
-                    await log("info", `${short(sid)} - max open-todos nudges (${maxRetries}) reached for this idle cycle, waiting for activity`)
+                    await log("info", `${short(sid)} - max open-todos nudges (${maxRetries}) reached, waiting for activity`)
                     return
                 }
                 w.todoNudgeAttempts++
+            } else if (isDoneClaimNoTodos) {
+                w.doneClaimNoTodosAttempts++
             } else {
                 w.toolTextRecovered = true
                 w.toolTextAttempts++
             }
 
+            const attemptNum = isOpenTodosReminder ? w.todoNudgeAttempts : isDoneClaimNoTodos ? w.doneClaimNoTodosAttempts : w.toolTextAttempts
             await log(
                 "info",
                 `${bestCandidate.source} detected on ${short(sid)}! ` +
-                `Attempt ${isOpenTodosReminder ? w.todoNudgeAttempts : w.toolTextAttempts}/${maxRetries}. Sending recovery prompt...`,
+                `Attempt ${attemptNum}/${maxRetries}. Sending recovery prompt...`,
             )
 
             // Guard: don't send if another plugin or user recently sent a prompt
             const timeSinceActivity = Date.now() - w.lastActivityAt
-            if (timeSinceActivity < MIN_ACTIVITY_GAP_MS) {
+            if (timeSinceActivity < minActivityGapMs) {
                 await log("info", `${short(sid)} - skipping ${bestCandidate.source}, session was active ${Math.round(timeSinceActivity / 1000)}s ago`)
                 return
             }
@@ -1310,7 +1328,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         const todos = w.todos || []
                         const hasOpenTodos = todos.some(t => t.status === "pending" || t.status === "in_progress")
                         
-                        if (hasOpenTodos && currentBusy === 0 && !w.completionSignaled && !w.userCancelled) {
+                        if (hasOpenTodos && currentBusy === 0 && !w.completionSignaled && !w.userCancelled && w.todoNudgeAttempts < maxRetries) {
                             const isCelebration = await lastAssistantEndsWithCelebration(sid)
                             if (isCelebration) {
                                 await log("info", `${short(sid)} - 🎉 detected in idle handler, skipping continue`)
@@ -1318,8 +1336,9 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                                 w.completionSignaled = true
                                 if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
                             } else {
+                                w.todoNudgeAttempts++
                                 const reminder = buildOpenTodosReminder(todos)
-                                await log("info", `${short(sid)} - idle with ${todos.filter(t => t.status === "pending" || t.status === "in_progress").length} open todos. Sending reminder...`)
+                                await log("info", `${short(sid)} - idle with ${todos.filter(t => t.status === "pending" || t.status === "in_progress").length} open todos. Sending reminder (nudge ${w.todoNudgeAttempts}/${maxRetries})...`)
                                 tryResume(sid, w, "Idle with open todos", reminder)
                             }
                         }
@@ -1329,7 +1348,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         if (w.toolTextTimer) clearTimeout(w.toolTextTimer)
                         w.toolTextTimer = setTimeout(() => {
                             checkForToolCallAsText(sid, w)
-                        }, TOOL_TEXT_CHECK_DELAY_MS)
+                        }, toolTextCheckDelayMs)
                     }
                 } else if (statusType === "retry") {
                     touchSession(sid)
@@ -1364,7 +1383,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         if (w.toolTextTimer) clearTimeout(w.toolTextTimer)
                         w.toolTextTimer = setTimeout(() => {
                             checkForToolCallAsText(sid, w)
-                        }, TOOL_TEXT_CHECK_DELAY_MS)
+                        }, toolTextCheckDelayMs)
                     }
                 }
                 break
@@ -1453,9 +1472,15 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         execute: async (_args, ctx) => {
             const w = sessions.get(ctx.sessionID)
             if (w) {
-                // Only set toolTextRecovered for PARENT sessions
-                // Subagents can call task_complete without blocking future continues
                 if (!w.isSubagent) {
+                    const openTodos = (w.todos || []).filter(t => t.status === "pending" || t.status === "in_progress")
+
+                    if (openTodos.length > 0 && w.taskCompleteOverrides < maxRetries) {
+                        w.taskCompleteOverrides++
+                        await log("info", `${short(ctx.sessionID)} - task_complete blocked: ${openTodos.length} open todos remain (override ${w.taskCompleteOverrides}/${maxRetries})`)
+                        return `You have ${openTodos.length} unfinished task(s). Please complete all remaining work before signaling completion.`
+                    }
+
                     w.toolTextRecovered = true
                     w.completionSignaled = true
                     if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }

@@ -354,7 +354,7 @@ describe("checkForToolCallAsText detection", () => {
         expect(promptCalls.length).toBeGreaterThan(0)
     })
 
-    test("Assistant text contains all done + NO open todos → NO prompt", async () => {
+    test("Assistant text contains all done + NO open todos → sends verification prompt", async () => {
         const { ctx, promptCalls } = createMockContext({
             sessions: [{ id: "ses_test12", status: "idle" }],
             messages: {
@@ -369,14 +369,14 @@ describe("checkForToolCallAsText detection", () => {
             }
         })
 
-        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1 })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, minActivityGapMs: 0 })
         await hooks.event(makeTodoUpdatedEvent("ses_test12", CLOSED_TODOS))
         await hooks.event(makeStatusEvent("ses_test12", "busy"))
         await hooks.event(makeStatusEvent("ses_test12", "idle"))
         await wait(3500)
 
-        const continueCalls = promptCalls.filter(c => c.body === "continue" || c.body.includes("verify"))
-        expect(continueCalls.length).toBe(0)
+        const verifyCalls = promptCalls.filter(c => c.body.includes("verify"))
+        expect(verifyCalls.length).toBe(1)
     })
 
     test("Assistant text ends with 🎉 → NO prompt sent", async () => {

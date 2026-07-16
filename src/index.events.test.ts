@@ -550,6 +550,235 @@ describe("task_complete tool", () => {
 
         expect(result).toContain("Task completion acknowledged")
     })
+
+    test("task_complete with open todos → blocks completion, returns unfinished-task message", async () => {
+        const { ctx, promptCalls } = createMockContext({
+            sessions: [{ id: "ses_parent", status: "busy" }],
+            messages: {}
+        })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, maxRetries: 3 })
+
+        await hooks.event({ event: { type: "session.status", sessionID: "ses_parent", properties: { status: "busy" } } })
+
+        // Set up open todos
+        await hooks.event({
+            event: {
+                type: "todo.updated",
+                sessionID: "ses_parent",
+                properties: { todos: [
+                    { id: "t1", content: "task A", status: "pending", priority: "medium" },
+                    { id: "t2", content: "task B", status: "in_progress", priority: "high" },
+                ] }
+            }
+        })
+
+        // Call task_complete — should be blocked
+        const result = await hooks.tool["task_complete"].execute({}, { sessionID: "ses_parent" } as any)
+
+        expect(result).toContain("unfinished task")
+        expect(result).not.toContain("Task completion acknowledged")
+
+        // Send idle — since completionSignaled was NOT set, the idle handler should send a reminder
+        await hooks.event({ event: { type: "session.status", sessionID: "ses_parent", properties: { status: "idle" } } })
+        await wait(100)
+
+        expect(promptCalls.length).toBeGreaterThan(0)
+    })
+
+    test("task_complete with open todos after maxRetries → accepts completion", async () => {
+        const { ctx, promptCalls } = createMockContext({
+            sessions: [{ id: "ses_parent", status: "busy" }],
+            messages: {}
+        })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, maxRetries: 1 })
+
+        await hooks.event({ event: { type: "session.status", sessionID: "ses_parent", properties: { status: "busy" } } })
+
+        await hooks.event({
+            event: {
+                type: "todo.updated",
+                sessionID: "ses_parent",
+                properties: { todos: [{ id: "t1", content: "task A", status: "pending", priority: "medium" }] }
+            }
+        })
+
+        // First call — blocked (override 1/1)
+        const result1 = await hooks.tool["task_complete"].execute({}, { sessionID: "ses_parent" } as any)
+        expect(result1).toContain("unfinished task")
+
+        // Second call — maxRetries reached, completion accepted
+        const result2 = await hooks.tool["task_complete"].execute({}, { sessionID: "ses_parent" } as any)
+        expect(result2).toContain("Task completion acknowledged")
+
+        // Send idle — should NOT trigger continue because completionSignaled is now true
+        await hooks.event({ event: { type: "session.status", sessionID: "ses_parent", properties: { status: "idle" } } })
+        await wait(100)
+
+        expect(promptCalls.length).toBe(0)
+    })
+
+    test("taskCompleteOverrides persists across busy/idle cycle", async () => {
+        const { ctx } = createMockContext({
+            sessions: [{ id: "ses_parent", status: "busy" }],
+            messages: {}
+        })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, maxRetries: 2 })
+
+        await hooks.event({ event: { type: "session.status", sessionID: "ses_parent", properties: { status: "busy" } } })
+
+        await hooks.event({
+            event: {
+                type: "todo.updated",
+                sessionID: "ses_parent",
+                properties: { todos: [{ id: "t1", content: "task A", status: "pending", priority: "medium" }] }
+            }
+        })
+
+        // First call — blocked (override 1/2)
+        const result1 = await hooks.tool["task_complete"].execute({}, { sessionID: "ses_parent" } as any)
+        expect(result1).toContain("unfinished task")
+
+        // Session goes busy (agent responds to reminder) — resetSessionFlags called
+        await hooks.event({ event: { type: "session.status", sessionID: "ses_parent", properties: { status: "busy" } } })
+
+        // Second call — should still be blocked (override 2/2), counter persisted
+        const result2 = await hooks.tool["task_complete"].execute({}, { sessionID: "ses_parent" } as any)
+        expect(result2).toContain("unfinished task")
+
+        // Third call — maxRetries reached, completion accepted
+        const result3 = await hooks.tool["task_complete"].execute({}, { sessionID: "ses_parent" } as any)
+        expect(result3).toContain("Task completion acknowledged")
+    })
+})
+
+describe("done-claim text detection (no tool call)", () => {
+    test("todoNudgeAttempts persists across busy/idle cycle (not reset by resetSessionFlags)", async () => {
+        const { ctx, promptCalls } = createMockContext({
+            sessions: [{ id: "ses_persist", status: "busy" }],
+            messages: {}
+        })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, maxRetries: 2, toolTextCheckDelayMs: 1, minActivityGapMs: 0 })
+
+        // Set open todos
+        await hooks.event({
+            event: {
+                type: "todo.updated",
+                sessionID: "ses_persist",
+                properties: { todos: [{ id: "t1", content: "task A", status: "pending", priority: "medium" }] }
+            }
+        })
+
+        // First idle → reminder sent (nudge 1)
+        await hooks.event({ event: { type: "session.status", sessionID: "ses_persist", properties: { status: "idle" } } })
+        await wait(30)
+        expect(promptCalls.length).toBeGreaterThanOrEqual(1)
+
+        // Session goes busy → resetSessionFlags called, but todoNudgeAttempts should persist
+        await hooks.event({ event: { type: "session.status", sessionID: "ses_persist", properties: { status: "busy" } } })
+        await wait(10)
+
+        // Second idle → reminder sent (nudge 2)
+        await hooks.event({ event: { type: "session.status", sessionID: "ses_persist", properties: { status: "idle" } } })
+        await wait(30)
+        expect(promptCalls.length).toBeGreaterThanOrEqual(2)
+
+        // Third idle → maxRetries (2) reached, no more nudges
+        await hooks.event({ event: { type: "session.status", sessionID: "ses_persist", properties: { status: "busy" } } })
+        await wait(10)
+        await hooks.event({ event: { type: "session.status", sessionID: "ses_persist", properties: { status: "idle" } } })
+        await wait(30)
+
+        // Should still be 2, not 3 — counter persisted
+        expect(promptCalls.length).toBe(2)
+    })
+
+    test("done-claim text with no open todos → sends DONE_WITHOUT_WORK_PROMPT", async () => {
+        const { ctx, promptCalls } = createMockContext({
+            sessions: [{ id: "ses_notodos", status: "busy" }],
+            messages: {
+                ses_notodos: [
+                    {
+                        id: "m1",
+                        role: "user",
+                        parts: [{ type: "text", text: "do the thing" }]
+                    },
+                    {
+                        id: "m2",
+                        role: "assistant",
+                        parts: [{ type: "text", text: "Task completed." }]
+                    }
+                ]
+            }
+        })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, maxRetries: 3, toolTextCheckDelayMs: 1, minActivityGapMs: 0 })
+
+        // No open todos (empty todo list)
+        await hooks.event({
+            event: {
+                type: "todo.updated",
+                sessionID: "ses_notodos",
+                properties: { todos: [] }
+            }
+        })
+
+        // Session goes idle → after delay, checkForToolCallAsText runs
+        await hooks.event({ event: { type: "session.status", sessionID: "ses_notodos", properties: { status: "idle" } } })
+        await wait(50)
+
+        // Should have sent the DONE_WITHOUT_WORK_PROMPT
+        expect(promptCalls.length).toBeGreaterThanOrEqual(1)
+        const lastPrompt = promptCalls[promptCalls.length - 1]?.body ?? ""
+        expect(lastPrompt).toContain("verify")
+    })
+
+    test("done-claim text with no open todos → stops after maxRetries", async () => {
+        const { ctx, promptCalls } = createMockContext({
+            sessions: [{ id: "ses_cap", status: "busy" }],
+            messages: {
+                ses_cap: [
+                    {
+                        id: "m1",
+                        role: "user",
+                        parts: [{ type: "text", text: "do the thing" }]
+                    },
+                    {
+                        id: "m2",
+                        role: "assistant",
+                        parts: [{ type: "text", text: "Task completed." }]
+                    }
+                ]
+            }
+        })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, maxRetries: 2, toolTextCheckDelayMs: 1, minActivityGapMs: 0 })
+
+        // No open todos
+        await hooks.event({
+            event: {
+                type: "todo.updated",
+                sessionID: "ses_cap",
+                properties: { todos: [] }
+            }
+        })
+
+        // First idle → prompt sent (attempt 1/2)
+        await hooks.event({ event: { type: "session.status", sessionID: "ses_cap", properties: { status: "idle" } } })
+        await wait(30)
+        expect(promptCalls.length).toBe(1)
+
+        // Busy → idle again (attempt 2/2)
+        await hooks.event({ event: { type: "session.status", sessionID: "ses_cap", properties: { status: "busy" } } })
+        await wait(10)
+        await hooks.event({ event: { type: "session.status", sessionID: "ses_cap", properties: { status: "idle" } } })
+        await wait(30)
+        expect(promptCalls.length).toBe(2)
+
+        // Busy → idle again → should NOT send (cap reached)
+        await hooks.event({ event: { type: "session.status", sessionID: "ses_cap", properties: { status: "busy" } } })
+        await wait(10)
+        await hooks.event({ event: { type: "session.status", sessionID: "ses_cap", properties: { status: "idle" } } })
+        await wait(30)
+        expect(promptCalls.length).toBe(2)
+    })
 })
 
 describe("handleEvent - edge cases", () => {
