@@ -432,3 +432,118 @@ describe("Continue behavior — 🎉 race condition fix", () => {
         expect(promptCalls.length).toBe(0)
     })
 })
+
+describe("Continue behavior — periodic idle recheck", () => {
+    test("periodic timer fires second nudge when session stays idle after first nudge", async () => {
+        const { ctx, promptCalls } = createContinueContext({
+            // Use "idle" as initial status so the periodic timer's status sync
+            // (line 1134-1137) doesn't overwrite w.status back to "busy".
+            sessions: [{ id: "ses_periodic", status: "idle" }],
+            messages: {
+                ses_periodic: [
+                    { role: "user", parts: [{ type: "text", text: "do work" }] },
+                    { role: "assistant", parts: [{ type: "text", text: "step 1" }] }
+                ]
+            }
+        })
+        const hooks = await AutoResumePlugin(ctx, {
+            enabled: true,
+            baseBackoffMs: 1,
+            checkIntervalMs: 50,
+            maxRetries: 5,
+            // Raise loopMaxContinues so isHallucinationLoop (which also counts
+            // periodic tryResume calls) doesn't intercept the second nudge.
+            loopMaxContinues: 10
+        })
+
+        await hooks.event(makeTodoUpdatedEvent("ses_periodic", OPEN_TODOS))
+
+        // Fire idle event → triggers idle handler → nudge 1
+        await hooks.event(makeStatusEvent("ses_periodic", "idle"))
+
+        // handleEvent is fire-and-forget (line 1532 lacks await),
+        // so yield briefly for the async chain to complete.
+        await wait(20)
+        expect(promptCalls.length).toBeGreaterThanOrEqual(1)
+
+        // Session stays idle — no more idle events.
+        // The periodic timer (50ms interval) rechecks and sends nudge 2.
+        await wait(400)
+        expect(promptCalls.length).toBeGreaterThanOrEqual(2)
+
+        const secondBody = promptCalls[1].body
+        expect(secondBody).toContain("unfinished task")
+    })
+
+    test("periodic recheck respects busyCount > 0 (skips nudge when subagent busy)", async () => {
+        const { ctx, promptCalls } = createContinueContext({
+            sessions: [
+                // ses_parent starts idle so periodic timer sync doesn't reset it,
+                // but ses_sub stays busy → busyCount = 1 → no nudge
+                { id: "ses_parent", status: "idle" },
+                { id: "ses_sub", status: "busy" }
+            ],
+            messages: {
+                ses_parent: [
+                    { role: "user", parts: [{ type: "text", text: "do work" }] },
+                    { role: "assistant", parts: [{ type: "text", text: "waiting for sub" }] }
+                ],
+                ses_sub: [
+                    { role: "assistant", parts: [{ type: "text", text: "working" }] }
+                ]
+            }
+        })
+        const hooks = await AutoResumePlugin(ctx, {
+            enabled: true,
+            baseBackoffMs: 1,
+            checkIntervalMs: 50,
+            maxRetries: 5,
+            loopMaxContinues: 10
+        })
+
+        // Register both sessions
+        await hooks.event(makeStatusEvent("ses_parent", "busy"))
+        await hooks.event(makeStatusEvent("ses_sub", "busy"))
+        await hooks.event(makeTodoUpdatedEvent("ses_parent", OPEN_TODOS))
+
+        // Parent goes idle but subagent still busy → busyCount = 1
+        await hooks.event(makeStatusEvent("ses_parent", "idle"))
+
+        // The idle handler respects busyCount > 0, so no instant nudge.
+        // The periodic recheck also checks busyCount() !== 0.
+        await wait(500)
+        expect(promptCalls.length).toBe(0)
+    })
+
+    test("periodic recheck respects maxRetries limit and stops after threshold", async () => {
+        const { ctx, promptCalls } = createContinueContext({
+            sessions: [{ id: "ses_limited", status: "idle" }],
+            messages: {
+                ses_limited: [
+                    { role: "user", parts: [{ type: "text", text: "do work" }] },
+                    { role: "assistant", parts: [{ type: "text", text: "step 1" }] }
+                ]
+            }
+        })
+        const hooks = await AutoResumePlugin(ctx, {
+            enabled: true,
+            baseBackoffMs: 1,
+            checkIntervalMs: 50,
+            maxRetries: 2,
+            loopMaxContinues: 10
+        })
+
+        await hooks.event(makeTodoUpdatedEvent("ses_limited", OPEN_TODOS))
+        await hooks.event(makeStatusEvent("ses_limited", "idle"))
+
+        // handleEvent is fire-and-forget; yield briefly for chain.
+        await wait(20)
+        expect(promptCalls.length).toBeGreaterThanOrEqual(1)
+
+        // Wait enough periodic timer cycles for retries to exhaust.
+        // todoNudgeAttempts: 0 → idle handler sets to 1 → periodic sets to 2,
+        // then stops at maxRetries=2 (todoNudgeAttempts >= maxRetries).
+        await wait(600)
+        expect(promptCalls.length).toBe(2)
+    })
+})
