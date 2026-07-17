@@ -1,4 +1,5 @@
 import { describe, test, expect } from "bun:test"
+import { buildOpenTodosReminder } from "./index"
 
 function short(id: string): string {
     return id.length > 8 ? id.slice(0, 4) + "…" + id.slice(-4) : id
@@ -182,5 +183,76 @@ describe("Agent validation", () => {
         const w = { agent: 123 } as { agent?: string }
         const agent = typeof w.agent === "string" ? w.agent : undefined
         expect(agent).toBe(undefined)
+    })
+})
+
+// -----------------------------------------------------------------------
+// Tests: buildOpenTodosReminder()
+// -----------------------------------------------------------------------
+
+interface TestTodo {
+    content: string
+    status: "pending" | "in_progress" | "completed" | "cancelled"
+    priority: "high" | "medium" | "low"
+}
+
+describe("buildOpenTodosReminder()", () => {
+    test("returns formatted reminder for pending todos", () => {
+        const todos: TestTodo[] = [
+            { content: "Fix login bug", status: "pending", priority: "high" },
+        ]
+        expect(buildOpenTodosReminder(todos)).toBe(
+            "You have 1 unfinished task:\n1. [pending] Fix login bug\n\nPlease continue working on this task."
+        )
+    })
+
+    test("returns formatted reminder for in_progress todos", () => {
+        const todos: TestTodo[] = [
+            { content: "Write tests", status: "in_progress", priority: "high" },
+        ]
+        const result = buildOpenTodosReminder(todos)
+        expect(result).toContain("[in_progress] Write tests")
+        expect(result).toContain("1 unfinished task")
+    })
+
+    test("lists multiple open todos with correct indices", () => {
+        const todos: TestTodo[] = [
+            { content: "Task one", status: "pending", priority: "high" },
+            { content: "Task two", status: "in_progress", priority: "medium" },
+            { content: "Task three", status: "pending", priority: "low" },
+        ]
+        const result = buildOpenTodosReminder(todos)
+        expect(result).toContain("1. [pending] Task one")
+        expect(result).toContain("2. [in_progress] Task two")
+        expect(result).toContain("3. [pending] Task three")
+        expect(result).toContain("3 unfinished tasks")
+    })
+
+    test("returns 'continue' for empty array", () => {
+        expect(buildOpenTodosReminder([])).toBe("continue")
+    })
+
+    test("returns 'continue' when all todos are completed", () => {
+        const todos: TestTodo[] = [
+            { content: "Done task", status: "completed", priority: "high" },
+            { content: "Cancelled task", status: "cancelled", priority: "low" },
+        ]
+        expect(buildOpenTodosReminder(todos)).toBe("continue")
+    })
+
+    test("returns 'continue' for non-array input (undefined)", () => {
+        expect(buildOpenTodosReminder(undefined as unknown as TestTodo[])).toBe("continue")
+    })
+
+    test("returns 'continue' for non-array input (null)", () => {
+        expect(buildOpenTodosReminder(null as unknown as TestTodo[])).toBe("continue")
+    })
+
+    test("returns 'continue' for non-array input (object)", () => {
+        expect(buildOpenTodosReminder({} as TestTodo[])).toBe("continue")
+    })
+
+    test("returns 'continue' for non-array input (string)", () => {
+        expect(buildOpenTodosReminder("not an array" as unknown as TestTodo[])).toBe("continue")
     })
 })

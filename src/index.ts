@@ -159,6 +159,7 @@ function containsDoneClaimPattern(text: string): boolean {
 }
 
 export function buildOpenTodosReminder(todos: Todo[]): string {
+    if (!Array.isArray(todos)) return "continue"
     const open = todos.filter(t => t.status === "pending" || t.status === "in_progress")
     if (open.length === 0) return "continue"
     const list = open.map((t, i) => `${i + 1}. [${t.status}] ${t.content}`).join("\n")
