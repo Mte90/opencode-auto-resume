@@ -18,6 +18,7 @@ interface ToolCallRecord {
 }
 
 interface SessionWatch {
+    createdAt: number
     lastActivityAt: number
     status: "busy" | "idle" | "retry" | "unknown"
     userCancelled: boolean
@@ -60,6 +61,8 @@ const DEFAULT_LOOP_MAX_CONTINUES = 3
 const DEFAULT_LOOP_WINDOW_MS = 10 * 60_000
 const DEFAULT_TOOL_TEXT_CHECK_DELAY_MS = 3_000
 const DEFAULT_MIN_ACTIVITY_GAP_MS = 1_000
+const DEFAULT_WARMUP_MS = 15_000
+const DEFAULT_DEBUG = false
 const MAX_IDLE_SESSIONS = 50
 const IDLE_CLEANUP_MS = 10 * 60_000
 const SESSION_DISCOVERY_INTERVAL_MS = 60_000
@@ -165,6 +168,24 @@ function containsDoneClaimPattern(text: string): boolean {
     return DONE_CLAIM_PATTERNS.some((pat) => pat.test(lastLines))
 }
 
+/**
+ * Detect an "action intent" — the model ends with `:` announcing intent
+ * (e.g. "Voy a editar el archivo:") without executing. Used to nudge.
+ */
+function containsActionIntent(text: string): boolean {
+    if (text.length <= 15) return false
+    const cleaned = text.replace(/<[a-zA-Z/?][^>]*>/g, "").trim()
+    const lines = cleaned.split('\n')
+    let lastLine = ""
+    for (let i = lines.length - 1; i >= 0; i--) {
+        if (lines[i].trim().length > 0) {
+            lastLine = lines[i].trim()
+            break
+        }
+    }
+    return lastLine.endsWith(":") && lastLine.length > 5 && lastLine.length < 500
+}
+
 function isOpenTodo(t: Todo): boolean {
     return t.status === "pending" || t.status === "in_progress"
 }
@@ -205,6 +226,23 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     (options?.toolTextCheckDelayMs as number) ?? DEFAULT_TOOL_TEXT_CHECK_DELAY_MS
     const minActivityGapMs: number =
     (options?.minActivityGapMs as number) ?? DEFAULT_MIN_ACTIVITY_GAP_MS
+    const warmupMs: number =
+    (options?.warmupMs as number) ?? DEFAULT_WARMUP_MS
+    const debug: boolean =
+    (options?.debug as boolean) ?? DEFAULT_DEBUG
+    const resumeOnActionIntent: boolean =
+    (options?.resumeOnActionIntent as boolean) !== false
+    const continuePrompt: string =
+    (options?.continuePrompt as string) ?? "continue"
+    const actionIntentPrompt: string =
+    (options?.actionIntentPrompt as string) ?? continuePrompt
+    const toolTextRecoveryPrompt: string =
+    (options?.toolTextRecoveryPrompt as string) ?? TOOL_TEXT_RECOVERY_PROMPT
+    const thinkingToolRecoveryPrompt: string =
+    (options?.thinkingToolRecoveryPrompt as string) ?? THINKING_TOOL_RECOVERY_PROMPT
+    const doneWithoutWorkPrompt: string =
+    (options?.doneWithoutWorkPrompt as string) ?? DONE_WITHOUT_WORK_PROMPT
+    const dbg = (...args: unknown[]) => { if (debug) console.log("[debug]", ...args) }
 
     const sessions = new Map<string, SessionWatch>()
     let timer: ReturnType<typeof setInterval> | null = null
@@ -239,6 +277,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         let w = sessions.get(sid)
         if (!w) {
             w = {
+                createdAt: Date.now(),
                 lastActivityAt: Date.now(),
                 status: "unknown",
                 userCancelled: false,
@@ -739,6 +778,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         if (w.status !== "idle") return
         if (w.checkingToolText) return
         w.checkingToolText = true
+        dbg(`checkForToolCallAsText called for ${short(sid)}, userCancelled=${w.userCancelled}, toolTextRecovered=${w.toolTextRecovered}, toolTextAttempts=${w.toolTextAttempts}`)
 
         // Backoff for tool-text recovery
         if (w.toolTextAttempts > 0) {
@@ -828,7 +868,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                             }
                         } else {
                             const candidate = {
-                                prompt: "continue",
+                                prompt: continuePrompt,
                                 source: "tool-use",
                                 priority: 1,
                             }
@@ -856,7 +896,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                             }
                         }
                         const candidate = {
-                            prompt: isReasoning ? THINKING_TOOL_RECOVERY_PROMPT : TOOL_TEXT_RECOVERY_PROMPT,
+                            prompt: isReasoning ? thinkingToolRecoveryPrompt : toolTextRecoveryPrompt,
                             source: isReasoning ? "reasoning" : "text",
                             priority: 0,
                         }
@@ -876,7 +916,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                             if (w.todoCheckAttempts >= 2) {
                                 await log("info", `${short(sid)} - todos completed but agent hasn't closed them. Sending continue...`)
                                 const candidate = {
-                                    prompt: "continue",
+                                    prompt: continuePrompt,
                                     source: "todo-completed-continue",
                                     priority: 1,
                                 }
@@ -891,8 +931,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         
                         const candidate = {
                             prompt: containsDoneClaimPattern(text)
-                                ? DONE_WITHOUT_WORK_PROMPT
-                                : "continue",
+                                ? doneWithoutWorkPrompt
+                                : continuePrompt,
                             source: containsDoneClaimPattern(text)
                                 ? "done-claim"
                                 : "ready-to-continue",
@@ -912,18 +952,39 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     if (hasOpenTodos) {
                         await log("info", `${short(sid)} - model claims done but todos remain open. Sending recovery prompt...`)
                         bestCandidate = {
-                            prompt: DONE_WITHOUT_WORK_PROMPT,
+                            prompt: doneWithoutWorkPrompt,
                             source: "done-claim-no-emoji",
                             priority: 1,
                         }
                     } else if (w.doneClaimNoTodosAttempts < maxRetries) {
                         await log("info", `${short(sid)} - model claims done with no open todos. Sending verification prompt (attempt ${w.doneClaimNoTodosAttempts + 1}/${maxRetries})...`)
                         bestCandidate = {
-                            prompt: DONE_WITHOUT_WORK_PROMPT,
+                            prompt: doneWithoutWorkPrompt,
                             source: "done-claim-no-todos",
                             priority: 1,
                         }
                     }
+                    }
+                }
+            }
+
+            if (resumeOnActionIntent) {
+                const lastAssistantMsg = messages.slice().reverse().find(m => (m.role ?? (m.info as Record<string, unknown> | undefined)?.role) === "assistant")
+                if (lastAssistantMsg) {
+                    let lastAssistantText = ""
+                    for (const part of ((lastAssistantMsg.parts as Array<Record<string, unknown>> | undefined) || [])) {
+                        lastAssistantText += (part.text as string ?? "") + "\n"
+                    }
+                    if (containsActionIntent(lastAssistantText)) {
+                        dbg(`ACTION INTENT DETECTED in checkForToolCallAsText for ${short(sid)}`)
+                        const candidate = {
+                            prompt: actionIntentPrompt,
+                            source: "action-intent",
+                            priority: 2,
+                        }
+                        if (!bestCandidate || candidate.priority < bestCandidate.priority) {
+                            bestCandidate = candidate
+                        }
                     }
                 }
             }
@@ -1046,7 +1107,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         if (w.status === "busy") w.status = "idle"
 
         try {
-            await sendContinuePrompt(sid, "continue", w)
+            await sendContinuePrompt(sid, continuePrompt, w)
             await log("info", `${short(sid)} - abort+continue done`)
             w.orphanWatchStartAt = null
             w.resumeAttempts++
@@ -1096,7 +1157,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         await log("info", `${reason} on ${short(sid)} (${idleSec}s, retry ${w.resumeAttempts}/${maxRetries})`)
 
         try {
-            await sendContinuePrompt(sid, prompt ?? "continue", w)
+            await sendContinuePrompt(sid, prompt ?? continuePrompt, w)
             await log("info", `${short(sid)} - retry sent`)
             return true
         } catch (err) {
@@ -1388,6 +1449,38 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     }
 
                     if (!w.completionSignaled && !w.userCancelled && w.toolTextAttempts < maxRetries) {
+                        if (resumeOnActionIntent && !w.toolTextRecovered) {
+                            const idleSid = sid
+                            const idleW = w
+                            setTimeout(async () => {
+                                try {
+                                    if (Date.now() - idleW.createdAt < warmupMs) {
+                                        dbg(`session.idle sid=${short(idleSid)}: skipping action intent, session is warming up (${Date.now() - idleW.createdAt}ms < ${warmupMs}ms)`)
+                                        return
+                                    }
+                                    const response = await ctx.client.session.messages({ path: { id: idleSid } })
+                                    const msgs = extractMessages(response as Record<string, unknown>)
+                                    const lastAssistantMsg = msgs.slice().reverse().find(m => (m.role ?? (m.info as Record<string, unknown> | undefined)?.role) === "assistant")
+                                    if (lastAssistantMsg) {
+                                        let lastText = ""
+                                        for (const part of ((lastAssistantMsg.parts as Array<Record<string, unknown>> | undefined) || [])) {
+                                            lastText += (part.text as string ?? "") + "\n"
+                                        }
+                                        if (containsActionIntent(lastText)) {
+                                            const w2 = sessions.get(idleSid)
+                                            if (!w2 || w2.toolTextRecovered || w2.completionSignaled || w2.status !== "idle") return
+                                            w2.toolTextRecovered = true
+                                            w2.toolTextAttempts++
+                                            dbg(`session.idle sid=${short(idleSid)}: ACTION INTENT DETECTED, sending "${actionIntentPrompt.slice(0, 40)}..."`)
+                                            await sendContinuePrompt(idleSid, actionIntentPrompt, w2)
+                                        }
+                                    }
+                                } catch (e) {
+                                    dbg(`session.idle sid=${short(idleSid)}: delayed check error: ${e}`)
+                                }
+                            }, 500)
+                        }
+
                         if (w.toolTextTimer) clearTimeout(w.toolTextTimer)
                         w.toolTextTimer = setTimeout(() => {
                             checkForToolCallAsText(sid, w)
@@ -1420,9 +1513,41 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 if (w) {
                     w.status = "idle"
                     resetIdleFlags(w)
+                    dbg(`session.idle sid=${short(sid)}: resetIdleFlags done, toolTextRecovered=${w.toolTextRecovered}, toolTextAttempts=${w.toolTextAttempts}, maxRetries=${maxRetries}`)
+
+                    if (resumeOnActionIntent && !w.toolTextRecovered && !w.completionSignaled) {
+                        setTimeout(async () => {
+                            try {
+                                if (Date.now() - w.createdAt < warmupMs) {
+                                    dbg(`session.idle sid=${short(sid)}: skipping action intent, session is warming up (${Date.now() - w.createdAt}ms < ${warmupMs}ms)`)
+                                    return
+                                }
+                                const response = await ctx.client.session.messages({ path: { id: sid } })
+                                const msgs = extractMessages(response as Record<string, unknown>)
+                                const lastAssistantMsg = msgs.slice().reverse().find(m => (m.role ?? (m.info as Record<string, unknown> | undefined)?.role) === "assistant")
+                                if (lastAssistantMsg) {
+                                    let lastText = ""
+                                    for (const part of ((lastAssistantMsg.parts as Array<Record<string, unknown>> | undefined) || [])) {
+                                        lastText += (part.text as string ?? "") + "\n"
+                                    }
+                                    if (containsActionIntent(lastText)) {
+                                        const w2 = sessions.get(sid)
+                                        if (!w2 || w2.toolTextRecovered || w2.completionSignaled || w2.status !== "idle") return
+                                        w2.toolTextRecovered = true
+                                        w2.toolTextAttempts++
+                                        dbg(`session.idle sid=${short(sid)}: ACTION INTENT DETECTED, sending "${actionIntentPrompt.slice(0, 40)}..."`)
+                                        await sendContinuePrompt(sid, actionIntentPrompt, w2)
+                                    }
+                                }
+                            } catch (e) {
+                                dbg(`session.idle sid=${short(sid)}: delayed check error: ${e}`)
+                            }
+                        }, 500)
+                    }
 
                     // Also check for tool-call-as-text on legacy idle event
-                    if (!w.toolTextRecovered && w.toolTextAttempts < maxRetries) {
+                    const shouldSet = !w.toolTextRecovered && w.toolTextAttempts < maxRetries
+                    if (shouldSet) {
                         if (w.toolTextTimer) clearTimeout(w.toolTextTimer)
                         w.toolTextTimer = setTimeout(() => {
                             checkForToolCallAsText(sid, w)
