@@ -158,6 +158,14 @@ function containsDoneClaimPattern(text: string): boolean {
     return DONE_CLAIM_PATTERNS.some((pat) => pat.test(lastLines))
 }
 
+function isOpenTodo(t: Todo): boolean {
+    return t.status === "pending" || t.status === "in_progress"
+}
+
+function getOpenTodos(todos: Todo[]): Todo[] {
+    return todos.filter(isOpenTodo)
+}
+
 export function buildOpenTodosReminder(todos: Todo[]): string {
     if (!Array.isArray(todos)) return "continue"
     const open = todos.filter(t => t.status === "pending" || t.status === "in_progress")
@@ -853,7 +861,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     if (containsReadyToContinuePattern(text)) {
                         // Check if todos exist and are all completed/cancelled
                         const todos = w.todos || []
-                        const hasOpenTodos = todos.some(t => t.status === "pending" || t.status === "in_progress")
+                        const hasOpenTodos = todos.some(isOpenTodo)
                         
                         if (!hasOpenTodos && todos.length > 0) {
                             // Todos exist but all are completed - check if we've tried enough times
@@ -892,7 +900,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     // This catches cases where model says "task completed" but doesn't use 🎉 or tool_call
                     if (!bestCandidate && containsDoneClaimPattern(text)) {
                         const todos = w.todos || []
-                        const hasOpenTodos = todos.some(t => t.status === "pending" || t.status === "in_progress")
+                        const hasOpenTodos = todos.some(isOpenTodo)
                         
                     if (hasOpenTodos) {
                         await log("info", `${short(sid)} - model claims done but todos remain open. Sending recovery prompt...`)
@@ -925,11 +933,11 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
             if (!bestCandidate) {
                 const todos = w.todos || []
-                const hasOpenTodos = todos.some(t => t.status === "pending" || t.status === "in_progress")
+                const hasOpenTodos = todos.some(isOpenTodo)
                 
                 if (hasOpenTodos && busyCount() === 0) {
                     const reminder = buildOpenTodosReminder(todos)
-                    await log("info", `${short(sid)} - no activity detected but todos remain open (${todos.filter(t => t.status === "pending" || t.status === "in_progress").length} tasks). Sending reminder...`)
+                    await log("info", `${short(sid)} - no activity detected but todos remain open (${getOpenTodos(todos).length} tasks). Sending reminder...`)
                     bestCandidate = {
                         prompt: reminder,
                         source: "idle-with-open-todos-reminder",
@@ -1258,6 +1266,33 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 }
             }
 
+            // Periodic idle session recheck: resume idle sessions with open todos
+            for (const [sid, w] of sessions) {
+                if (w.status !== "idle") continue
+                if (w.isSubagent) continue
+                if (w.userCancelled || w.completionSignaled) continue
+                if (w.continuing) continue
+                if (busyCount() !== 0) continue
+                const open = getOpenTodos(w.todos || [])
+                if (open.length === 0) continue
+                if (w.todoNudgeAttempts >= maxRetries) continue
+                const elapsedSinceLastNudge = Date.now() - w.lastRetryAt
+                const requiredBackoff = backoffMs(w.todoNudgeAttempts)
+                if (w.lastRetryAt > 0 && elapsedSinceLastNudge < requiredBackoff) continue
+                const isCelebration = await lastAssistantEndsWithCelebration(sid)
+                if (isCelebration) {
+                    w.toolTextRecovered = true
+                    w.completionSignaled = true
+                    continue
+                }
+                const reminder = buildOpenTodosReminder(w.todos || [])
+                const sent = await tryResume(sid, w, "Idle with open todos (periodic)", reminder)
+                if (sent) {
+                    w.todoNudgeAttempts++
+                    await log("info", `${short(sid)} - idle periodic recheck: nudge ${w.todoNudgeAttempts}/${maxRetries}`)
+                }
+            }
+
             // Periodic cleanup
             cleanupIdleSessions()
         }, checkIntervalMs)
@@ -1327,9 +1362,9 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
                     if (!w.isSubagent) {
                         const todos = w.todos || []
-                        const hasOpenTodos = todos.some(t => t.status === "pending" || t.status === "in_progress")
+                        const open = getOpenTodos(todos)
                         
-                        if (hasOpenTodos && currentBusy === 0 && !w.completionSignaled && !w.userCancelled && w.todoNudgeAttempts < maxRetries) {
+                        if (open.length > 0 && currentBusy === 0 && !w.completionSignaled && !w.userCancelled && w.todoNudgeAttempts < maxRetries) {
                             const isCelebration = await lastAssistantEndsWithCelebration(sid)
                             if (isCelebration) {
                                 await log("info", `${short(sid)} - 🎉 detected in idle handler, skipping continue`)
@@ -1339,8 +1374,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                             } else {
                                 w.todoNudgeAttempts++
                                 const reminder = buildOpenTodosReminder(todos)
-                                await log("info", `${short(sid)} - idle with ${todos.filter(t => t.status === "pending" || t.status === "in_progress").length} open todos. Sending reminder (nudge ${w.todoNudgeAttempts}/${maxRetries})...`)
-                                tryResume(sid, w, "Idle with open todos", reminder)
+                                await log("info", `${short(sid)} - idle with ${open.length} open todos. Sending reminder (nudge ${w.todoNudgeAttempts}/${maxRetries})...`)
+                                await tryResume(sid, w, "Idle with open todos", reminder)
                             }
                         }
                     }
