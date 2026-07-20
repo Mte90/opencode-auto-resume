@@ -457,6 +457,66 @@ describe("checkForToolCallAsText detection", () => {
         expect(continueCall).toBeDefined()
     })
 
+    test("Tool-call syntax inside fenced code block → NO tool-call recovery prompt", async () => {
+        const { ctx, promptCalls } = createMockContext({
+            sessions: [
+                { id: "ses_codeblock1", status: "idle" },
+                { id: "ses_blocker_cb1", status: "busy" }
+            ],
+            messages: {
+                "ses_codeblock1": [
+                    {
+                        role: "assistant",
+                        parts: [{
+                            type: "text",
+                            text: "Here is an example:\n```\n<function=edit path='test.ts'>\n</function>\n```\nLet me know if that helps."
+                        }]
+                    }
+                ]
+            }
+        })
+
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1 })
+        await hooks.event(makeStatusEvent("ses_blocker_cb1", "busy"))
+        await hooks.event(makeTodoUpdatedEvent("ses_codeblock1", OPEN_TODOS))
+        await hooks.event(makeStatusEvent("ses_codeblock1", "busy"))
+        await hooks.event(makeStatusEvent("ses_codeblock1", "idle"))
+        await wait(3500)
+
+        const recoveryCall = promptCalls.find(c => c.body.includes("tool call"))
+        expect(recoveryCall).toBeUndefined()
+    })
+
+    test("Tool-call syntax inside inline code → NO tool-call recovery prompt", async () => {
+        const { ctx, promptCalls } = createMockContext({
+            sessions: [
+                { id: "ses_codeblock2", status: "idle" },
+                { id: "ses_blocker_cb2", status: "busy" }
+            ],
+            messages: {
+                "ses_codeblock2": [
+                    {
+                        role: "assistant",
+                        parts: [{
+                            type: "text",
+                            text: "Use `<function=edit path='test.ts'>` to modify files."
+                        }]
+                    }
+                ]
+            }
+        })
+
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1 })
+        await hooks.event(makeStatusEvent("ses_blocker_cb2", "busy"))
+        await hooks.event(makeTodoUpdatedEvent("ses_codeblock2", OPEN_TODOS))
+        await hooks.event(makeStatusEvent("ses_codeblock2", "busy"))
+        await hooks.event(makeStatusEvent("ses_codeblock2", "idle"))
+        await wait(3500)
+
+        const recoveryCall = promptCalls.find(c => c.body.includes("tool call"))
+        expect(recoveryCall).toBeUndefined()
+    })
+
     test("maxRetries reached (toolTextAttempts >= 3) → NO prompt", async () => {
         const { ctx, promptCalls } = createMockContext({
             sessions: [{ id: "ses_test16", status: "idle" }],

@@ -117,11 +117,18 @@ const READY_TO_CONTINUE_PATTERNS = [
     /moving on to task/i,
 ]
 
+function stripCodeBlocks(text: string): string {
+    return text
+        .replace(/```[\s\S]*?```/g, "")
+        .replace(/`[^`\n]+`/g, "")
+}
+
 function containsToolCallAsText(text: string): boolean {
     if (text.length <= 10) return false
-    if (TOOL_TEXT_PATTERNS.some((pat) => pat.test(text))) return true
+    const stripped = stripCodeBlocks(text)
+    if (TOOL_TEXT_PATTERNS.some((pat) => pat.test(stripped))) return true
     for (const { open, close } of TRUNCATED_XML_PATTERNS) {
-        if (open.test(text) && !close.test(text)) return true
+        if (open.test(stripped) && !close.test(stripped)) return true
     }
     return false
 }
