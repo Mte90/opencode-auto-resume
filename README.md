@@ -73,6 +73,81 @@ _Motivated by:_
 
 ---
 
+### Streaming failure recovery
+
+The AI provider's streaming response can fail mid-stream (connection reset, timeout, socket close). When the provider reports an error whose **name** matches `streamingFailureErrorNames` (exact, case-sensitive) or whose **message** matches `streamingFailureMessagePatterns` (regex, case-insensitive), the plugin arms a deferred recovery instead of relying only on the generic stall timeout. Invalid regex patterns fall back to substring matching.
+
+**Default error names:**
+- `ProviderError`, `APIError`, `StreamError`, `ConnectionError`, `TimeoutError`
+
+**Default message patterns:**
+- `streaming response failed`, `stream.*fail`, `connection.*reset`, `connection.*closed`
+
+#### Recovery behavior
+
+1. **Detection**: `session.error` is classified via `isStreamingFailure()` against the configured error names and message patterns
+2. **State transition**: the session's `pendingRecovery` flag is armed with the error name (`pendingRecoveryReason`) and timestamp (`pendingRecoveryAt`)
+3. **Recovery attempt**: once the session is idle and the backoff delay has elapsed, the timer loop sends a recovery prompt
+4. **Watchdog**: if the session is still not busy 3 seconds after the prompt, the recovery is retried (up to `maxRecoveryRetries`) with exponential backoff
+5. **Escalation**: when retries are exhausted, the plugin aborts the session and resumes it (`abort+resume`); `gaveUp` is set if that also fails
+
+#### Configuration
+
+Add to your plugin options (in `opencode.jsonc`):
+
+```json
+{
+  "streamingFailureErrorNames": ["ProviderError", "APIError", "StreamError", "ConnectionError", "TimeoutError"],
+  "streamingFailureMessagePatterns": ["streaming response failed", "stream.*fail", "connection.*reset", "connection.*closed"],
+  "maxRecoveryRetries": 2,
+  "baseBackoffMs": 1000,
+  "maxBackoffMs": 8000
+}
+```
+
+#### State machine addition
+
+New per-session recovery fields added to the state machine:
+- `pendingRecovery` — failure detected, recovery armed
+- `pendingRecoveryReason` — error name that triggered the recovery
+- `pendingRecoveryAt` — detection timestamp (backoff anchor)
+- `recoveryAttempts` — recovery attempt counter
+- `watchdogRetryGuard` — watchdog retry in progress (keeps the recovery armed)
+
+Recovery chain: `pendingRecovery` → recovery attempt → `recoveryAttempts` retry → `abort+resume` → `gaveUp`.
+
+See [Recovery Flow Documentation](docs/architecture/recovery-flow.md) for the full state machine.
+
+#### Example scenario
+
+```
+1. AI provider starts streaming response
+2. Network interruption causes "connection reset" error mid-stream
+3. System detects "ConnectionError" matches streamingFailureErrorNames
+4. Session's pendingRecovery flag is armed (reason=ConnectionError)
+5. Session goes idle; timer loop waits until the backoff delay has elapsed
+6. Recovery prompt sent (recoveryAttempts=1)
+7. Success → session busy → recovery flags cleared
+   Still not busy after 3s → watchdog retry (attempt 2/2)
+   Still not busy after 3s → maxRecoveryRetries reached → abort + resume
+   Abort+continue fails → gaveUp
+```
+
+#### Configuration reference
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `streamingFailureErrorNames` | `string[]` | `["ProviderError","APIError","StreamError","ConnectionError","TimeoutError"]` | Error names that indicate a streaming failure (exact, case-sensitive) |
+| `streamingFailureMessagePatterns` | `string[]` | `["streaming response failed","stream.*fail","connection.*reset","connection.*closed"]` | Regex patterns matching streaming failure messages (case-insensitive) |
+| `maxRecoveryRetries` | `number` | `2` | Maximum streaming-failure recovery attempts before abort+resume escalation |
+| `baseBackoffMs` | `number` | `1000` | Initial backoff delay in milliseconds |
+| `maxBackoffMs` | `number` | `8000` | Maximum backoff delay cap in milliseconds |
+
+_Motivated by:_
+- [EPIC: Streaming Failure Recovery](docs/EPIC-Streaming-Recovery-OpenCode-Auto-Resume-v3.md) — recovery requests not consistently creating new assistant executions after mid-stream failures
+
+---
+
 ### Active-tool safety guard
 
 Before **any** abort, the plugin calls `checkSessionHasActiveTool()` to verify the session isn't mid-tool-execution. If a tool is running, the abort is skipped. This prevents the plugin from killing a long-running build, test suite, or command — even when it looks like a stall.
@@ -256,6 +331,11 @@ bun run build
 | `subagentWaitMs` | `15000` | Wait before treating orphan parent as stuck |
 | `loopMaxContinues` | `3` | Continues in window before triggering abort |
 | `loopWindowMs` | `600000` | Hallucination loop detection window (10 min) |
+| `streamingFailureErrorNames` | `["ProviderError","APIError","StreamError","ConnectionError","TimeoutError"]` | Error names that classify as streaming failures (exact match) |
+| `streamingFailureMessagePatterns` | `["streaming response failed","stream.*fail","connection.*reset","connection.*closed"]` | Regex patterns (case-insensitive) in error messages indicating streaming failure |
+| `maxRecoveryRetries` | `2` | Max streaming-failure recovery attempts before abort+resume escalation |
+
+Message patterns are matched case-insensitively. Error names use exact match.
 
 ### Internal constants (not configurable)
 

@@ -106,6 +106,159 @@ describe("Plugin Core Logic", () => {
             const elapsed2 = now - lastRetryAt2
             expect(elapsed2 >= backoffMs(0)).toBe(true)
         })
+
+        test("ensureWatch initializes pending recovery fields with defaults", () => {
+            const sessions = new Map<string, any>()
+
+            function ensureWatch(sid: string) {
+                if (!sessions.has(sid)) {
+                    sessions.set(sid, {
+                        createdAt: Date.now(),
+                        lastActivityAt: Date.now(),
+                        status: "unknown",
+                        userCancelled: false,
+                        resumeAttempts: 0,
+                        lastRetryAt: 0,
+                        gaveUp: false,
+                        orphanWatchStartAt: null,
+                        aborting: false,
+                        toolTextRecovered: false,
+                        toolTextAttempts: 0,
+                        continueTimestamps: [],
+                        idleSince: null,
+                        continuing: false,
+                        todos: [],
+                        todoCheckAttempts: 0,
+                        toolTextTimer: null,
+                        checkingToolText: false,
+                        lastSubagentCheckAt: 0,
+                        interruptedContinueCount: 0,
+                        recentToolCalls: [],
+                        toolLoopAttempts: 0,
+                        isSubagent: false,
+                        completionSignaled: false,
+                        todoNudgeAttempts: 0,
+                        taskCompleteOverrides: 0,
+                        doneClaimNoTodosAttempts: 0,
+                        pendingTools: 0,
+                        pendingCommands: 0,
+                        pendingRecovery: false,
+                        pendingRecoveryReason: null,
+                        pendingRecoveryAt: 0,
+                        recoveryAttempts: 0,
+                    })
+                }
+                return sessions.get(sid)
+            }
+
+            const w = ensureWatch("test-session")
+
+            expect(w.pendingRecovery).toBe(false)
+            expect(w.pendingRecoveryReason).toBeNull()
+            expect(w.pendingRecoveryAt).toBe(0)
+            expect(w.recoveryAttempts).toBe(0)
+        })
+
+        test("resetSessionFlags clears pending recovery fields", () => {
+            const w = {
+                userCancelled: true,
+                resumeAttempts: 2,
+                pendingTools: 5,
+                pendingCommands: 3,
+                gaveUp: true,
+                orphanWatchStartAt: Date.now(),
+                aborting: true,
+                toolTextRecovered: true,
+                toolTextAttempts: 1,
+                completionSignaled: true,
+                continueTimestamps: [Date.now()],
+                idleSince: Date.now(),
+                continuing: true,
+                todoCheckAttempts: 1,
+                checkingToolText: true,
+                interruptedContinueCount: 1,
+                recentToolCalls: [{ toolName: "bash", at: Date.now() }],
+                toolLoopAttempts: 1,
+                toolTextTimer: null,
+                pendingRecovery: true,
+                pendingRecoveryReason: "stream_stalled",
+                pendingRecoveryAt: Date.now(),
+                recoveryAttempts: 2,
+            }
+
+            function resetSessionFlags(w: any) {
+                w.userCancelled = false
+                w.resumeAttempts = 0
+                w.pendingTools = 0
+                w.pendingCommands = 0
+                w.gaveUp = false
+                w.orphanWatchStartAt = null
+                w.aborting = false
+                w.toolTextRecovered = false
+                w.toolTextAttempts = 0
+                w.completionSignaled = false
+                w.continueTimestamps = []
+                w.idleSince = null
+                w.continuing = false
+                w.todoCheckAttempts = 0
+                w.checkingToolText = false
+                w.interruptedContinueCount = 0
+                w.recentToolCalls = []
+                w.toolLoopAttempts = 0
+                if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
+                w.pendingRecovery = false
+                w.pendingRecoveryReason = null
+                w.pendingRecoveryAt = 0
+                w.recoveryAttempts = 0
+            }
+
+            resetSessionFlags(w)
+
+            expect(w.pendingRecovery).toBe(false)
+            expect(w.pendingRecoveryReason).toBeNull()
+            expect(w.pendingRecoveryAt).toBe(0)
+            expect(w.recoveryAttempts).toBe(0)
+        })
+
+        test("resetIdleFlags preserves pendingRecovery and pendingRecoveryReason", () => {
+            const w = {
+                aborting: true,
+                orphanWatchStartAt: Date.now(),
+                idleSince: null,
+                pendingTools: 5,
+                pendingCommands: 3,
+                pendingRecovery: true,
+                pendingRecoveryReason: "tool_text_detected",
+                pendingRecoveryAt: 123456,
+                recoveryAttempts: 1,
+            }
+
+            function resetIdleFlags(w: any) {
+                w.aborting = false
+                w.orphanWatchStartAt = null
+                w.idleSince = Date.now()
+                w.pendingTools = 0
+                w.pendingCommands = 0
+            }
+
+            const beforeRecovery = w.pendingRecovery
+            const beforeReason = w.pendingRecoveryReason
+            const beforeAt = w.pendingRecoveryAt
+            const beforeAttempts = w.recoveryAttempts
+
+            resetIdleFlags(w)
+
+            expect(w.pendingRecovery).toBe(beforeRecovery)
+            expect(w.pendingRecoveryReason).toBe(beforeReason)
+            expect(w.pendingRecoveryAt).toBe(beforeAt)
+            expect(w.recoveryAttempts).toBe(beforeAttempts)
+
+            expect(w.aborting).toBe(false)
+            expect(w.orphanWatchStartAt).toBeNull()
+            expect(w.idleSince).not.toBeNull()
+            expect(w.pendingTools).toBe(0)
+            expect(w.pendingCommands).toBe(0)
+        })
     })
 
     describe("Event parsing", () => {

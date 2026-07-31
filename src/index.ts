@@ -5,6 +5,7 @@
 
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
+import type { SessionPromptResponses } from "@opencode-ai/sdk"
 
 interface Todo {
     content: string
@@ -17,7 +18,7 @@ interface ToolCallRecord {
     at: number
 }
 
-interface SessionWatch {
+export interface SessionWatch {
     createdAt: number
     lastActivityAt: number
     status: "busy" | "idle" | "retry" | "unknown"
@@ -47,6 +48,11 @@ interface SessionWatch {
     doneClaimNoTodosAttempts: number
     pendingTools: number
     pendingCommands: number
+    pendingRecovery: boolean
+    pendingRecoveryReason: string | null
+    pendingRecoveryAt: number
+    recoveryAttempts: number
+    watchdogRetryGuard: boolean
 }
 
 const DEFAULT_CHUNK_TIMEOUT_MS = 45_000
@@ -60,9 +66,26 @@ const ABORT_CONTINUE_DELAY_MS = 2_000
 const DEFAULT_LOOP_MAX_CONTINUES = 3
 const DEFAULT_LOOP_WINDOW_MS = 10 * 60_000
 const DEFAULT_TOOL_TEXT_CHECK_DELAY_MS = 3_000
+const DEFAULT_MAX_RECOVERY_RETRIES = 2
 const DEFAULT_MIN_ACTIVITY_GAP_MS = 1_000
 const DEFAULT_WARMUP_MS = 15_000
 const DEFAULT_DEBUG = false
+
+const DEFAULT_STREAMING_FAILURE_ERROR_NAMES = [
+    "ProviderError",
+    "APIError",
+    "StreamError",
+    "ConnectionError",
+    "TimeoutError",
+]
+
+const DEFAULT_STREAMING_FAILURE_MESSAGE_PATTERNS = [
+    "streaming response failed",
+    "stream.*fail",
+    "connection.*reset",
+    "connection.*closed",
+]
+
 const MAX_IDLE_SESSIONS = 50
 const IDLE_CLEANUP_MS = 10 * 60_000
 const SESSION_DISCOVERY_INTERVAL_MS = 60_000
@@ -169,6 +192,50 @@ function containsDoneClaimPattern(text: string): boolean {
 }
 
 /**
+ * Classify an error as a streaming failure by error name (exact, case-sensitive)
+ * or by message content (regex, case-insensitive).
+ */
+export function isStreamingFailure(
+    errorName: string,
+    errorMessage: string,
+    errorNames: string[] = DEFAULT_STREAMING_FAILURE_ERROR_NAMES,
+    messagePatterns: string[] = DEFAULT_STREAMING_FAILURE_MESSAGE_PATTERNS,
+): boolean {
+    if (!errorName && !errorMessage) return false
+
+    // Error name match: exact, case-sensitive
+    if (errorName && errorNames.includes(errorName)) {
+        return true
+    }
+
+    // Message pattern match: case-insensitive regex, substring fallback on invalid regex
+    if (errorMessage) {
+        const lowerMessage = errorMessage.toLowerCase()
+        for (const pattern of messagePatterns) {
+            try {
+                if (new RegExp(pattern, "i").test(lowerMessage)) return true
+            } catch {
+                if (lowerMessage.includes(pattern.toLowerCase())) return true
+            }
+        }
+    }
+
+    return false
+}
+
+/**
+ * Exponential backoff for recovery retries: `base * 2^(attempt-1)`, capped at `max`.
+ * Exported as a pure function for unit testing (WP-08).
+ */
+export function backoffMs(
+    attempt: number,
+    baseBackoffMs: number = DEFAULT_BASE_BACKOFF_MS,
+    maxBackoffMs: number = DEFAULT_MAX_BACKOFF_MS,
+): number {
+    return Math.min(baseBackoffMs * Math.pow(2, attempt - 1), maxBackoffMs)
+}
+
+/**
  * Detect an "action intent" — the model ends with `:` announcing intent
  * (e.g. "Voy a editar el archivo:") without executing. Used to nudge.
  */
@@ -224,12 +291,18 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     (options?.loopWindowMs as number) ?? DEFAULT_LOOP_WINDOW_MS
     const toolTextCheckDelayMs: number =
     (options?.toolTextCheckDelayMs as number) ?? DEFAULT_TOOL_TEXT_CHECK_DELAY_MS
+    const maxRecoveryRetries: number =
+    (options?.maxRecoveryRetries as number) ?? DEFAULT_MAX_RECOVERY_RETRIES
     const minActivityGapMs: number =
     (options?.minActivityGapMs as number) ?? DEFAULT_MIN_ACTIVITY_GAP_MS
     const warmupMs: number =
     (options?.warmupMs as number) ?? DEFAULT_WARMUP_MS
     const debug: boolean =
     (options?.debug as boolean) ?? DEFAULT_DEBUG
+    const streamingFailureErrorNames: string[] =
+        (options?.streamingFailureErrorNames as string[]) ?? DEFAULT_STREAMING_FAILURE_ERROR_NAMES
+    const streamingFailureMessagePatterns: string[] =
+        (options?.streamingFailureMessagePatterns as string[]) ?? DEFAULT_STREAMING_FAILURE_MESSAGE_PATTERNS
     const resumeOnActionIntent: boolean =
     (options?.resumeOnActionIntent as boolean) !== false
     const continuePrompt: string =
@@ -306,6 +379,11 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 doneClaimNoTodosAttempts: 0,
                 pendingTools: 0,
                 pendingCommands: 0,
+                pendingRecovery: false,
+                pendingRecoveryReason: null,
+                pendingRecoveryAt: 0,
+                recoveryAttempts: 0,
+                watchdogRetryGuard: false,
             }
             sessions.set(sid, w)
         }
@@ -380,10 +458,6 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         return sid.length > 12 ? `...${sid.slice(-8)}` : sid
     }
 
-    function backoffMs(attempt: number): number {
-        return Math.min(baseBackoffMs * Math.pow(2, attempt - 1), maxBackoffMs)
-    }
-
     /** Clean up idle sessions that have been idle too long. */
     function cleanupIdleSessions() {
         const now = Date.now()
@@ -423,12 +497,68 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         }
     }
 
+    /**
+     * Extract the `{ info, parts }` payload from a `session.prompt()` result.
+     * Handles both the SDK client shape (`{ data: { info, parts } }`) and the
+     * raw payload shape (`{ info, parts }`). Returns null on unexpected shapes
+     * so the caller can log the raw response for debugging.
+     */
+    function getPromptResponsePayload(result: unknown): SessionPromptResponses[200] | null {
+        if (!result || typeof result !== "object") return null
+        const raw = result as Record<string, unknown>
+        const data = raw.data as Record<string, unknown> | undefined
+        if (data && typeof data === "object" && "parts" in data) {
+            return data as unknown as SessionPromptResponses[200]
+        }
+        if ("parts" in raw) {
+            return raw as unknown as SessionPromptResponses[200]
+        }
+        return null
+    }
+
+    /**
+     * Diagnostic logging for a `session.prompt()` response (WP-06).
+     * Never throws and never alters control flow — observability only.
+     */
+    async function logPromptResponse(result: unknown, context: { sessionId: string; isRetry?: boolean }) {
+        const payload = getPromptResponsePayload(result)
+        const isRetry = context.isRetry ?? false
+        if (!payload) {
+            await log("debug", `${short(context.sessionId)} - session.prompt() response has unexpected structure: ${JSON.stringify({ sessionId: context.sessionId, isRetry, rawResponse: JSON.stringify(result) })}`)
+            return
+        }
+        const parts = Array.isArray(payload.parts) ? payload.parts : []
+        const partsCount = parts.length
+        const info = payload.info && typeof payload.info === "object" ? payload.info : undefined
+        const infoKeys = info ? Object.keys(info) : []
+        const hasParts = partsCount > 0
+
+        await log("debug", `${short(context.sessionId)} - session.prompt() response received: ${JSON.stringify({ sessionId: context.sessionId, isRetry, hasParts, partsCount, infoKeys, info })}`)
+
+        if (partsCount === 0) {
+            await log("warn", `${short(context.sessionId)} - session.prompt() returned empty parts array - possible stream initiation failure: ${JSON.stringify({ sessionId: context.sessionId, isRetry, responseInfo: info, partsCount })}`)
+        }
+
+        if (info && "error" in info) {
+            await log("warn", `${short(context.sessionId)} - session.prompt() response.info contains error indicator: ${JSON.stringify({ sessionId: context.sessionId, isRetry, errorInfo: info.error })}`)
+        }
+
+        await log("debug", `${short(context.sessionId)} - session.prompt() raw response: ${JSON.stringify({ sessionId: context.sessionId, isRetry, rawResponse: JSON.stringify(result, null, 2) })}`)
+    }
+
     async function sendContinuePrompt(sid: string, text: string, w: SessionWatch) {
-        if (w.continuing) {
+        if (w.continuing && !w.watchdogRetryGuard) {
             await log("debug", `${short(sid)} - continue already in progress, skipping`)
             return
         }
+        if (!w.continuing) dbg(`State transition on ${short(sid)}: continuing=false -> true`)
         w.continuing = true
+        if (w.watchdogRetryGuard) {
+            // Watchdog retry: keep the recovery armed so the retried prompt's
+            // own deferred watchdog continues the escalation chain (WP-05).
+            w.pendingRecovery = true
+        }
+        w.watchdogRetryGuard = false
         
         let agent: string | undefined
         let model: { providerID: string; modelID: string } | undefined
@@ -474,7 +604,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 }
             }
 
-            await ctx.client.session.prompt({
+            dbg(`Recovery prompt sent to ${short(sid)}: prompt="${text.length > 80 ? `${text.slice(0, 80)}...` : text}", agent=${agent ?? "(default)"}, model=${model ? `${model.providerID}/${model.modelID}` : "(default)"}`)
+            const response = await ctx.client.session.prompt({
                 path: { id: sid },
                 body: {
                     parts: [{ type: "text", text }],
@@ -482,6 +613,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     model,
                 },
             })
+            await logPromptResponse(response, { sessionId: sid })
             await log(
                 "debug",
                 `${short(sid)} - prompt sent with agent: ${agent ?? "(default)"}, model: ${model ? `${model.providerID}/${model.modelID}` : "(default)"}`,
@@ -492,10 +624,11 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             const errMsg = err instanceof Error ? err.message : String(err)
             await log("warn", `${short(sid)} - prompt failed: ${errMsg}`)
             try {
-                await ctx.client.session.prompt({
+                const retryResponse = await ctx.client.session.prompt({
                     path: { id: sid },
                     body: { parts: [{ type: "text", text }], agent, model },
                 })
+                await logPromptResponse(retryResponse, { sessionId: sid, isRetry: true })
                 recordContinue(sid)
                 w.lastRetryAt = Date.now()
             } catch (retryErr) {
@@ -504,14 +637,62 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 throw retryErr
             }
         } finally {
+            if (w.continuing) dbg(`State transition on ${short(sid)}: continuing=true -> false`)
             w.continuing = false
             w.todoCheckAttempts = 0
             if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
         }
-        // Deferred check: verify the session went busy after prompt
+        // Deferred check: verify the session went busy after prompt.
+        // If this was a streaming-failure recovery (pendingRecovery armed),
+        // retry up to maxRecoveryRetries and then escalate to abort+resume.
         setTimeout(async () => {
             if (w.status !== "busy") {
-                await log("warn", `${short(sid)} - prompt sent >${toolTextCheckDelayMs / 1000}s ago but session is still ${w.status}`)
+                if (w.pendingRecovery) {
+                    if (w.recoveryAttempts < maxRecoveryRetries) {
+                        w.recoveryAttempts++
+                        dbg(`State transition on ${short(sid)}: recoveryAttempts=${w.recoveryAttempts - 1} -> ${w.recoveryAttempts}`)
+                        w.watchdogRetryGuard = true
+                        await log("warn", `${short(sid)} - recovery attempt ${w.recoveryAttempts}/${maxRecoveryRetries} after prompt timeout`)
+                        await log("warn", `Recovery failed on ${short(sid)} - session still ${w.status}: attempt=${w.recoveryAttempts}, maxRetries=${maxRecoveryRetries}, nextAction=retry`)
+                        dbg(`Watchdog check on ${short(sid)}: status=${w.status}, recoveryAttempts=${w.recoveryAttempts}, maxRetries=${maxRecoveryRetries}, watchdogLatencyMs=${Date.now() - w.lastRetryAt} -> RETRY`)
+                        const retryBackoffMs = backoffMs(w.recoveryAttempts, baseBackoffMs, maxBackoffMs)
+                        await log("info", `Retrying recovery on ${short(sid)}: attempt=${w.recoveryAttempts}, backoffMs=${retryBackoffMs}`)
+                        dbg(`Retrying recovery on ${short(sid)}: recoveryAttempts=${w.recoveryAttempts}, backoffMs=${retryBackoffMs}, pendingRecoveryReason=${w.pendingRecoveryReason}`)
+                        try {
+                            await sendContinuePrompt(sid, continuePrompt, w)
+                        } catch (err) {
+                            const errMsg = err instanceof Error ? err.message : String(err)
+                            await log("warn", `${short(sid)} - recovery retry failed: ${errMsg}`)
+                            // Let the timer loop re-initiate the recovery
+                            w.recoveryAttempts = 0
+                        }
+                        w.watchdogRetryGuard = false
+                    } else {
+                        dbg(`Pending recovery cleared on ${short(sid)}: reason=recovery-attempt`)
+                        w.pendingRecovery = false
+                        await log("warn", `${short(sid)} - max recovery attempts (${maxRecoveryRetries}) reached, escalating to abort+resume`)
+                        await log("warn", `Recovery failed on ${short(sid)} - session still ${w.status}: attempt=${w.recoveryAttempts}, maxRetries=${maxRecoveryRetries}, nextAction=abort-resume`)
+                        await log("warn", `Escalating to abort+resume on ${short(sid)}: attempt=${w.recoveryAttempts}`)
+                        dbg(`Watchdog check on ${short(sid)}: status=${w.status}, recoveryAttempts=${w.recoveryAttempts}, maxRetries=${maxRecoveryRetries}, watchdogLatencyMs=${Date.now() - w.lastRetryAt} -> ABORT_RESUME`)
+                        const resumed = await tryAbortAndResume(sid, w)
+                        if (!resumed && !w.aborting) {
+                            await log("warn", `Recovery exhausted on ${short(sid)}: attempts=${w.recoveryAttempts}, lastError=abort+resume failed`)
+                            dbg(`Watchdog check on ${short(sid)}: status=${w.status} -> GAVE_UP`)
+                            if (w.pendingRecoveryAt > 0) {
+                                dbg(`Total recovery cycle on ${short(sid)} (failed): totalCycleMs=${Date.now() - w.pendingRecoveryAt}`)
+                            }
+                        }
+                    }
+                } else {
+                    await log("warn", `${short(sid)} - prompt sent >${toolTextCheckDelayMs / 1000}s ago but session is still ${w.status}`)
+                }
+            } else {
+                const elapsedMs = Date.now() - w.lastRetryAt
+                await log("info", `Recovery successful on ${short(sid)}: elapsedMs=${elapsedMs}`)
+                dbg(`Watchdog check on ${short(sid)}: status=busy, elapsedMs=${elapsedMs} -> SUCCESS`)
+                if (w.pendingRecoveryAt > 0) {
+                    dbg(`Total recovery cycle on ${short(sid)}: totalCycleMs=${Date.now() - w.pendingRecoveryAt}`)
+                }
             }
         }, toolTextCheckDelayMs)
     }
@@ -716,6 +897,11 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         w.recentToolCalls = []
         w.toolLoopAttempts = 0
         if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
+        w.pendingRecovery = false
+        w.pendingRecoveryReason = null
+        w.pendingRecoveryAt = 0
+        w.recoveryAttempts = 0
+        w.watchdogRetryGuard = false
     }
 
     function resetIdleFlags(w: SessionWatch) {
@@ -783,7 +969,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         // Backoff for tool-text recovery
         if (w.toolTextAttempts > 0) {
             const elapsed = Date.now() - w.lastRetryAt
-            const requiredBackoff = backoffMs(w.toolTextAttempts)
+            const requiredBackoff = backoffMs(w.toolTextAttempts, baseBackoffMs, maxBackoffMs)
             if (elapsed < requiredBackoff) return
         }
 
@@ -1095,6 +1281,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         try {
             await ctx.client.session.abort({ path: { id: sid } })
             await log("info", `${short(sid)} - abort OK`)
+            dbg(`Abort succeeded on ${short(sid)}, waiting ${ABORT_CONTINUE_DELAY_MS}ms before continue prompt`)
         } catch (err) {
             const errMsg = err instanceof Error ? err.message : String(err)
             await log("warn", `${short(sid)} - abort failed: ${errMsg}`)
@@ -1132,7 +1319,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         }
         const now = Date.now()
         const elapsedSinceRetry = now - w.lastRetryAt
-        const requiredBackoff = backoffMs(w.resumeAttempts)
+        const requiredBackoff = backoffMs(w.resumeAttempts, baseBackoffMs, maxBackoffMs)
         if (w.lastRetryAt > 0 && elapsedSinceRetry < requiredBackoff) return false
 
         if (isHallucinationLoop(sid)) {
@@ -1260,6 +1447,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                             }
                         } else if (!w.gaveUp) {
                             w.gaveUp = true
+                            dbg(`State transition on ${short(sid)}: gaveUp=false -> true`)
                             w.orphanWatchStartAt = null
                             w.aborting = false
                             log("warn", `${short(sid)} - orphan retries exhausted.`)
@@ -1328,6 +1516,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                             tryResume(sid, w, "Stream stall")
                         } else if (!w.gaveUp) {
                             w.gaveUp = true
+                            dbg(`State transition on ${short(sid)}: gaveUp=false -> true`)
                             log("warn", `${short(sid)} - all ${maxRetries} retries exhausted.`)
                         }
                     }
@@ -1336,6 +1525,42 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
             // Periodic idle session recheck: resume idle sessions with open todos
             for (const [sid, w] of sessions) {
+                // Pending recovery: trigger deferred recovery for streaming failures (WP-04)
+                if (
+                    w.pendingRecovery &&
+                    w.status === "idle" &&
+                    !w.userCancelled &&
+                    !w.aborting &&
+                    !w.continuing &&
+                    !w.gaveUp &&
+                    // recoveryAttempts === 0: the watchdog chain owns the
+                    // counter once the first recovery send is initiated (WP-05)
+                    w.recoveryAttempts === 0
+                ) {
+                    dbg(`Pending recovery check on ${short(sid)}: pendingRecovery=${w.pendingRecovery}, status=${w.status}, userCancelled=${w.userCancelled}, aborting=${w.aborting}, continuing=${w.continuing}, gaveUp=${w.gaveUp}, recoveryAttempts=${w.recoveryAttempts}, pendingRecoveryAt=${w.pendingRecoveryAt}`)
+                    const elapsed = Date.now() - w.pendingRecoveryAt
+                    const requiredBackoff = backoffMs(w.recoveryAttempts, baseBackoffMs, maxBackoffMs)
+                    if (elapsed < requiredBackoff) {
+                        dbg(`Backoff check on ${short(sid)}: elapsed=${elapsed}ms, required=${requiredBackoff}ms, attempt=${w.recoveryAttempts}, pass=false`)
+                        dbg(`Pending recovery on ${short(sid)} waiting for backoff: ${requiredBackoff - elapsed}ms remaining`)
+                        continue
+                    }
+                    dbg(`Backoff check on ${short(sid)}: elapsed=${elapsed}ms, required=${requiredBackoff}ms, attempt=${w.recoveryAttempts}, pass=true`)
+                    await log("info", `Pending recovery triggered on ${short(sid)}: reason=${w.pendingRecoveryReason}, attempt=${w.recoveryAttempts + 1}, maxRetries=${maxRecoveryRetries}`)
+                    dbg(`Recovery timing on ${short(sid)}: detectionToAttemptMs=${Date.now() - w.pendingRecoveryAt}`)
+                    w.recoveryAttempts++
+                    dbg(`State transition on ${short(sid)}: recoveryAttempts=${w.recoveryAttempts - 1} -> ${w.recoveryAttempts}`)
+                    // Keep pendingRecovery armed: the deferred watchdog (WP-05)
+                    // verifies this recovery and retries/escalates on failure.
+                    try {
+                        await sendContinuePrompt(sid, continuePrompt, w)
+                    } catch (err) {
+                        const errMsg = err instanceof Error ? err.message : String(err)
+                        await log("warn", `${short(sid)} - pending recovery failed: ${errMsg}`)
+                        w.recoveryAttempts = 0
+                    }
+                }
+
                 if (w.status !== "idle") continue
                 if (w.isSubagent) continue
                 if (w.userCancelled || w.completionSignaled) continue
@@ -1345,7 +1570,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 if (open.length === 0) continue
                 if (w.todoNudgeAttempts >= maxRetries) continue
                 const elapsedSinceLastNudge = Date.now() - w.lastRetryAt
-                const requiredBackoff = backoffMs(w.todoNudgeAttempts)
+                const requiredBackoff = backoffMs(w.todoNudgeAttempts, baseBackoffMs, maxBackoffMs)
                 if (w.lastRetryAt > 0 && elapsedSinceLastNudge < requiredBackoff) continue
                 const isCelebration = await lastAssistantEndsWithCelebration(sid)
                 if (isCelebration) {
@@ -1401,6 +1626,9 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
                 if (statusType === "busy") {
                     w.lastActivityAt = Date.now()
+                    if (w.pendingRecovery) {
+                        dbg(`Pending recovery cleared on ${short(sid)}: reason=session-busy`)
+                    }
                     resetSessionFlags(w)
                     prevBusyCount = busyCount()
                     log("debug", `${short(sid)} -> busy (${prevBusyCount})`)
@@ -1587,6 +1815,9 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             case "session.error": {
                 const errorObj = getError(ev)
                 const errorName = (errorObj?.name as string) ?? ""
+                const errorMessage =
+                    (errorObj?.data as Record<string, unknown>)?.message as string | undefined ??
+                    String(errorObj?.data ?? "")
                 const isMessageAborted = errorName === "MessageAbortedError"
 
                 if (isMessageAborted) {
@@ -1601,11 +1832,31 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     break
                 }
 
+                const isStreamingFail = isStreamingFailure(
+                    errorName,
+                    errorMessage,
+                    streamingFailureErrorNames,
+                    streamingFailureMessagePatterns,
+                )
+
+                if (isStreamingFail) {
+                    if (sid) {
+                        const w = sessions.get(sid)
+                        if (w && w.status === "busy") {
+                            w.pendingRecovery = true
+                            w.pendingRecoveryReason = errorName
+                            w.pendingRecoveryAt = Date.now()
+                            dbg(`State transition on ${short(sid)}: pendingRecovery=false -> true, reason=${errorName}`)
+                            await log("info", `Streaming failure detected on ${short(sid)}: errorName=${errorName}, errorMessage=${errorMessage}, pendingRecoveryReason=${errorName}`)
+                        }
+                        log("info", `Streaming failure detected: ${errorName} - ${errorMessage}`)
+                    } else {
+                        log("warn", `Streaming failure detected but no session ID: ${errorName} - ${errorMessage}`)
+                    }
+                }
+
                 if (busyCount() === 0) break
 
-                const errorMessage =
-                    (errorObj?.data as Record<string, unknown>)?.message as string | undefined ??
-                    String(errorObj?.data ?? "")
                 log("debug", `Session error: ${errorName} - ${errorMessage}`)
 
                 if (sid) {
@@ -1616,7 +1867,10 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             }
 
             case "command.executed": {
-                for (const [, w] of sessions) {
+                for (const [sid2, w] of sessions) {
+                    if (w.pendingRecovery) {
+                        dbg(`Pending recovery cleared on ${short(sid2)}: reason=user-command`)
+                    }
                     resetSessionFlags(w)
                 }
                 if (!sid) break
