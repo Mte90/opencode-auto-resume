@@ -508,20 +508,43 @@ export default Plugin.define({
 		// Recovery actions
 		// ---------------------------------------------------------------------
 
-		async function sendPrompt(sid: string, text: string): Promise<boolean> {
+		/**
+		 * Show a visible notification in the session timeline and optionally
+		 * resume it.  Uses `session.synthetic()` which is exposed on the v2
+		 * promise-plugin context — the synthetic message appears in the TUI
+		 * so the user knows the plugin intervened.
+		 *
+		 * When `resume` is true the synthetic also acts as a user turn that
+		 * kicks the session back to life, replacing the separate `prompt()`.
+		 */
+		async function notifyAndPrompt(sid: string, text: string, notification: string, resume = true): Promise<boolean> {
 			try {
-				await ctx.session.prompt({ sessionID: sid, text })
+				await ctx.session.synthetic({
+					sessionID: sid,
+					text,
+					description: `auto-resume: ${notification}`,
+					resume,
+				})
 				return true
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : String(err)
-				log("warn", `${short(sid)} prompt failed: ${msg}`)
-				// One flattened-shape fallback for beta drift safety
+				log("warn", `${short(sid)} synthetic failed: ${msg}`)
+				// Flat-shape fallback for beta drift
 				try {
-					await (ctx.session as any).prompt({ path: { id: sid }, body: { parts: [{ type: "text", text }] } })
+					await (ctx.session as any).synthetic({
+						path: { id: sid },
+						body: { text, description: `auto-resume: ${notification}`, resume },
+					})
 					return true
 				} catch {
-					log("error", `${short(sid)} prompt failed twice: ${msg}`)
-					return false
+					// Last resort: bare prompt
+					try {
+						await ctx.session.prompt({ sessionID: sid, text })
+						return true
+					} catch {
+						log("error", `${short(sid)} all recovery attempts failed: ${msg}`)
+						return false
+					}
 				}
 			}
 		}
@@ -540,7 +563,7 @@ export default Plugin.define({
 			await new Promise((r) => setTimeout(r, 2_000))
 			w.aborting = false
 			w.resumeAttempts = 0
-			const ok = await sendPrompt(sid, opts.continuePrompt ?? CONTINUE_PROMPT)
+			const ok = await notifyAndPrompt(sid, opts.continuePrompt ?? CONTINUE_PROMPT, "abort+resume escalation")
 			if (ok) {
 				recordContinue(sid)
 				w.lastRetryAt = Date.now()
@@ -585,7 +608,7 @@ export default Plugin.define({
 					// user took over.
 					if (w.userCancelled || w.gaveUp) return
 					if (w.status === "idle" && !w.pendingRecoveryArmed) return // recovered by itself meanwhile
-					const ok = await sendPrompt(sid, opts.continuePrompt ?? CONTINUE_PROMPT)
+					const ok = await notifyAndPrompt(sid, opts.continuePrompt ?? CONTINUE_PROMPT, "stalled — retrying")
 					w.pendingRecoveryArmed = false
 					if (ok) {
 						w.lastRetryAt = Date.now()
@@ -618,7 +641,7 @@ export default Plugin.define({
 			w[budgetKey]++
 			log("info", `${short(sid)} ${kind} detected — sending targeted prompt (${w[budgetKey]}/${maxRetries})`)
 			w.recovering = true
-			const ok = await sendPrompt(sid, prompt)
+			const ok = await notifyAndPrompt(sid, prompt, "recovering: " + kind)
 			w.recovering = false
 			if (ok) {
 				recordContinue(sid)
