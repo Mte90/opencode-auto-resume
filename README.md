@@ -156,6 +156,10 @@ _Motivated by:_
 
 The model stream can die after emitting only reasoning — no text part, no tool call — finalizing with `finish: "unknown"`. OpenCode treats the message as completed and the session goes idle, so no error or stall path triggers. On idle, if the **newest** assistant message has a finish reason, zero text parts, and at least `silentDeadStreamMinTokens` output tokens, the plugin sends a recovery prompt. Only the newest assistant message is evaluated — a delivered text answer means normal completion, and older tool-call steps are never misread as dead streams. Recovery is also skipped if the session has gone busy/retry again before the prompt is sent (race guard).
 
+### Context saturation → magic-context wrapup
+
+A session can fill its usable context window without stalling — it just keeps working until it chokes. The plugin tracks token usage from `message.updated` events and computes the ratio against the model's usable window (`context − min(20k, maxOutput)`, mirroring OpenCode's own overflow math). On idle, when the ratio crosses `contextSaturationThreshold` (default 0.85), routing depends on session kind. For parent sessions, only when magic-context is detected in the host's configured plugin list (`config.get().plugin`), the plugin invokes the registered `ctx-wrapup` command through `client.session.command()` — it does not send `/ctx-wrapup` as prompt text, because prompt text is not expanded into a command. For subagent sessions identified by `parentID` on `session.created`, the default is no intervention: magic-context does run bounded cleanup for subagents (structural-noise/cleared-reasoning strips, heuristic drops, ceiling nudges), but its hard protections — historian compartments, emergency fail-closed abort, caveman compression — skip subagents, and on true overflow the error just propagates to the parent with no deterministic reclaim. Terminal reclamation therefore depends on the agent calling `ctx_reduce` when nudged. If `subagentNativeCompactionEnabled` is `true`, the plugin calls native `session.summarize()` as an opt-in safety net. Fail-safe: provider lookup errors, unknown model limits, user cancellation, or completion signals mean no intervention. Magic-context absence additionally disables only the parent path (the `ctx-wrapup` command would not be registered); the opt-in subagent path needs no magic-context detection because `session.summarize()` is native. This path is magic-context-gated on purpose: magic-context's setup disables OpenCode's native compaction, so unconditionally summarizing a magic-context-managed parent would double-compress and fight its cache-aware historian. One intervention per busy cycle.
+
 ---
 
 ### Active-tool safety guard
@@ -261,7 +265,7 @@ All recovery paths fall into three families. Which family fires determines what 
 
 Fire only after OpenCode reports the session **idle** — the runner has exited. The prompt starts a new run.
 
-Paths: todo nudges, tool-call-as-text recovery, thinking-tool recovery, action-intent nudge, ready-to-continue, done-claim verification, streaming-failure recovery, silent dead-stream recovery.
+Paths: todo nudges, tool-call-as-text recovery, thinking-tool recovery, action-intent nudge, ready-to-continue, done-claim verification, streaming-failure recovery, silent dead-stream recovery, context-saturation routing (magic-context-gated; parent sessions use `session.command`, subagents use opt-in native `session.summarize`).
 
 ### 2. Busy-silence continue (stream stall)
 
@@ -384,6 +388,8 @@ With options:
 | `doneWithoutDetailsPrompt` | `DONE_WITHOUT_DETAILS_PROMPT` | Override the done-claim-with-no-todos report prompt |
 | `silentDeadStreamMinTokens` | `200` | Min output tokens to treat a textless `finish:"unknown"` message as a dead stream |
 | `busyStallStrategy` | `"continue"` | Busy-stall response: `"continue"`, `"abort"` (abort-first), or `"off"` (disabled) |
+| `contextSaturationThreshold` | `0.85` | Ratio of used/usable context that routes a saturated parent to magic-context `ctx-wrapup` (only when magic-context is installed) |
+| `subagentNativeCompactionEnabled` | `false` | Opt-in native `session.summarize()` for saturated subagent sessions (no magic-context detection required) |
 
 Message patterns are matched case-insensitively. Error names use exact match.
 

@@ -42,6 +42,8 @@ export interface SessionWatch {
     interruptedContinueCount: number
     recentToolCalls: ToolCallRecord[]
     liveToolSigs: string[]
+    lastTokenTotal: number
+    contextWrapupAttempts: number
     toolLoopAttempts: number
     isSubagent: boolean
     completionSignaled: boolean
@@ -107,6 +109,8 @@ const TOOL_LOOP_RECOVERY_PROMPT =
     "1) Are you stuck in a loop? 2) Do you need different information first? " +
     "3) Should you try a different tool or break the task into smaller steps? " +
     "Take a moment to think about what's blocking you and propose a different strategy."
+
+const CTX_WRAPUP_TRIGGER = "ctx-wrapup"
 
 const TOOL_TEXT_PATTERNS = [
     /<function\s*=/i,
@@ -450,6 +454,10 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         rawBusyStallStrategy === "abort" || rawBusyStallStrategy === "off"
             ? rawBusyStallStrategy
             : "continue"
+    const contextSaturationThreshold: number =
+        (options?.contextSaturationThreshold as number) ?? 0.85
+    const subagentNativeCompactionEnabled: boolean =
+        (options?.subagentNativeCompactionEnabled as boolean) ?? false
     const dbg = (...args: unknown[]) => { if (debug) console.log("[debug]", ...args) }
 
     const sessions = new Map<string, SessionWatch>()
@@ -537,6 +545,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 interruptedContinueCount: 0,
                 recentToolCalls: [],
                 liveToolSigs: [],
+                lastTokenTotal: 0,
+                contextWrapupAttempts: 0,
                 toolLoopAttempts: 0,
                 isSubagent: false,
                 completionSignaled: false,
@@ -1010,7 +1020,82 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         }
     }
 
-        async function checkSessionHasActiveTool(sid: string): Promise<boolean> {
+        let magicContextDetected: boolean | null = null
+
+    /**
+     * True when the magic-context plugin appears in the host's configured
+     * plugin list. Fail-safe: any error or missing data returns false without
+     * caching, so a transient failure can be re-checked later.
+     */
+    async function isMagicContextInstalled(): Promise<boolean> {
+        if (magicContextDetected !== null) return magicContextDetected
+        try {
+            const res = await (ctx.client as { config?: { get?: () => Promise<unknown> } }).config?.get?.()
+            const cfg = (res as { data?: { plugin?: unknown } } | undefined)?.data
+            const plugins = cfg?.plugin
+            if (!Array.isArray(plugins)) {
+                dbg("magic-context detection: plugin list unavailable, treating as not installed")
+                return false
+            }
+            magicContextDetected = plugins.some((p) => {
+                const spec = typeof p === "string" ? p : Array.isArray(p) ? String(p[0]) : ""
+                return spec.toLowerCase().includes("magic-context")
+            })
+            return magicContextDetected
+        } catch (e) {
+            const errMsg = e instanceof Error ? e.message : String(e)
+            dbg(`magic-context detection failed, treating as not installed: ${errMsg}`)
+            return false
+        }
+    }
+
+    const usableLimitCache = new Map<string, number>()
+
+    /**
+     * Usable context window for a session's model, mirroring OpenCode's own
+     * overflow math: context - min(20k, maxOutput). Returns null when the
+     * model or its limits cannot be determined (fail-safe: no intervention).
+     */
+    async function getUsableContextLimit(sid: string): Promise<number | null> {
+        try {
+            const msgs = await getSessionMessages(sid)
+            let model: { providerID?: string; modelID?: string } | undefined
+            for (let i = msgs.length - 1; i >= 0; i--) {
+                const m = msgs[i] as Record<string, unknown>
+                if ((m.role as string) === "user") {
+                    model = (m.model ?? (m.info as Record<string, unknown> | undefined)?.model) as
+                        | { providerID?: string; modelID?: string }
+                        | undefined
+                    break
+                }
+            }
+            if (!model || typeof model.providerID !== "string" || typeof model.modelID !== "string") {
+                return null
+            }
+            const key = `${model.providerID}/${model.modelID}`
+            const cached = usableLimitCache.get(key)
+            if (cached !== undefined) return cached
+            const res = await (ctx.client as { provider?: { get?: () => Promise<unknown> } }).provider?.get?.()
+            const providers = ((res as { data?: unknown } | undefined)?.data ?? res) as
+                | Array<Record<string, unknown>>
+                | undefined
+            if (!Array.isArray(providers)) return null
+            const prov = providers.find((p) => p.id === model!.providerID)
+            const models = prov?.models as Array<Record<string, unknown>> | undefined
+            const entry = models?.find((x) => x.id === model!.modelID)
+            const limit = entry?.limit as { context?: number; output?: number } | undefined
+            if (!limit || typeof limit.context !== "number" || limit.context === 0) return null
+            const usable = limit.context - Math.min(20_000, limit.output ?? 0)
+            usableLimitCache.set(key, usable)
+            return usable
+        } catch (e) {
+            const errMsg = e instanceof Error ? e.message : String(e)
+            dbg(`usable-context-limit lookup failed for ${short(sid)}: ${errMsg}`)
+            return null
+        }
+    }
+
+    async function checkSessionHasActiveTool(sid: string): Promise<boolean> {
         try {
             const statusMap = await getSessionStatusMap()
             if (statusMap[sid] === "busy") {
@@ -1137,6 +1222,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         w.recentToolCalls = []
         w.liveToolSigs = []
         w.toolLoopAttempts = 0
+        w.contextWrapupAttempts = 0
         w.pendingRecovery = false
         w.pendingRecoveryReason = null
         w.pendingRecoveryAt = 0
@@ -1953,6 +2039,44 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     prevBusyCount = currentBusy
                     log("debug", `${short(sid)} -> idle (${currentBusy})`)
 
+                    // Subagent context saturation: subagents never enter the
+                    // parent-only recovery block below, so the opt-in native
+                    // compaction safety net is handled here with its own gates.
+                    // No magic-context detection: session.summarize() is native
+                    // and works with or without magic-context installed.
+                    if (w.isSubagent) {
+                        try {
+                            if (
+                                w.lastTokenTotal > 0 &&
+                                w.contextWrapupAttempts < 1 &&
+                                !w.userCancelled &&
+                                !w.completionSignaled &&
+                                !w.aborting
+                            ) {
+                                const usable = await getUsableContextLimit(sid)
+                                if (
+                                    usable &&
+                                    w.lastTokenTotal / usable >= contextSaturationThreshold
+                                ) {
+                                    if (subagentNativeCompactionEnabled) {
+                                        w.contextWrapupAttempts++
+                                        await log(
+                                            "warn",
+                                            `${short(sid)} - context saturation (subagent): ${w.lastTokenTotal}/${usable} tokens (${Math.round((w.lastTokenTotal / usable) * 100)}% of usable); triggering native compaction`,
+                                        )
+                                        await ctx.client.session.summarize({ path: { id: sid } })
+                                    }
+                                }
+                            }
+                        } catch (e) {
+                            const errMsg =
+                                e instanceof Error ? e.message : String(e)
+                            dbg(
+                                `session.idle sid=${short(sid)}: context-saturation check error: ${errMsg}`,
+                            )
+                        }
+                    }
+
                     if (!w.isSubagent) {
                         if (
                             !w.pendingRecovery &&
@@ -2046,6 +2170,45 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                                     `session.idle sid=${short(sid)}: silent-dead-stream check error: ${errMsg}`,
                                 )
                             }
+
+                            // Context saturation (parent sessions only — subagents
+                            // are handled above): the last assistant message used
+                            // >= threshold of the model's usable window. When
+                            // magic-context manages the session (its setup disables
+                            // native compaction), trigger its wrapup command rather
+                            // than native compaction, which would double-compress.
+                            try {
+                                if (
+                                    w.lastTokenTotal > 0 &&
+                                    w.contextWrapupAttempts < 1 &&
+                                    !w.userCancelled &&
+                                    !w.completionSignaled
+                                ) {
+                                    const usable = await getUsableContextLimit(sid)
+                                    if (
+                                        usable &&
+                                        w.lastTokenTotal / usable >= contextSaturationThreshold
+                                    ) {
+                                        const installed = await isMagicContextInstalled()
+                                        if (!installed) break
+                                        w.contextWrapupAttempts++
+                                        await log(
+                                            "warn",
+                                            `${short(sid)} - context saturation: ${w.lastTokenTotal}/${usable} tokens (${Math.round((w.lastTokenTotal / usable) * 100)}% of usable); sending magic-context wrapup command`,
+                                        )
+                                        await ctx.client.session.command({
+                                            path: { id: sid },
+                                            body: { command: CTX_WRAPUP_TRIGGER, arguments: "" },
+                                        })
+                                    }
+                                }
+                            } catch (e) {
+                                const errMsg =
+                                    e instanceof Error ? e.message : String(e)
+                                dbg(
+                                    `session.idle sid=${short(sid)}: context-saturation check error: ${errMsg}`,
+                                )
+                            }
                         }
 
                         let todos = w.todos || []
@@ -2125,7 +2288,13 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 const w = ensureWatch(sid)
                 w.pendingTools = 0
                 w.pendingCommands = 0
-                log("debug", `New session: ${short(sid)} (${sessions.size})`)
+                const createdProps = ev.properties as Record<string, unknown> | undefined
+                const parentID = (createdProps?.parentID ??
+                    (createdProps?.session as Record<string, unknown> | undefined)?.parentID) as
+                    | string
+                    | undefined
+                w.isSubagent = typeof parentID === "string" && parentID.length > 0
+                log("debug", `New session: ${short(sid)} (${sessions.size})${w.isSubagent ? " [subagent]" : ""}`)
                 break
             }
 
@@ -2192,6 +2361,29 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     w.userCancelled = true
                     if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
                     log("info", `${short(sid)} -> interrupted by user, backing off`)
+                }
+                break
+            }
+
+            case "message.updated": {
+                if (!sid) break
+                const props = ev.properties as Record<string, unknown> | undefined
+                const info = props?.info as Record<string, unknown> | undefined
+                const role = (info?.role as string) ?? (props?.role as string)
+                if (role !== "assistant") break
+                const tokens = (info?.tokens ?? props?.tokens) as Record<string, unknown> | undefined
+                if (!tokens) break
+                const cache = tokens.cache as Record<string, unknown> | undefined
+                const total =
+                    (tokens.total as number) ??
+                    ((tokens.input as number) ?? 0) +
+                        ((tokens.output as number) ?? 0) +
+                        ((cache?.read as number) ?? 0) +
+                        ((cache?.write as number) ?? 0)
+                if (typeof total === "number" && total > 0) {
+                    const w = ensureWatch(sid)
+                    w.lastActivityAt = Date.now()
+                    w.lastTokenTotal = total
                 }
                 break
             }
