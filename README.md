@@ -225,7 +225,16 @@ When the assistant ends a line with `:` ("Next, I will edit the file:") — anno
 
 ### Done-claim verification
 
-If the assistant claims the task is done ("task done", "finished", "all complete") but open todos remain, the plugin sends `DONE_WITHOUT_WORK_PROMPT` asking the agent to verify and finish remaining work. If it claims done with **no** open todos but the response contains no description of the work, the plugin sends `DONE_WITHOUT_DETAILS_PROMPT` — an imperative prompt demanding a concrete report (files changed, commands run, results). Both use the real `todo.updated` event state — not regex on the message text.
+If the assistant claims the task is done ("task done", "finished", "all complete") but open todos remain, the plugin sends `DONE_WITHOUT_WORK_PROMPT` asking the agent to verify and finish remaining work. If it claims done with **no** open todos and the response carries no work description, the plugin sends `DONE_WITHOUT_DETAILS_PROMPT` — an imperative prompt demanding a concrete report (files changed, commands run, results). A response that already contains file paths, verification output, or result sections satisfies the demand on its own and never triggers the prompt. The budget is capped at `maxRetries` across busy cycles (going busy no longer re-arms it); only a genuinely new inbound user message re-arms it. Both use the real `todo.updated` event state — not regex on the message text.
+
+---
+
+### User-input awareness
+
+The session is not stalled while the ball is in the user's court. Two gates stand down idle nudges:
+
+- **Awaiting input**: the newest assistant message holds a `tool_use` part with `state.status: "pending"` (e.g. an open `question` tool call). All idle checks, the periodic recheck, delayed action-intent callbacks, and the tool-text scan skip prompting until a newer user message clears the gate. Completed tool calls never engage it.
+- **Recently active user**: any inbound user message within `activeUserWindowMs` (default 15 minutes) means the user is engaged — likely composing a reply, which leaves no pending tool call behind. Open-todos nudges (idle + periodic), the tool-text reminder fallback, and action-intent callbacks stand down until the window expires.
 
 ---
 
@@ -389,6 +398,7 @@ With options:
 | `silentDeadStreamMinTokens` | `200` | Min output tokens to treat a textless `finish:"unknown"` message as a dead stream |
 | `busyStallStrategy` | `"continue"` | Busy-stall response: `"continue"`, `"abort"` (abort-first), or `"off"` (disabled) |
 | `contextSaturationThreshold` | `0.85` | Ratio of used/usable context that routes a saturated parent to magic-context `ctx-wrapup` (only when magic-context is installed) |
+| `activeUserWindowMs` | `900000` | Inbound-user-message recency window (15 min) during which idle nudges stand down (user likely composing) |
 | `subagentNativeCompactionEnabled` | `false` | Opt-in native `session.summarize()` for saturated subagent sessions (no magic-context detection required) |
 
 Message patterns are matched case-insensitively. Error names use exact match.

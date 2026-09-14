@@ -50,6 +50,9 @@ export interface SessionWatch {
     todoNudgeAttempts: number
     taskCompleteOverrides: number
     doneClaimNoTodosAttempts: number
+    // Last inbound user message (message.updated, role=user). A recently
+    // active user is likely composing a reply — idle nudges must stand down.
+    lastUserMessageAt: number
     pendingTools: number
     pendingCommands: number
     pendingRecovery: boolean
@@ -61,6 +64,9 @@ export interface SessionWatch {
 
 const DEFAULT_CHUNK_TIMEOUT_MS = 45_000
 const DEFAULT_CHECK_INTERVAL_MS = 5_000
+// Active-user window: an inbound user message this recent means the user is
+// engaged (likely composing) — idle open-todos nudges stand down.
+const DEFAULT_ACTIVE_USER_WINDOW_MS = 15 * 60_000
 const DEFAULT_GRACE_PERIOD_MS = 3_000
 const DEFAULT_MAX_RETRIES = 3
 const DEFAULT_MAX_BACKOFF_MS = 8_000
@@ -208,6 +214,18 @@ function containsDoneClaimPattern(text: string): boolean {
     const lines = text.split('\n')
     const lastLines = lines.slice(-5).join('\n')
     return DONE_CLAIM_PATTERNS.some((pat) => pat.test(lastLines))
+}
+
+// A done-claim that already carries a concrete work report satisfies the
+// details demand on its own — prompting again would loop forever (#26).
+function containsWorkDescription(text: string): boolean {
+    // Backticked span mentioning a dotted filename: `src/index.ts`
+    if (/`[^`\n]*\.[a-zA-Z0-9]{1,8}[^`\n]*`/.test(text)) return true
+    // Bare path with a slash and a dotted extension: src/index.ts, /a/b.py
+    if (/[\w\-~.][\w\-.~\/]*\/[\w\-.~]*\.[a-zA-Z]{1,8}\b/.test(text)) return true
+    // Report section headers: files changed, verification, results, ...
+    if (/^(changed|modified|deleted|created|updated|renamed|moved|files?\s+changed|verification|verified|tests?(?:\s+run|\s+passing|\s+pass)?|results?|outcome|commands?\s+(?:run|executed))/im.test(text)) return true
+    return false
 }
 
 function isStreamingFailure(
@@ -458,6 +476,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         (options?.contextSaturationThreshold as number) ?? 0.85
     const subagentNativeCompactionEnabled: boolean =
         (options?.subagentNativeCompactionEnabled as boolean) ?? false
+    const activeUserWindowMs: number =
+        (options?.activeUserWindowMs as number) ?? DEFAULT_ACTIVE_USER_WINDOW_MS
     const dbg = (...args: unknown[]) => { if (debug) console.log("[debug]", ...args) }
 
     const sessions = new Map<string, SessionWatch>()
@@ -553,6 +573,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 todoNudgeAttempts: 0,
                 taskCompleteOverrides: 0,
                 doneClaimNoTodosAttempts: 0,
+                lastUserMessageAt: 0,
                 pendingTools: 0,
                 pendingCommands: 0,
                 pendingRecovery: false,
@@ -782,6 +803,10 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             }
 
             dbg(`Recovery prompt sent to ${short(sid)}: prompt="${text.length > 80 ? `${text.slice(0, 80)}...` : text}", agent=${agent ?? "(default)"}, model=${model ? `${model.providerID}/${model.modelID}` : "(default)"}`)
+            // Re-check: ESC (or completion) may have landed while the session
+            // messages were being fetched above — never send into a cancelled
+            // session. (finally below resets the continuing flag on return.)
+            if (w.userCancelled || w.completionSignaled) return
             const response = await ctx.client.session.prompt({
                 path: { id: sid },
                 body: {
@@ -825,7 +850,15 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         setTimeout(async () => {
             if (w.status !== "busy") {
                 if (w.pendingRecovery) {
-                    if (w.recoveryAttempts < maxRecoveryRetries) {
+                    // Disarm on ESC/completion: without this the retry burns an
+                    // attempt (or escalates) on a dead session, and the still-
+                    // armed recovery refires spuriously once the user re-engages.
+                    if (w.userCancelled || w.completionSignaled) {
+                        w.pendingRecovery = false
+                        w.pendingRecoveryReason = null
+                        w.recoveryAttempts = 0
+                        await log("info", `${short(sid)} - recovery disarmed: session cancelled/completed while awaiting watchdog`)
+                    } else if (w.recoveryAttempts < maxRecoveryRetries) {
                         w.recoveryAttempts++
                         dbg(`State transition on ${short(sid)}: recoveryAttempts=${w.recoveryAttempts - 1} -> ${w.recoveryAttempts}`)
                         w.watchdogRetryGuard = true
@@ -879,6 +912,36 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         if (Array.isArray(response.data)) return response.data
         if (Array.isArray(response.messages)) return response.messages
         return []
+    }
+
+    // Awaiting-input gate: a trailing pending tool_use part (e.g. the
+    // question tool waiting on the user) means the ball is in the user's
+    // court — the session is NOT stalled, so no idle check may prompt.
+    // A newer user message clears the gate.
+    function hasPendingUserInput(messages: Array<Record<string, unknown>>): boolean {
+        for (let i = messages.length - 1; i >= 0; i--) {
+            const msg = messages[i]
+            const rawRole = (msg.role ?? (msg.info as Record<string, unknown> | undefined)?.role) as string | undefined
+            if (rawRole === "user") return false
+            if (rawRole !== "assistant") continue
+            const parts = msg.parts as Array<Record<string, unknown>> | undefined
+            if (!parts) return false
+            for (const part of parts) {
+                if ((part.type as string) !== "tool_use") continue
+                const state = part.state as Record<string, unknown> | undefined
+                if ((state?.status as string | undefined) === "pending") return true
+            }
+            return false
+        }
+        return false
+    }
+
+    // Active-user suppression: the awaiting-input gate only covers a formally
+    // pending tool_use — but a composing user leaves no pending tool call.
+    // Any inbound user message inside activeUserWindowMs means the user is
+    // engaged, so idle nudges stand down.
+    function userRecentlyActive(w: SessionWatch): boolean {
+        return w.lastUserMessageAt > 0 && Date.now() - w.lastUserMessageAt < activeUserWindowMs
     }
 
     const messagesInflight = new Map<string, Promise<Array<Record<string, unknown>>>>()
@@ -1231,7 +1294,9 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
         // Reset nudge budget on each genuine new busy→work cycle (user prompt or agent re-engagement after nudge)
         w.todoNudgeAttempts = 0
-        w.doneClaimNoTodosAttempts = 0
+        // PRESERVE doneClaimNoTodosAttempts: re-armed only by an inbound user
+        // message (genuine new work cycle). Resetting it here let the
+        // done-claim-no-todos prompt refire unboundedly across cycles (#26).
         w.continueTimestamps = []
         // PRESERVE: userCancelled, completionSignaled, idleSince, continuing
     }
@@ -1325,6 +1390,16 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
         try {
             const messages = await getSessionMessages(sid)
+            if (hasPendingUserInput(messages)) {
+                w.checkingToolText = false
+                await log("info", `${short(sid)} - awaiting user input (pending tool_use), skipping tool-text check`)
+                return
+            }
+            if (userRecentlyActive(w)) {
+                w.checkingToolText = false
+                await log("info", `${short(sid)} - user recently active, skipping tool-text check`)
+                return
+            }
             const recent = messages.slice(-3)
 
             let bestCandidate: {
@@ -1488,6 +1563,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                             source: "done-claim-no-emoji",
                             priority: 1,
                         }
+                    } else if (containsWorkDescription(allAssistantText)) {
+                        await log("info", `${short(sid)} - model claims done with no open todos, but the response already contains a work description. Skipping details prompt...`)
                     } else if (w.doneClaimNoTodosAttempts < maxRetries) {
                         await log("info", `${short(sid)} - model claims done with no open todos. Sending details prompt (attempt ${w.doneClaimNoTodosAttempts + 1}/${maxRetries})...`)
                         bestCandidate = {
@@ -1645,6 +1722,14 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         await new Promise<void>((resolve) => setTimeout(resolve, ABORT_CONTINUE_DELAY_MS))
 
         if (w.status === "busy") w.status = "idle"
+
+        // ESC (or completion) may have landed during the abort delay —
+        // re-check before continuing into a cancelled session.
+        if (w.userCancelled || w.completionSignaled) {
+            w.aborting = false
+            await log("info", `${short(sid)} - abort+resume stood down: session cancelled/completed during abort delay`)
+            return false
+        }
 
         try {
             await sendContinuePrompt(sid, continuePrompt, w)
@@ -1936,6 +2021,26 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 if (w.userCancelled || w.completionSignaled) continue
                 if (w.continuing) continue
                 if (busyCount() !== 0) continue
+                // Awaiting-input gate (same contract as the session.idle
+                // block): a trailing pending tool_use means the user holds
+                // the ball — the periodic open-todos nudge must stand down
+                // too. Without this it fires with no question asked whenever
+                // the session has open todos.
+                try {
+                    if (hasPendingUserInput(await getSessionMessages(sid))) {
+                        await log("info", `${short(sid)} - awaiting user input (pending tool_use), skipping periodic open-todos nudge`)
+                        continue
+                    }
+                } catch (e) {
+                    dbg(`periodic recheck sid=${short(sid)}: awaiting-input check error: ${e}`)
+                }
+                // Active-user suppression: inbound user message inside the
+                // window means the user is engaged (likely composing) — the
+                // session is NOT abandoned, skip the periodic nudge too.
+                if (userRecentlyActive(w)) {
+                    await log("info", `${short(sid)} - user recently active, skipping periodic open-todos nudge`)
+                    continue
+                }
                 // Lazy fetch: if we never received a todo.updated event, try the API
                 if ((w.todos || []).length === 0) {
                     const fetched = await fetchSessionTodos(sid)
@@ -2046,7 +2151,17 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     // and works with or without magic-context installed.
                     if (w.isSubagent) {
                         try {
-                            if (
+                            let subAwaitingInput = false
+                            try {
+                                subAwaitingInput = hasPendingUserInput(await getSessionMessages(sid))
+                            } catch (e) {
+                                dbg(`session.idle sid=${short(sid)}: awaiting-input check error: ${e}`)
+                            }
+                            if (subAwaitingInput) {
+                                await log("info", `${short(sid)} - awaiting user input (pending tool_use), skipping subagent saturation check`)
+                            } else if (userRecentlyActive(w)) {
+                                await log("info", `${short(sid)} - user recently active, skipping subagent saturation check`)
+                            } else if (
                                 w.lastTokenTotal > 0 &&
                                 w.contextWrapupAttempts < 1 &&
                                 !w.userCancelled &&
@@ -2064,6 +2179,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                                             "warn",
                                             `${short(sid)} - context saturation (subagent): ${w.lastTokenTotal}/${usable} tokens (${Math.round((w.lastTokenTotal / usable) * 100)}% of usable); triggering native compaction`,
                                         )
+                                        if (w.userCancelled || w.completionSignaled) break
                                         await ctx.client.session.summarize({ path: { id: sid } })
                                     }
                                 }
@@ -2078,7 +2194,23 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     }
 
                     if (!w.isSubagent) {
+                        // Awaiting-input gate: trailing pending tool_use (e.g. an
+                        // open question) means the user holds the ball — skip the
+                        // whole idle block, no check may prompt. Re-evaluated on
+                        // the next idle event after the user answers. Computed
+                        // once here so every idle check below (streaming,
+                        // dead-stream, context, open-todos) shares it.
+                        let awaitingUserInput = false
+                        try {
+                            awaitingUserInput = hasPendingUserInput(await getSessionMessages(sid))
+                        } catch (e) {
+                            dbg(`session.idle sid=${short(sid)}: awaiting-input check error: ${e}`)
+                        }
+                        if (awaitingUserInput) {
+                            await log("info", `${short(sid)} - awaiting user input (pending tool_use), standing down all idle checks/nudges`)
+                        }
                         if (
+                            !awaitingUserInput &&
                             !w.pendingRecovery &&
                             !w.completionSignaled &&
                             !w.userCancelled &&
@@ -2182,7 +2314,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                                     w.lastTokenTotal > 0 &&
                                     w.contextWrapupAttempts < 1 &&
                                     !w.userCancelled &&
-                                    !w.completionSignaled
+                                    !w.completionSignaled &&
+                                    !userRecentlyActive(w)
                                 ) {
                                     const usable = await getUsableContextLimit(sid)
                                     if (
@@ -2196,7 +2329,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                                             "warn",
                                             `${short(sid)} - context saturation: ${w.lastTokenTotal}/${usable} tokens (${Math.round((w.lastTokenTotal / usable) * 100)}% of usable); sending magic-context wrapup command`,
                                         )
-                                        await ctx.client.session.command({
+                                            if (w.userCancelled || w.completionSignaled) break
+                                            await ctx.client.session.command({
                                             path: { id: sid },
                                             body: { command: CTX_WRAPUP_TRIGGER, arguments: "" },
                                         })
@@ -2222,7 +2356,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         }
                         const open = getOpenTodos(todos)
                         
-                        if (open.length > 0 && currentBusy === 0 && !w.completionSignaled && !w.userCancelled && w.todoNudgeAttempts < maxRetries) {
+                        if (open.length > 0 && currentBusy === 0 && !awaitingUserInput && !userRecentlyActive(w) && !w.completionSignaled && !w.userCancelled && w.todoNudgeAttempts < maxRetries) {
                             const isCelebration = await lastAssistantEndsWithCelebration(sid)
                             await log("info", `${short(sid)} - open todos=${open.length}, isCelebration=${isCelebration}, currentBusy=${currentBusy}`)
                             if (isCelebration) {
@@ -2250,6 +2384,14 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                                         return
                                     }
                                     const msgs = await getSessionMessages(idleSid)
+                                    if (hasPendingUserInput(msgs)) {
+                                        dbg(`session.idle sid=${short(idleSid)}: awaiting user input, skipping action-intent prompt`)
+                                        return
+                                    }
+                                    if (userRecentlyActive(idleW)) {
+                                        dbg(`session.idle sid=${short(idleSid)}: user recently active, skipping action-intent prompt`)
+                                        return
+                                    }
                                     const lastAssistantMsg = msgs.slice().reverse().find(m => (m.role ?? (m.info as Record<string, unknown> | undefined)?.role) === "assistant")
                                     if (lastAssistantMsg) {
                                         let lastText = ""
@@ -2319,6 +2461,15 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                                     return
                                 }
                                 const msgs = await getSessionMessages(sid)
+                                if (hasPendingUserInput(msgs)) {
+                                    dbg(`session.idle sid=${short(sid)}: awaiting user input, skipping action-intent prompt`)
+                                    return
+                                }
+                                const w2pre = sessions.get(sid)
+                                if (w2pre && userRecentlyActive(w2pre)) {
+                                    dbg(`session.idle sid=${short(sid)}: user recently active, skipping action-intent prompt`)
+                                    return
+                                }
                                 const lastAssistantMsg = msgs.slice().reverse().find(m => (m.role ?? (m.info as Record<string, unknown> | undefined)?.role) === "assistant")
                                 if (lastAssistantMsg) {
                                     let lastText = ""
@@ -2370,6 +2521,17 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 const props = ev.properties as Record<string, unknown> | undefined
                 const info = props?.info as Record<string, unknown> | undefined
                 const role = (info?.role as string) ?? (props?.role as string)
+                if (role === "user") {
+                    // Genuine new work cycle: re-arm the done-claim nudge budget.
+                    // (Deliberately NOT reset in resetBusyFlags — see note there.)
+                    // Also stamps inbound user activity for active-user suppression.
+                    const w = sessions.get(sid)
+                    if (w) {
+                        w.doneClaimNoTodosAttempts = 0
+                        w.lastUserMessageAt = Date.now()
+                    }
+                    break
+                }
                 if (role !== "assistant") break
                 const tokens = (info?.tokens ?? props?.tokens) as Record<string, unknown> | undefined
                 if (!tokens) break

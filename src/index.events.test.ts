@@ -867,7 +867,7 @@ describe("done-claim text detection (no tool call)", () => {
         expect(lastPrompt).toContain("verify")
     })
 
-    test("done-claim text with no open todos → sends prompts, resets on busy", async () => {
+    test("done-claim with no open todos → details prompt capped across busy cycles (no reset on busy)", async () => {
         const { ctx, promptCalls } = createMockContext({
             sessions: [{ id: "ses_cap", status: "busy" }],
             messages: {
@@ -901,19 +901,116 @@ describe("done-claim text detection (no tool call)", () => {
         await wait(100)
         expect(promptCalls.length).toBe(1)
 
-        // Busy resets the counter (fresh budget)
+        // Busy NO LONGER resets the counter → second idle sends attempt 2/2
         await hooks.event!({ event: { type: "session.status", sessionID: "ses_cap", properties: { status: "busy" } } as any })
         await wait(50)
         await hooks.event!({ event: { type: "session.status", sessionID: "ses_cap", properties: { status: "idle" } } as any })
         await wait(100)
         expect(promptCalls.length).toBe(2)
 
-        // Busy resets again → another prompt (counter is fresh each cycle now)
+        // Cap binds across cycles: third idle sends nothing (was unbounded before #26)
         await hooks.event!({ event: { type: "session.status", sessionID: "ses_cap", properties: { status: "busy" } } as any })
         await wait(50)
         await hooks.event!({ event: { type: "session.status", sessionID: "ses_cap", properties: { status: "idle" } } as any })
         await wait(100)
-        expect(promptCalls.length).toBe(3)
+        expect(promptCalls.length).toBe(2)
+    })
+
+    test("done-claim response that already contains a work description → NO details prompt (#26)", async () => {
+        const { ctx, promptCalls } = createMockContext({
+            sessions: [{ id: "ses_report", status: "busy" }],
+            messages: {
+                ses_report: [
+                    {
+                        id: "m1",
+                        role: "user",
+                        parts: [{ type: "text", text: "do the thing" }]
+                    },
+                    {
+                        id: "m2",
+                        role: "assistant",
+                        parts: [{
+                            type: "text",
+                            text: "Task completed.\n\nChanged files:\n- src/index.ts: removed the leftover helper and its import\n- src/old-plugin.ts: deleted (leftover from uninstalled plugin)\n\nVerification:\n- bun test → 527 pass, 0 fail\n- bun x tsc --noEmit → clean\n\nResult: leftover files removed, suite green."
+                        }]
+                    }
+                ]
+            }
+        })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, maxRetries: 3, toolTextCheckDelayMs: 1, minActivityGapMs: 0 })
+
+        // No open todos
+        await hooks.event!({
+            event: {
+                type: "todo.updated",
+                sessionID: "ses_report",
+                properties: { todos: [] }
+            } as any
+        })
+
+        // Session goes idle → the done-claim matches, but the response already
+        // carries file paths + verification output, so no prompt may fire
+        await hooks.event!({ event: { type: "session.status", sessionID: "ses_report", properties: { status: "idle" } } as any })
+        await wait(100)
+        expect(promptCalls.length).toBe(0)
+    })
+
+    test("inbound user message re-arms the done-claim budget after the cap", async () => {
+        const { ctx, promptCalls } = createMockContext({
+            sessions: [{ id: "ses_rearm", status: "busy" }],
+            messages: {
+                ses_rearm: [
+                    {
+                        id: "m1",
+                        role: "user",
+                        parts: [{ type: "text", text: "do the thing" }]
+                    },
+                    {
+                        id: "m2",
+                        role: "assistant",
+                        parts: [{ type: "text", text: "Task completed." }]
+                    }
+                ]
+            }
+        })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, maxRetries: 1, toolTextCheckDelayMs: 1, minActivityGapMs: 0, activeUserWindowMs: 1 })
+
+        // No open todos
+        await hooks.event!({
+            event: {
+                type: "todo.updated",
+                sessionID: "ses_rearm",
+                properties: { todos: [] }
+            } as any
+        })
+
+        // First idle → prompt sent (attempt 1/1, cap reached)
+        await hooks.event!({ event: { type: "session.status", sessionID: "ses_rearm", properties: { status: "idle" } } as any })
+        await wait(100)
+        expect(promptCalls.length).toBe(1)
+
+        // Busy → idle → cap holds, nothing sent
+        await hooks.event!({ event: { type: "session.status", sessionID: "ses_rearm", properties: { status: "busy" } } as any })
+        await wait(50)
+        await hooks.event!({ event: { type: "session.status", sessionID: "ses_rearm", properties: { status: "idle" } } as any })
+        await wait(100)
+        expect(promptCalls.length).toBe(1)
+
+        // Genuine new cycle: inbound user message re-arms the budget (window
+        // expires first so active-user suppression does not mask the check)
+        await hooks.event!({
+            event: {
+                type: "message.updated",
+                sessionID: "ses_rearm",
+                properties: { info: { role: "user" }, parts: [{ type: "text", text: "now do the other thing" }] }
+            } as any
+        })
+        await wait(100)
+        await hooks.event!({ event: { type: "session.status", sessionID: "ses_rearm", properties: { status: "busy" } } as any })
+        await wait(50)
+        await hooks.event!({ event: { type: "session.status", sessionID: "ses_rearm", properties: { status: "idle" } } as any })
+        await wait(100)
+        expect(promptCalls.length).toBe(2)
     })
 })
 

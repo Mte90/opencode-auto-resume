@@ -42,13 +42,20 @@ describe("Issue #16 regression: contract assertions on source", () => {
         // Extract the function body more robustly: find resetBusyFlags, then scan forward
         const fnStart = SOURCE.indexOf("function resetBusyFlags")
         expect(fnStart).toBeGreaterThan(-1)
-        const fnEnd = SOURCE.indexOf("// PRESERVE", fnStart)
+        const fnEnd = SOURCE.indexOf("// PRESERVE: userCancelled", fnStart)
         expect(fnEnd).toBeGreaterThan(fnStart)
         const body = SOURCE.slice(fnStart, fnEnd)
         expect(body).not.toMatch(/w\.userCancelled\s*=\s*false/)
         expect(body).not.toMatch(/w\.completionSignaled\s*=\s*false/)
         expect(body).toMatch(/todoNudgeAttempts\s*=\s*0/)
-        expect(body).toMatch(/doneClaimNoTodosAttempts\s*=\s*0/)
+        // #26: the done-claim budget must NOT re-arm on every busy (that let
+        // the details prompt refire unboundedly across cycles); it re-arms
+        // only on an inbound user message (genuine new work cycle).
+        expect(body).not.toMatch(/doneClaimNoTodosAttempts\s*=\s*0/)
+        const msgUpdated = SOURCE.indexOf('case "message.updated"')
+        expect(msgUpdated).toBeGreaterThan(-1)
+        const msgBlock = SOURCE.slice(msgUpdated, msgUpdated + 2000)
+        expect(msgBlock).toMatch(/doneClaimNoTodosAttempts\s*=\s*0/)
     })
 
     test("FIX A2: command.executed resets only originating session (no loop over all sessions)", () => {
