@@ -721,6 +721,101 @@ describe("task_complete tool", () => {
         expect(promptCalls.length).toBeGreaterThan(0)
     })
 
+    test("task_complete block-site names the specific open todos in the message", async () => {
+        const { ctx, promptCalls } = createMockContext({
+            sessions: [{ id: "ses_parent", status: "busy" }],
+            messages: {}
+        })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, maxRetries: 3 })
+
+        await hooks.event!({ event: { type: "session.status", sessionID: "ses_parent", properties: { status: "busy" } } as any })
+
+        await hooks.event!({
+            event: {
+                type: "todo.updated",
+                sessionID: "ses_parent",
+                properties: { todos: [
+                    { id: "t1", content: "Fix the auth handler", status: "pending", priority: "high" },
+                    { id: "t2", content: "Add tests for the new endpoint", status: "in_progress", priority: "medium" },
+                    { id: "t3", content: "Update the README", status: "pending", priority: "low" },
+                ] }
+            } as any
+        })
+
+        const result = await hooks.tool!["task_complete"].execute({}, { sessionID: "ses_parent" } as any)
+
+        // Must name each specific todo, not just a generic count
+        expect(result).toContain("Fix the auth handler")
+        expect(result).toContain("Add tests for the new endpoint")
+        expect(result).toContain("Update the README")
+        // Must include the instruction to mark finished todos complete
+        expect(result).toContain("Mark any finished todos complete")
+        // Must not be the old generic one-liner
+        expect(result).not.toContain("Please complete all remaining work before signaling completion")
+    })
+
+    test("task_complete block-site fires a visible sendContinuePrompt nudge", async () => {
+        const { ctx, promptCalls } = createMockContext({
+            sessions: [{ id: "ses_parent", status: "busy" }],
+            messages: {}
+        })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, maxRetries: 3 })
+
+        await hooks.event!({ event: { type: "session.status", sessionID: "ses_parent", properties: { status: "busy" } } as any })
+
+        await hooks.event!({
+            event: {
+                type: "todo.updated",
+                sessionID: "ses_parent",
+                properties: { todos: [
+                    { id: "t1", content: "Implement login", status: "pending", priority: "high" },
+                ] }
+            } as any
+        })
+
+        const result = await hooks.tool!["task_complete"].execute({}, { sessionID: "ses_parent" } as any)
+
+        // The block-site must fire a visible nudge (session.prompt call)
+        expect(promptCalls.length).toBeGreaterThanOrEqual(1)
+        // The nudge body must match the returned tool result
+        const nudgeBody = promptCalls[0].body
+        expect(nudgeBody).toContain("Implement login")
+        expect(nudgeBody).toContain("Mark any finished todos complete")
+        // The nudge targets the same session
+        expect(promptCalls[0].sid).toBe("ses_parent")
+    })
+
+    test("task_complete block-site nudge and tool result carry identical todo list", async () => {
+        const { ctx, promptCalls } = createMockContext({
+            sessions: [{ id: "ses_parent", status: "busy" }],
+            messages: {}
+        })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, maxRetries: 3 })
+
+        await hooks.event!({ event: { type: "session.status", sessionID: "ses_parent", properties: { status: "busy" } } as any })
+
+        await hooks.event!({
+            event: {
+                type: "todo.updated",
+                sessionID: "ses_parent",
+                properties: { todos: [
+                    { id: "t1", content: "Alpha task", status: "in_progress", priority: "high" },
+                    { id: "t2", content: "Beta task", status: "pending", priority: "medium" },
+                ] }
+            } as any
+        })
+
+        const result = await hooks.tool!["task_complete"].execute({}, { sessionID: "ses_parent" } as any)
+
+        // Both the visible nudge and the tool result must contain the same todo list
+        const nudgeBody = promptCalls[0].body
+        // The todo list portion of the reminder must appear in both
+        expect(nudgeBody).toContain("1. [in_progress] Alpha task")
+        expect(nudgeBody).toContain("2. [pending] Beta task")
+        expect(result).toContain("1. [in_progress] Alpha task")
+        expect(result).toContain("2. [pending] Beta task")
+    })
+
     test("task_complete with open todos after maxRetries → accepts completion", async () => {
         const { ctx, promptCalls } = createMockContext({
             sessions: [{ id: "ses_parent", status: "busy" }],
@@ -746,11 +841,13 @@ describe("task_complete tool", () => {
         const result2 = await hooks.tool!["task_complete"].execute({}, { sessionID: "ses_parent" } as any)
         expect(result2).toContain("Task completion acknowledged")
 
-        // Send idle — should NOT trigger continue because completionSignaled is now true
+        // The blocked first task_complete call fired a visible block-site nudge
+        // (1 session.prompt). The idle must add 0 because completionSignaled is now true.
+        const promptsBeforeIdle = promptCalls.length
         await hooks.event!({ event: { type: "session.status", sessionID: "ses_parent", properties: { status: "idle" } } as any })
         await wait(100)
 
-        expect(promptCalls.length).toBe(0)
+        expect(promptCalls.length).toBe(promptsBeforeIdle)
     })
 
     test("taskCompleteOverrides persists across busy/idle cycle", async () => {
