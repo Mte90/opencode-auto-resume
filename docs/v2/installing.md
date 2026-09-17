@@ -9,13 +9,35 @@ plugin API (`@opencode/plugin` 2.0.5, shipped with `opencode` v2.0.5).
 ## Requirements
 
 - **opencode v2.0.5 or newer** (`opencode --version`).
-- Node.js/Bun is only needed if you run the test/typecheck tooling; the plugin
-  itself is loaded by opencode.
+- **`@opencode/plugin` must be resolvable by opencode.** A local plugin is loaded
+  with a normal ESM import, so the API package has to be installed next to it
+  (see [Step 1](#step-1--install-the-plugin-api-package)). Without it opencode
+  logs `failed to load plugin … Cannot find package '@opencode/plugin'`.
+- Node.js/Bun is only needed to install the API package and run the
+  test/typecheck tooling; opencode itself loads the plugin.
 - The plugin source: [`src/v2/index.ts`](../../src/v2/index.ts) from this repo.
 
 ## Install
 
-### Option A — drop-in file (no config)
+### Step 1 — install the plugin API package
+
+Global plugins resolve imports from `~/.config/opencode`, so install the stable
+API package there once:
+
+```sh
+cd ~/.config/opencode
+bun add @opencode/plugin@2.0.5     # or: npm install @opencode/plugin@2.0.5
+```
+
+For a per-project plugin, install it in the project instead:
+
+```sh
+npm install @opencode/plugin@2.0.5
+```
+
+### Step 2 — add the plugin
+
+#### Option A — drop-in file (no config)
 
 OpenCode auto-loads every plugin found in these directories:
 
@@ -32,7 +54,7 @@ cp src/v2/index.ts ~/.config/opencode/plugins/auto-resume-v2.ts
 That's it — no `opencode.json` change is required. Restart opencode (or reload
 plugins) and the plugin is active.
 
-### Option B — `opencode.json(c)` entry
+#### Option B — `opencode.json(c)` entry
 
 Use this when you want to load the file from another location, pass options, or
 pin a published package. Add an entry to the `plugins` array:
@@ -58,6 +80,12 @@ pin a published package. Add an entry to the `plugins` array:
 
 Both `.opencode/plugin/` (v1 directory name) and `.opencode/plugins/` are
 discovered; use `.opencode/plugins/` for v2 files.
+
+### Step 3 — restart opencode
+
+Restart opencode after installing. The plugin loader resolves plugin
+dependencies when the server starts, so a hot file reload is **not** enough to
+pick up a newly installed `@opencode/plugin` package.
 
 ## Options
 
@@ -118,6 +146,7 @@ also appended to the opencode log with an `[auto-resume]` prefix.
 | Symptom | Check |
 |---|---|
 | No `[auto-resume] ready …` banner | File is in a `plugins/` dir opencode scans, or listed in `plugins`; restart opencode. |
+| Logs say `failed to load plugin … Cannot find package '@opencode/plugin'` | Install the API package next to the plugin (Step 1) **and restart** opencode. |
 | Nothing happens on a stall | Increase verbosity with `"debug": true`; confirm `chunkTimeoutMs` isn't larger than your real stall. |
 | Recovers but you don't see a notice | Your model/provider may reject `session.synthetic()`; the plugin falls back to `session.prompt()` (no TUI banner). |
 | Never recovers a parent waiting on a subagent | Intentional: parent sessions blocked on a running subagent are left alone. |

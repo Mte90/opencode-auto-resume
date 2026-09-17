@@ -211,3 +211,9 @@ The port was originally written against the beta (`@opencode-ai/plugin`
   `ctx.session.interrupt()` input is `{ sessionID, resume? }`.
 - **Docs recommend `ctx.event.subscribe({ signal })`** and aborting the stream
   during cleanup; the port now does this with an `AbortController`.
+- **Local-file installs need the API package resolvable.** opencode loads a
+  local `.ts` plugin with a normal ESM import and snapshots plugin
+  dependencies at server startup, so `@opencode/plugin` must be installed in
+  the config dir (`~/.config/opencode`) and opencode restarted. A *published*
+  plugin should instead declare `@opencode/plugin` in its `dependencies`
+  (replacing `@opencode-ai/plugin`).
