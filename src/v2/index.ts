@@ -10,10 +10,12 @@
  *    (`{ type, data }`) instead of the v1 `event` hook (`{ type, properties }`).
  *  - SDK calls are flattened: `ctx.session.prompt({ sessionID, text })`,
  *    `ctx.session.interrupt({ sessionID })`, `ctx.session.active()`.
- *  - There is no message-history access from the v2 plugin context, so assistant
- *    text is reconstructed from `session.text.delta` events instead of
- *    `session.messages()` polling.
+ *  - Assistant text is accumulated from `session.text.delta` events for liveness;
+ *    `ctx.session.context()` (stable v2) supplies the authoritative final
+ *    assistant text at idle time — replacing v1's `session.messages()` polling.
  *  - No `ctx.app.log` in v2 — logs go to the console (captured by opencode logs).
+ *  - Targets the stable v2 API (`@opencode/plugin`). Event names are unchanged
+ *    from the beta port; `session.execution.interrupted` now carries a `reason`.
  *
  * Detection/recovery features ported:
  *  - Stalled stream watchdog (busy session with no events for chunkTimeoutMs)
@@ -30,7 +32,7 @@
  *   { "plugins": [{ "package": "./plugins/auto-resume-v2.ts", "options": { ... } }] }
  */
 
-import { Plugin } from "@opencode-ai/plugin"
+import { Plugin } from "@opencode/plugin"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -529,22 +531,14 @@ export default Plugin.define({
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : String(err)
 				log("warn", `${short(sid)} synthetic failed: ${msg}`)
-				// Flat-shape fallback for beta drift
+				// Last resort: a plain prompt still resumes the session (just
+				// without the visible synthetic notification in the TUI).
 				try {
-					await (ctx.session as any).synthetic({
-						path: { id: sid },
-						body: { text, description: `auto-resume: ${notification}`, resume },
-					})
+					await ctx.session.prompt({ sessionID: sid, text })
 					return true
 				} catch {
-					// Last resort: bare prompt
-					try {
-						await ctx.session.prompt({ sessionID: sid, text })
-						return true
-					} catch {
-						log("error", `${short(sid)} all recovery attempts failed: ${msg}`)
-						return false
-					}
+					log("error", `${short(sid)} all recovery attempts failed: ${msg}`)
+					return false
 				}
 			}
 		}
@@ -654,9 +648,40 @@ export default Plugin.define({
 		// Idle-time forensics (runs once when a turn finishes)
 		// ---------------------------------------------------------------------
 
+		/**
+		 * Read the last assistant message's text from the session message history
+		 * (`ctx.session.context()`, stable v2 API). Returns "" when unavailable.
+		 * Guarded so a failure in this forensic path never breaks the watchdog.
+		 */
+		async function lastAssistantTextFromContext(sid: string): Promise<string> {
+			try {
+				const messages = await ctx.session.context({ sessionID: sid })
+				if (!Array.isArray(messages)) return ""
+				for (let i = messages.length - 1; i >= 0; i--) {
+					const msg = messages[i] as {
+						type?: string
+						content?: Array<{ type?: string; text?: string }>
+					}
+					if (!msg || msg.type !== "assistant" || !Array.isArray(msg.content)) continue
+					const text = msg.content
+						.filter((part) => part?.type === "text" && typeof part.text === "string")
+						.map((part) => part.text as string)
+						.join("")
+					if (text) return text
+				}
+				return ""
+			} catch (e) {
+				dbg("session.context() fallback failed:", e instanceof Error ? e.message : String(e))
+				return ""
+			}
+		}
+
 		async function inspectOnIdle(sid: string) {
 			const w = ensureWatch(sid)
-			const text = w.lastAssistantText
+			// Prefer the live delta buffer; fall back to the authoritative message
+			// history when it is empty (e.g. the plugin loaded mid-turn) or stale.
+			let text = w.lastAssistantText
+			if (!text) text = await lastAssistantTextFromContext(sid)
 			if (!text) return
 
 			if (containsToolCallAsText(text)) {
@@ -768,13 +793,24 @@ export default Plugin.define({
 					const sid = sidOf(ev)
 					if (!sid) return
 					const w = ensureWatch(sid)
-					// Only user interrupts should suppress us; ours reset flags themselves.
-					w.userCancelled = !w.aborting
+					// Stable v2 carries the interrupt `reason`. Only a genuine user
+					// interrupt should suppress recovery; shutdown/superseded/inactivity
+					// (or a missing reason on older runtimes) must not.
+					const reason = typeof ev.data?.reason === "string" ? ev.data.reason : undefined
+					w.userCancelled = !w.aborting && (reason === undefined || reason === "user")
 					w.recovering = false
 					markIdle(sid)
 					return
 				}
-				case "session.deleted":
+				case "session.deleted": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					sessions.delete(sid)
+					return
+				}
+				// v1 legacy: not emitted in v2 (reverts now surface as
+				// `session.revert.cleared` / `session.revert.committed`). Kept
+				// defensively so older runtimes still drop their watch state.
 				case "session.reverted": {
 					const sid = sidOf(ev)
 					if (!sid) return
@@ -918,10 +954,13 @@ export default Plugin.define({
 		}
 
 		// Subscribe and pump events in the background (setup must not block).
+		// Stable v2 recommends passing an AbortSignal so the stream is torn down
+		// promptly on plugin unload instead of staying suspended in `for await`.
 		let running = true
+		const eventAbort = new AbortController()
 		const pump = async () => {
 			try {
-				const stream = ctx.event.subscribe()
+				const stream = ctx.event.subscribe({ signal: eventAbort.signal })
 				for await (const raw of stream) {
 					if (!running) return
 					const ev = raw as unknown as V2Event
@@ -943,9 +982,10 @@ export default Plugin.define({
 			`ready (opencode v2). timeout=${chunkTimeoutMs}ms interval=${checkIntervalMs}ms retries=${maxRetries} loop=${loopMaxContinues}/${loopWindowMs / 1000}s`,
 		)
 
-		// Cleanup: stop timers and the pump; OpenCode awaits this on disable/reload/shutdown.
+		// Cleanup: stop timers and the event pump; OpenCode awaits this on disable/reload/shutdown.
 		return () => {
 			running = false
+			eventAbort.abort()
 			clearInterval(watchdog)
 			sessions.clear()
 			log("info", "stopped")
