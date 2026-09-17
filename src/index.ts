@@ -2650,8 +2650,14 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
                     if (openTodos.length > 0 && w.taskCompleteOverrides < maxRetries) {
                         w.taskCompleteOverrides++
+                        const reminder = buildOpenTodosReminder(w.todos)
+                        const blockMsg = `Mark any finished todos complete and do not redo completed work.\n${reminder}`
                         await log("info", `${short(ctx.sessionID)} - task_complete blocked: ${openTodos.length} open todos remain (override ${w.taskCompleteOverrides}/${maxRetries})`)
-                        return `You have ${openTodos.length} unfinished task(s). Please complete all remaining work before signaling completion.`
+                        // Fire a visible nudge naming the blocking todos so the model sees
+                        // exactly what is still open, even if this tool result collapses to
+                        // an invisible one-liner. Mirrors the idle-resume path.
+                        await sendContinuePrompt(ctx.sessionID, blockMsg, w)
+                        return blockMsg
                     }
                 }
 
