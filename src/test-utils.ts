@@ -45,6 +45,7 @@ export interface SessionWatch {
     completionSignaled: boolean
     todoNudgeAttempts: number
     taskCompleteOverrides: number
+    taskCompleteSignals: number
     doneClaimNoTodosAttempts: number
     pendingTools: number
     pendingCommands: number

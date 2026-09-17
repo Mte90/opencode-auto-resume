@@ -49,6 +49,11 @@ export interface SessionWatch {
     completionSignaled: boolean
     todoNudgeAttempts: number
     taskCompleteOverrides: number
+    // Consecutive task_complete ACKs with no new user message, block, or
+    // other tool work between them. Guards the ack self-loop where the ack
+    // tool-result is fed back and the model re-emits task_complete instead
+    // of ending its turn. Persists across busy/idle cycles by design.
+    taskCompleteSignals: number
     doneClaimNoTodosAttempts: number
     // Last inbound user message (message.updated, role=user). A recently
     // active user is likely composing a reply — idle nudges must stand down.
@@ -115,6 +120,25 @@ const TOOL_LOOP_RECOVERY_PROMPT =
     "1) Are you stuck in a loop? 2) Do you need different information first? " +
     "3) Should you try a different tool or break the task into smaller steps? " +
     "Take a moment to think about what's blocking you and propose a different strategy."
+
+// task_complete acknowledgement texts. The ack tool-result is fed back into
+// the model's turn, so a stuck model re-emits task_complete instead of ending
+// with text (observed in production: 27 consecutive acked calls, zero new
+// user input). The first ack therefore carries an explicit stop instruction;
+// repeats escalate to a thrown error so the turn is forced to end.
+const TASK_COMPLETE_ACK =
+    "Task completion acknowledged. No further continuation will be sent. " +
+    "End your turn now with a brief text reply — do not call task_complete or any other tool again " +
+    "unless the user sends a new message."
+
+const TASK_COMPLETE_REPEAT_WARNING =
+    "Task completion acknowledged already on your previous call — completion is recorded. " +
+    "End your turn now with a brief text reply. Do not call task_complete again; " +
+    "further repeat calls are rejected as errors."
+
+const TASK_COMPLETE_REPEAT_ERROR =
+    "task_complete already acknowledged twice with no new user message or tool work since — " +
+    "completion is recorded. End your turn with text and make no further tool calls."
 
 const CTX_WRAPUP_TRIGGER = "ctx-wrapup"
 
@@ -572,6 +596,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 completionSignaled: false,
                 todoNudgeAttempts: 0,
                 taskCompleteOverrides: 0,
+                taskCompleteSignals: 0,
                 doneClaimNoTodosAttempts: 0,
                 lastUserMessageAt: 0,
                 pendingTools: 0,
@@ -2640,7 +2665,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     // -----------------------------------------------------------------------
 
     const taskCompleteTool = tool({
-        description: "Signal that all work is complete and stop automatic continuation prompts. Call this ONLY after finishing everything requested.",
+        description: "Signal that all work is complete and stop automatic continuation prompts. Call this ONLY after finishing everything requested. Call exactly once per completed round of work — repeat calls with no new user message in between are rejected.",
         args: {},
         execute: async (_args, ctx) => {
             const w = sessions.get(ctx.sessionID)
@@ -2650,6 +2675,9 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
                     if (openTodos.length > 0 && w.taskCompleteOverrides < maxRetries) {
                         w.taskCompleteOverrides++
+                        // Work remains, so a later completion is legitimate:
+                        // reset the repeat-signal counter.
+                        w.taskCompleteSignals = 0
                         const reminder = buildOpenTodosReminder(w.todos)
                         const blockMsg = `Mark any finished todos complete and do not redo completed work.\n${reminder}`
                         await log("info", `${short(ctx.sessionID)} - task_complete blocked: ${openTodos.length} open todos remain (override ${w.taskCompleteOverrides}/${maxRetries})`)
@@ -2665,8 +2693,16 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 w.completionSignaled = true
                 if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
                 log("info", `${short(ctx.sessionID)} - task_complete called, ${w.isSubagent ? 'subagent' : 'agent'} done`)
+                // Repeat-signal guard (ack self-loop): the ack tool-result is
+                // fed straight back into the model's turn, and a stuck model
+                // re-emits task_complete instead of ending with text. The 1st
+                // ack carries a stop instruction, the 2nd warns, the 3rd+
+                // throws so the turn is forced to end.
+                w.taskCompleteSignals++
+                if (w.taskCompleteSignals === 2) return TASK_COMPLETE_REPEAT_WARNING
+                if (w.taskCompleteSignals > 2) throw new Error(TASK_COMPLETE_REPEAT_ERROR)
             }
-            return "Task completion acknowledged. No further continuation will be sent."
+            return TASK_COMPLETE_ACK
         },
     })
 
@@ -2709,6 +2745,9 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             if (w.userCancelled || w.completionSignaled) {
                 w.userCancelled = false
                 w.completionSignaled = false
+                // A genuine user message starts a new round of work, so the
+                // repeat-signal counter restarts too.
+                w.taskCompleteSignals = 0
                 await log("info", `${short(sid)} - new user message, re-arming auto-resume`)
             }
         },
@@ -2720,6 +2759,10 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             w.lastActivityAt = Date.now()
 
             const toolName = (input.tool as string) ?? "unknown"
+            // Any real tool work between completions legitimises the next
+            // task_complete — reset the repeat-signal counter. task_complete
+            // itself is excluded (it manages the counter in its execute).
+            if (toolName !== "task_complete") w.taskCompleteSignals = 0
             const rawArgs = (hookArgs as { args?: unknown } | undefined)?.args
                 ?? (input as { args?: unknown }).args
             w.liveToolSigs.push(toolCallSignature(toolName, rawArgs))

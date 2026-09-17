@@ -42,6 +42,7 @@ interface WatchState {
     completionSignaled: boolean
     todoNudgeAttempts: number
     taskCompleteOverrides: number
+    taskCompleteSignals: number
     doneClaimNoTodosAttempts: number
     pendingTools: number
     pendingCommands: number
@@ -82,6 +83,7 @@ function createWatch(sid: string, now = 1000): WatchState {
         completionSignaled: false,
         todoNudgeAttempts: 0,
         taskCompleteOverrides: 0,
+        taskCompleteSignals: 0,
         doneClaimNoTodosAttempts: 0,
         pendingTools: 0,
         pendingCommands: 0,
