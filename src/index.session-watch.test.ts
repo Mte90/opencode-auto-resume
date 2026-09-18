@@ -30,6 +30,7 @@ function createWatch(sid: string, now = Date.now()): SessionWatch {
         completionSignaled: false,
         todoNudgeAttempts: 0,
         taskCompleteOverrides: 0,
+        taskCompleteSignals: 0,
         doneClaimNoTodosAttempts: 0,
         pendingTools: 0,
         pendingCommands: 0,

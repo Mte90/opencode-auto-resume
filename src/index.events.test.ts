@@ -882,6 +882,135 @@ describe("task_complete tool", () => {
         const result3 = await hooks.tool!["task_complete"].execute({}, { sessionID: "ses_parent" } as any)
         expect(result3).toContain("Task completion acknowledged")
     })
+
+    test("task_complete repeat-signal guard: 1st ack instructs stop, 2nd warns, 3rd throws", async () => {
+        // Regression: production session looped 27 consecutive acked
+        // task_complete calls with zero new user input — the ack tool-result
+        // fed back into the turn and the model re-emitted instead of ending.
+        const { ctx } = createMockContext({
+            sessions: [{ id: "ses_repeat", status: "busy" }],
+            messages: {}
+        })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1 })
+
+        await hooks.event!({ event: { type: "session.status", sessionID: "ses_repeat", properties: { status: "busy" } } as any })
+
+        // 1st call — full ack carrying an explicit stop instruction
+        const r1 = await hooks.tool!["task_complete"].execute({}, { sessionID: "ses_repeat" } as any)
+        expect(r1).toContain("Task completion acknowledged")
+        expect(r1).toContain("End your turn")
+
+        // 2nd consecutive call — repeat warning (still success, still ack phrase)
+        const r2 = await hooks.tool!["task_complete"].execute({}, { sessionID: "ses_repeat" } as any)
+        expect(r2).toContain("Task completion acknowledged")
+        expect(r2).toContain("repeat")
+
+        // 3rd consecutive call — rejected as an error so the model turn ends
+        await expect(
+            hooks.tool!["task_complete"].execute({}, { sessionID: "ses_repeat" } as any)
+        ).rejects.toThrow("already acknowledged")
+    })
+
+    test("task_complete repeat counter persists across busy/idle cycle", async () => {
+        const { ctx } = createMockContext({
+            sessions: [{ id: "ses_persist", status: "busy" }],
+            messages: {}
+        })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1 })
+
+        await hooks.event!({ event: { type: "session.status", sessionID: "ses_persist", properties: { status: "busy" } } as any })
+
+        await hooks.tool!["task_complete"].execute({}, { sessionID: "ses_persist" } as any)
+        await hooks.tool!["task_complete"].execute({}, { sessionID: "ses_persist" } as any)
+
+        // Idle + busy churn (as in the production loop) must NOT reset it
+        await hooks.event!({ event: { type: "session.status", sessionID: "ses_persist", properties: { status: "idle" } } as any })
+        await hooks.event!({ event: { type: "session.status", sessionID: "ses_persist", properties: { status: "busy" } } as any })
+
+        await expect(
+            hooks.tool!["task_complete"].execute({}, { sessionID: "ses_persist" } as any)
+        ).rejects.toThrow("already acknowledged")
+    })
+
+    test("task_complete repeat counter resets on genuine user message", async () => {
+        const { ctx } = createMockContext({
+            sessions: [{ id: "ses_rearm", status: "busy" }],
+            messages: {}
+        })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1 })
+
+        await hooks.event!({ event: { type: "session.status", sessionID: "ses_rearm", properties: { status: "busy" } } as any })
+
+        await hooks.tool!["task_complete"].execute({}, { sessionID: "ses_rearm" } as any)
+        await hooks.tool!["task_complete"].execute({}, { sessionID: "ses_rearm" } as any)
+
+        // Genuine user message (continuing unset) starts a new round of work
+        await hooks["chat.message"]!({ sessionID: "ses_rearm" } as any)
+
+        const r3 = await hooks.tool!["task_complete"].execute({}, { sessionID: "ses_rearm" } as any)
+        expect(r3).toContain("Task completion acknowledged")
+        expect(r3).toContain("End your turn")
+        expect(r3).not.toContain("already")
+    })
+
+    test("task_complete repeat counter resets after other tool work", async () => {
+        const { ctx } = createMockContext({
+            sessions: [{ id: "ses_work", status: "busy" }],
+            messages: {}
+        })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1 })
+
+        await hooks.event!({ event: { type: "session.status", sessionID: "ses_work", properties: { status: "busy" } } as any })
+
+        await hooks.tool!["task_complete"].execute({}, { sessionID: "ses_work" } as any)
+        await hooks.tool!["task_complete"].execute({}, { sessionID: "ses_work" } as any)
+
+        // Real tool work between completions legitimises the next one
+        await hooks["tool.execute.before"]!({ tool: "read", sessionID: "ses_work", callID: "c-1" } as any, { args: { filePath: "a.ts" } } as any)
+
+        const r3 = await hooks.tool!["task_complete"].execute({}, { sessionID: "ses_work" } as any)
+        expect(r3).toContain("Task completion acknowledged")
+        expect(r3).toContain("End your turn")
+        expect(r3).not.toContain("already")
+    })
+
+    test("task_complete block path resets repeat counter", async () => {
+        const { ctx } = createMockContext({
+            sessions: [{ id: "ses_blockreset", status: "busy" }],
+            messages: {}
+        })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, maxRetries: 3 })
+
+        await hooks.event!({ event: { type: "session.status", sessionID: "ses_blockreset", properties: { status: "busy" } } as any })
+
+        // 1st call — clean ack
+        const r1 = await hooks.tool!["task_complete"].execute({}, { sessionID: "ses_blockreset" } as any)
+        expect(r1).toContain("End your turn")
+
+        // Todos reopen → next call blocks (work remains, later completion legit)
+        await hooks.event!({
+            event: {
+                type: "todo.updated",
+                sessionID: "ses_blockreset",
+                properties: { todos: [{ id: "t1", content: "reopened work", status: "pending", priority: "high" }] }
+            } as any
+        })
+        const blocked = await hooks.tool!["task_complete"].execute({}, { sessionID: "ses_blockreset" } as any)
+        expect(blocked).toContain("unfinished task")
+
+        // Todos cleared → next completion is a full ack again, not a warning
+        await hooks.event!({
+            event: {
+                type: "todo.updated",
+                sessionID: "ses_blockreset",
+                properties: { todos: [{ id: "t1", content: "reopened work", status: "completed", priority: "high" }] }
+            } as any
+        })
+        const r3 = await hooks.tool!["task_complete"].execute({}, { sessionID: "ses_blockreset" } as any)
+        expect(r3).toContain("Task completion acknowledged")
+        expect(r3).toContain("End your turn")
+        expect(r3).not.toContain("already")
+    })
 })
 
 describe("done-claim text detection (no tool call)", () => {

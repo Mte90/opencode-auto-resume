@@ -203,6 +203,8 @@ The agent can call the built-in `task_complete` tool to signal that all work is 
 
 If `task_complete` is called while open todos remain, the call is rejected (up to `maxRetries` times) with a message asking the agent to finish the remaining work first.
 
+Repeat calls with no new user message in between are guarded: the first acknowledgement carries an explicit stop instruction, the second returns a repeat warning, and the third and subsequent calls are rejected as errors. This breaks the ack self-loop where the acknowledgement tool-result is fed back into the turn and a stuck model re-emits `task_complete` instead of ending with text. The counter resets on a genuine user message, on the block path above, or when any other tool runs in between.
+
 ---
 
 ### 🎉 emoji completion
