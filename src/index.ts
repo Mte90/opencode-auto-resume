@@ -2800,7 +2800,21 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         // Fire a visible nudge naming the blocking todos so the model sees
                         // exactly what is still open, even if this tool result collapses to
                         // an invisible one-liner. Mirrors the idle-resume path.
-                        await sendContinuePrompt(ctx.sessionID, blockMsg, w)
+                        // #27 follow-up: never inject into a session holding the ball
+                        // (open question awaiting the user) — the tool result above
+                        // already carries the todo names. Fail open: if the check
+                        // errors, keep the visible nudge.
+                        let awaitingInput = false
+                        try {
+                            awaitingInput = hasPendingUserInput(await getSessionMessages(ctx.sessionID))
+                        } catch (e) {
+                            dbg(`task_complete block: awaiting-input check error: ${e}`)
+                        }
+                        if (awaitingInput) {
+                            await log("info", `${short(ctx.sessionID)} - task_complete blocked but user input pending, skipping visible nudge`)
+                        } else {
+                            await sendContinuePrompt(ctx.sessionID, blockMsg, w)
+                        }
                         return blockMsg
                     }
                 }
