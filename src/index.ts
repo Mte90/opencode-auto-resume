@@ -224,6 +224,22 @@ const DONE_CLAIM_PATTERNS = [
     /\bfinished\s+(?:the\s+)?(?:task|work|implementation)/im,
     /\b(?:all|everything)\s+(?:is\s+)?(?:complete|done|finished)/im,
     /\bnothing\s+(?:else\s+)?(?:left|remaining|to do)/im,
+    // Russian equivalents: anchored short claims + contextual phrases
+    // Russian equivalents: anchored short claims + contextual phrases.
+    // \b is ASCII-only, so Cyrillic needs explicit \p{L}/\p{N} lookarounds with the u flag.
+    /^готово[.!]*$/imu,
+    /^выполнено[.!]*$/imu,
+    /^сделано[.!]*$/imu,
+    /^завершено[.!]*$/imu,
+    /^решено[.!]*$/imu,
+    /^реализовано[.!]*$/imu,
+    /^задача\s+(?:полностью\s+)?(?:выполнена|решена|закрыта|сделана)[.!]*$/imu,
+    /^все\s+задачи\s+(?:выполнены|завершены|решены|сделаны)[.!]*$/imu,
+    /(?<![\p{L}\p{N}_])(?:задач[аиы]|работ[аиы]|реализация)\s+(?:полностью\s+)?(?:выполнен[аыо]?|завершен[аыо]?|сделан[аыо]?)(?![\p{L}\p{N}_])/imu,
+    /(?<![\p{L}\p{N}_])(?:все|всё)\s+(?:задачи\s+)?(?:выполнены|завершены|решены|сделаны)(?![\p{L}\p{N}_])/imu,
+    /(?<![\p{L}\p{N}_])(?:все|всё)\s+(?:выполнено|сделано|готово|завершено)(?![\p{L}\p{N}_])/imu,
+    /(?<![\p{L}\p{N}_])готово\s+к\s+(?:использованию|проверке|ревью)(?![\p{L}\p{N}_])/imu,
+    /(?<![\p{L}\p{N}_])ничего\s+(?:больше\s+)?(?:не\s+)?(?:осталось|требуется)(?![\p{L}\p{N}_])/imu,
 ]
 
 const DONE_WITHOUT_WORK_PROMPT =
