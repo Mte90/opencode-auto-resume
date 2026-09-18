@@ -35,7 +35,7 @@ function createMockContext(opts: {
 // These fail deterministically if someone removes the fix.
 // ============================================================================
 
-describe("Issue #16 regression: contract assertions on source", () => {
+describe("busy-flag rearm: contract assertions on source", () => {
     test("FIX A1: resetBusyFlags preserves userCancelled (not cleared on busy)", () => {
         // resetBusyFlags must exist and must NOT clear userCancelled/completionSignaled
         expect(SOURCE).toMatch(/function resetBusyFlags/)
@@ -109,7 +109,7 @@ describe("Issue #16 regression: contract assertions on source", () => {
 // BEHAVIORAL TESTS — verify the runtime behavior of each fix.
 // ============================================================================
 
-describe("Issue #16 regression: behavioral tests", () => {
+describe("busy-flag rearm: behavioral tests", () => {
     test("FIX A1+A5: ESC survives busy event — no resume after interrupt", async () => {
         const { ctx, promptCalls } = createMockContext({
             sessions: [{ id: "ses_esc", status: "busy" }],

@@ -46,6 +46,20 @@ A separate **tool-call loop detector** catches the model calling the same tool 3
 
 Loop detection runs in two places. At idle, tool names are scanned from recent assistant messages. **Live**, every `tool.execute.before` hook fingerprints the call as `tool name + arguments` — so a subagent stuck re-reading the same file/range (even alternating between two near-identical argument sets, which never produces 3 consecutive identical calls) is caught after 6+ calls in the repeating cycle. On live detection the plugin aborts the running turn immediately (this is the sanctioned exception to the never-abort-busy rule: 6+ identical name+args fingerprints prove a hallucinated loop, and the current call has not started yet) and then sends `TOOL_LOOP_RECOVERY_PROMPT`. Esc-cancelled sessions are never touched.
 
+---
+
+### Unknown tool suggestion
+
+When the model calls a tool that does not exist (a typo, a hallucinated name, or a tool from a different plugin that isn't loaded), OpenCode returns a `tool` part with `state.status = "error"`. If the same wrong tool name appears **2 times** in the session's message history, the plugin:
+
+1. Fetches the list of available tools via `ctx.client.tool.ids()` (cached for 5 minutes).
+2. Computes the closest match by Levenshtein distance (case-insensitive, threshold = half the wrong name's length).
+3. Sends a continue prompt that names the wrong tool, states it does not exist, suggests the closest match (if one was found), and lists the first 20 available tools for reference.
+
+The suggestion fires once per busy cycle. A new user message resets the counter so the suggestion can fire again on a fresh cycle. Tool parts that already succeeded (`state.status = "completed"`) and parts for tools that do exist are skipped.
+
+Threshold and cache are compile-time constants (`UNKNOWN_TOOL_THRESHOLD = 2`, `TOOL_IDS_CACHE_MS = 5 min`). The detection runs at idle, alongside the tool-text recovery check.
+
 _Motivated by:_
 - [#22142](https://github.com/anomalyco/opencode/issues/22142) — Repetitive tool-call loops with alibaba-coding-plan-cn/qwen3.6-plus
 - [#16218](https://github.com/anomalyco/opencode/issues/16218) — Model repeats the same response in a loop after generating an answer

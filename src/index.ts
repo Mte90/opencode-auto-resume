@@ -65,6 +65,9 @@ export interface SessionWatch {
     pendingRecoveryAt: number
     recoveryAttempts: number
     watchdogRetryGuard: boolean
+    unknownToolErrors: Map<string, number>
+    unknownToolSuggestionSent: boolean
+    checkedToolPartIDs: Set<string>
 }
 
 const DEFAULT_CHUNK_TIMEOUT_MS = 45_000
@@ -141,6 +144,8 @@ const TASK_COMPLETE_REPEAT_ERROR =
     "completion is recorded. End your turn with text and make no further tool calls."
 
 const CTX_WRAPUP_TRIGGER = "ctx-wrapup"
+const UNKNOWN_TOOL_THRESHOLD = 2
+const TOOL_IDS_CACHE_MS = 5 * 60_000
 
 const TOOL_TEXT_PATTERNS = [
     /<function\s*=/i,
@@ -250,6 +255,39 @@ function containsWorkDescription(text: string): boolean {
     // Report section headers: files changed, verification, results, ...
     if (/^(changed|modified|deleted|created|updated|renamed|moved|files?\s+changed|verification|verified|tests?(?:\s+run|\s+passing|\s+pass)?|results?|outcome|commands?\s+(?:run|executed))/im.test(text)) return true
     return false
+}
+
+function levenshtein(a: string, b: string): number {
+    const m = a.length, n = b.length
+    if (m === 0) return n
+    if (n === 0) return m
+    let prev = new Array<number>(n + 1)
+    let curr = new Array<number>(n + 1)
+    for (let j = 0; j <= n; j++) prev[j] = j
+    for (let i = 1; i <= m; i++) {
+        curr[0] = i
+        for (let j = 1; j <= n; j++) {
+            const cost = a[i - 1] === b[j - 1] ? 0 : 1
+            curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
+        }
+        const tmp = prev; prev = curr; curr = tmp
+    }
+    return prev[n]
+}
+
+function suggestClosestTool(wrongName: string, available: string[]): string | null {
+    const lower = wrongName.toLowerCase()
+    let best: string | null = null
+    let bestDist = Infinity
+    for (const id of available) {
+        const dist = levenshtein(lower, id.toLowerCase())
+        const threshold = Math.max(2, Math.floor(lower.length / 2))
+        if (dist < bestDist && dist <= threshold) {
+            bestDist = dist
+            best = id
+        }
+    }
+    return best
 }
 
 function isStreamingFailure(
@@ -606,6 +644,9 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 pendingRecoveryAt: 0,
                 recoveryAttempts: 0,
                 watchdogRetryGuard: false,
+                unknownToolErrors: new Map(),
+                unknownToolSuggestionSent: false,
+                checkedToolPartIDs: new Set(),
             }
             sessions.set(sid, w)
         }
@@ -984,6 +1025,74 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         })()
         messagesInflight.set(sid, p)
         return p
+    }
+
+    let cachedToolIds: string[] | null = null
+    let cachedToolIdsAt = 0
+
+    async function getAvailableToolIds(): Promise<string[]> {
+        if (cachedToolIds && Date.now() - cachedToolIdsAt < TOOL_IDS_CACHE_MS) {
+            return cachedToolIds
+        }
+        try {
+            const result = await ctx.client.tool.ids()
+            const ids = (result.data as string[]) ?? []
+            cachedToolIds = ids
+            cachedToolIdsAt = Date.now()
+            return ids
+        } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e)
+            await log("warn", `Failed to fetch tool IDs: ${msg}`)
+            return cachedToolIds ?? []
+        }
+    }
+
+    async function checkForUnknownToolCalls(sid: string, w: SessionWatch): Promise<boolean> {
+        if (w.unknownToolSuggestionSent) return false
+        if (w.userCancelled || w.completionSignaled) return false
+        try {
+            const available = await getAvailableToolIds()
+            if (available.length === 0) return false
+            const messages = await getSessionMessages(sid)
+            for (const msg of messages) {
+                const parts = msg.parts as Array<Record<string, unknown>> | undefined
+                if (!parts) continue
+                for (const part of parts) {
+                    const partType = part.type as string
+                    if (partType !== "tool") continue
+                    const partId = (part.id as string) ?? (part.callID as string) ?? ""
+                    if (!partId || w.checkedToolPartIDs.has(partId)) continue
+                    w.checkedToolPartIDs.add(partId)
+                    const state = part.state as Record<string, unknown> | undefined
+                    if (!state || (state.status as string) !== "error") continue
+                    const toolName = (part.tool as string) ?? ""
+                    if (!toolName || available.includes(toolName)) continue
+                    const count = (w.unknownToolErrors.get(toolName) ?? 0) + 1
+                    w.unknownToolErrors.set(toolName, count)
+                    if (count < UNKNOWN_TOOL_THRESHOLD) continue
+                    const suggestion = suggestClosestTool(toolName, available)
+                    const toolList = available.slice(0, 20).join(", ")
+                    const prompt = suggestion
+                        ? `You tried to use the tool "${toolName}" ${count} times, but it does not exist. ` +
+                          `The closest matching tool is "${suggestion}". ` +
+                          `Please use "${suggestion}" instead and adjust your arguments accordingly. ` +
+                          `Available tools include: ${toolList}.`
+                        : `You tried to use the tool "${toolName}" ${count} times, but it does not exist. ` +
+                          `Please check the available tools and use the correct one. ` +
+                          `Available tools include: ${toolList}.`
+                    w.unknownToolSuggestionSent = true
+                    w.toolTextRecovered = true
+                    await log("warn", `${short(sid)} - unknown tool "${toolName}" called ${count}x, suggesting "${suggestion ?? "(none)"}"`)
+                    await sendContinuePrompt(sid, prompt, w)
+                    return true
+                }
+            }
+            return false
+        } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e)
+            await log("warn", `${short(sid)} - checkForUnknownToolCalls error: ${msg}`)
+            return false
+        }
     }
 
     function roleOf(msg: Record<string, unknown> | undefined): string | undefined {
@@ -2478,6 +2587,10 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     resetIdleFlags(w)
                     dbg(`session.idle sid=${short(sid)}: resetIdleFlags done, toolTextRecovered=${w.toolTextRecovered}, toolTextAttempts=${w.toolTextAttempts}, maxRetries=${maxRetries}`)
 
+                    if (!w.unknownToolSuggestionSent && !w.completionSignaled && !w.userCancelled) {
+                        void checkForUnknownToolCalls(sid, w)
+                    }
+
                     if (resumeOnActionIntent && !w.toolTextRecovered && !w.completionSignaled) {
                         setTimeout(async () => {
                             try {
@@ -2554,6 +2667,9 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     if (w) {
                         w.doneClaimNoTodosAttempts = 0
                         w.lastUserMessageAt = Date.now()
+                        w.unknownToolErrors.clear()
+                        w.unknownToolSuggestionSent = false
+                        w.checkedToolPartIDs.clear()
                     }
                     break
                 }
