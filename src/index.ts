@@ -103,6 +103,7 @@ const DEFAULT_STREAMING_FAILURE_MESSAGE_PATTERNS = [
     "stream.*fail",
     "connection.*reset",
     "connection.*closed",
+    "aborted due to timeout",
 ]
 
 const MAX_IDLE_SESSIONS = 50

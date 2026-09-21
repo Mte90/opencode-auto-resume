@@ -69,6 +69,7 @@ const DEFAULT_STREAMING_FAILURE_MESSAGE_PATTERNS = [
     "stream.*fail",
     "connection.*reset",
     "connection.*closed",
+    "aborted due to timeout",
 ]
 
 const DEFAULT_MAX_BACKOFF_MS = 8_000

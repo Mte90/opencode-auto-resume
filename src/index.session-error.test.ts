@@ -235,4 +235,39 @@ describe("handleEvent - session.error (streaming failure detection)", () => {
         expect(logsOf(logCalls, "debug", "Session error:  - ").length).toBe(1)
         expect(promptCalls.length).toBe(0)
     })
+
+    test("TC-09: UnknownError with 'aborted due to timeout' on busy session → streaming failure, recovery armed", async () => {
+        const { ctx, logCalls, promptCalls } = createMockContext()
+        const hooks = await AutoResumePlugin(ctx, OPTS as any)
+        const sid = "ses_tc09"
+        await busy(hooks, sid)
+
+        await sendError(hooks, {
+            type: "session.error",
+            sessionID: sid,
+            properties: { error: { name: "UnknownError", data: { message: "The operation was aborted due to timeout" } } },
+        })
+        await wait(50)
+
+        expect(logsOf(logCalls, "info", "Streaming failure detected: UnknownError - The operation was aborted due to timeout").length).toBe(1)
+        expect(promptCalls.length).toBe(0)
+    })
+
+    test("TC-10: UnknownError with unrelated message on busy session → NOT a streaming failure", async () => {
+        const { ctx, logCalls, promptCalls } = createMockContext()
+        const hooks = await AutoResumePlugin(ctx, OPTS as any)
+        const sid = "ses_tc10"
+        await busy(hooks, sid)
+
+        await sendError(hooks, {
+            type: "session.error",
+            sessionID: sid,
+            properties: { error: { name: "UnknownError", data: { message: "rate limited" } } },
+        })
+        await wait(50)
+
+        expect(anyStreamingInfo(logCalls)).toBe(false)
+        expect(logsOf(logCalls, "debug", "Session error: UnknownError - rate limited").length).toBe(1)
+        expect(promptCalls.length).toBe(0)
+    })
 })

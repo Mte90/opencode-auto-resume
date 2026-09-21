@@ -53,6 +53,14 @@ describe("isStreamingFailure()", () => {
         expect(isStreamingFailure("AnyError", "Connection closed unexpectedly")).toBe(true)
     })
 
+    test("aborted due to timeout → true (slow host / GPU queue timeout)", () => {
+        expect(isStreamingFailure("UnknownError", "The operation was aborted due to timeout")).toBe(true)
+    })
+
+    test("UnknownError with unrelated message → false (catch-all name must not over-match)", () => {
+        expect(isStreamingFailure("UnknownError", "Something else")).toBe(false)
+    })
+
     // Case insensitivity
     test("STREAMING RESPONSE FAILED (uppercase) → true", () => {
         expect(isStreamingFailure("AnyError", "STREAMING RESPONSE FAILED")).toBe(true)
