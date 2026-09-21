@@ -1534,6 +1534,16 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 await log("info", `${short(sid)} - user recently active, skipping tool-text check`)
                 return
             }
+            // Lazy fetch: if we never received a todo.updated event, try the API
+            // so the open-todos reminder and the 🎉 latch both see real state.
+            if ((w.todos || []).length === 0) {
+                try {
+                    const fetched = await fetchSessionTodos(sid)
+                    if (fetched.length > 0) w.todos = fetched
+                } catch (e) {
+                    dbg(`checkForToolCallAsText sid=${short(sid)}: lazy todo fetch error: ${e}`)
+                }
+            }
             const recent = messages.slice(-3)
 
             let bestCandidate: {
@@ -2787,6 +2797,16 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             const w = sessions.get(ctx.sessionID)
             if (w) {
                 if (!w.isSubagent) {
+                    // Lazy fetch: if we never received a todo.updated event, try the API
+                    // before deciding to latch completion.
+                    if ((w.todos || []).length === 0) {
+                        try {
+                            const fetched = await fetchSessionTodos(ctx.sessionID)
+                            if (fetched.length > 0) w.todos = fetched
+                        } catch (e) {
+                            dbg(`task_complete sid=${short(ctx.sessionID)}: lazy todo fetch error: ${e}`)
+                        }
+                    }
                     const openTodos = (w.todos || []).filter(t => t.status === "pending" || t.status === "in_progress")
 
                     if (openTodos.length > 0 && w.taskCompleteOverrides < maxRetries) {

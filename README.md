@@ -328,6 +328,10 @@ session.status events:
 
 todo.updated events:
   └─ track real todo state (not regex on message text)
+     └─ if missing (no event received): idle path + task_complete
+        fetch on-demand via session.todo() API so the
+        open-todos reminder and the 🎉 completion latch see
+        real state, not a stale empty array.
 
 Timer loop (every 5s):
   for each busy session:
