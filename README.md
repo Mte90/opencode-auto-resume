@@ -2,6 +2,12 @@
 
 **Plugin for [OpenCode](https://github.com/anomalyco/opencode) that automatically detects and recovers from LLM session failures — stalls, broken tool calls, hallucination loops, stuck subagent parents, and more. Fully silent, zero UI pollution.**
 
+> **OpenCode v2 is here (stable).** This repo ships both the v1 plugin
+> (`src/index.ts`) and a complete v2 port (`src/v2/index.ts`) targeting the
+> stable `@opencode/plugin` 2.0.5 API. Install it with the
+> [v2 install guide](docs/v2/installing.md); see
+> [docs/v2/migration.md](docs/v2/migration.md) for the full migration notes.
+
 ## What it does
 
 LLM sessions fail in predictable ways. This plugin monitors all sessions and automatically recovers without user intervention. Each recovery path below references the upstream OpenCode issues that motivated it — these are problems not yet resolved in the official project.
@@ -387,6 +393,31 @@ With options:
   ]
 }
 ```
+
+### OpenCode v2 (stable)
+
+The v2 plugin uses the `Plugin.define` API with `ctx.event.subscribe()` (AsyncIterable) instead of the v1 hooks-object pattern, and targets the stable **`@opencode/plugin` 2.0.5** API (opencode v2.0.5+). Add to your `opencode.json`:
+
+```jsonc
+{
+  "plugins": [
+    {
+      "package": "./plugins/auto-resume-v2.ts",
+      "options": {
+        "chunkTimeoutMs": 45000,
+        "maxRetries": 3
+      }
+    }
+  ]
+}
+```
+
+Or place `src/v2/index.ts` directly in `~/.config/opencode/plugins/` for auto-discovery (no config entry needed).
+
+Disable via `"-auto-resume.v2"` in `plugins`.
+
+- **Step-by-step install guide:** [docs/v2/installing.md](docs/v2/installing.md)
+- **Migration notes (v1 → v2, stable validation):** [docs/v2/migration.md](docs/v2/migration.md)
 
 ### Configurable options
 
