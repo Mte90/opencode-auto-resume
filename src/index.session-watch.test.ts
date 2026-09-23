@@ -13,6 +13,8 @@ function createWatch(sid: string, now = Date.now()): SessionWatch {
         gaveUp: false,
         orphanWatchStartAt: null,
         aborting: false,
+        pluginAbortInFlight: false,
+        pluginAbortAt: 0,
         toolTextRecovered: false,
         toolTextAttempts: 0,
         continueTimestamps: [],

@@ -29,6 +29,7 @@ export interface SessionWatch {
     orphanWatchStartAt: number | null
     aborting: boolean
     pluginAbortInFlight: boolean
+    pluginAbortAt: number
     toolTextRecovered: boolean
     toolTextAttempts: number
     continueTimestamps: number[]
@@ -202,12 +203,12 @@ function containsToolCallAsText(text: string): boolean {
     return false
 }
 
-function containsReadyToContinuePattern(text: string): boolean {
+function containsReadyToContinuePattern(text: string, patterns: RegExp[] = READY_TO_CONTINUE_PATTERNS): boolean {
     const lines = text.split('\n')
     const lastLine = lines[lines.length - 1]?.trim()
     if (!lastLine) return false
     const lastLines = lines.slice(-3).join('\n')
-    return READY_TO_CONTINUE_PATTERNS.some((pat) => pat.test(lastLines))
+    return patterns.some((pat) => pat.test(lastLines))
 }
 
 const DONE_CLAIM_PATTERNS = [
@@ -240,10 +241,10 @@ const DONE_WITHOUT_DETAILS_PROMPT =
     "Do NOT reply with 'done', 'task completed', or any short acknowledgment — " +
     "your ONLY acceptable response right now is this detailed report. Write it now."
 
-function containsDoneClaimPattern(text: string): boolean {
+function containsDoneClaimPattern(text: string, patterns: RegExp[] = DONE_CLAIM_PATTERNS): boolean {
     const lines = text.split('\n')
     const lastLines = lines.slice(-5).join('\n')
-    return DONE_CLAIM_PATTERNS.some((pat) => pat.test(lastLines))
+    return patterns.some((pat) => pat.test(lastLines))
 }
 
 // A done-claim that already carries a concrete work report satisfies the
@@ -541,6 +542,16 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         (options?.subagentNativeCompactionEnabled as boolean) ?? false
     const activeUserWindowMs: number =
         (options?.activeUserWindowMs as number) ?? DEFAULT_ACTIVE_USER_WINDOW_MS
+    const doneClaimPatterns: RegExp[] = (() => {
+        const raw = options?.doneClaimPatterns as string[] | undefined
+        if (!Array.isArray(raw) || raw.length === 0) return DONE_CLAIM_PATTERNS
+        return raw.map(s => { try { return new RegExp(s, "im") } catch { return null } }).filter((r): r is RegExp => r !== null)
+    })()
+    const readyToContinuePatterns: RegExp[] = (() => {
+        const raw = options?.readyToContinuePatterns as string[] | undefined
+        if (!Array.isArray(raw) || raw.length === 0) return READY_TO_CONTINUE_PATTERNS
+        return raw.map(s => { try { return new RegExp(s, "i") } catch { return null } }).filter((r): r is RegExp => r !== null)
+    })()
     const dbg = (...args: unknown[]) => { if (debug) console.log("[debug]", ...args) }
 
     const sessions = new Map<string, SessionWatch>()
@@ -615,6 +626,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 orphanWatchStartAt: null,
                 aborting: false,
                 pluginAbortInFlight: false,
+                pluginAbortAt: 0,
                 toolTextRecovered: false,
                 toolTextAttempts: 0,
                 continueTimestamps: [],
@@ -1680,7 +1692,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         }
                     }
 
-                    if (containsReadyToContinuePattern(text)) {
+                    if (containsReadyToContinuePattern(text, readyToContinuePatterns)) {
                         // Check if todos exist and are all completed/cancelled
                         const todos = w.todos || []
                         const hasOpenTodos = todos.some(isOpenTodo)
@@ -1704,29 +1716,58 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                             continue
                         }
                         
-                        const candidate = {
-                            prompt: containsDoneClaimPattern(text)
-                                ? doneWithoutWorkPrompt
-                                : continuePrompt,
-                            source: containsDoneClaimPattern(text)
-                                ? "done-claim"
-                                : "ready-to-continue",
-                            priority: 1,
-                        }
-                        if (!bestCandidate || candidate.priority < bestCandidate.priority) {
-                            bestCandidate = candidate
+                        if (containsDoneClaimPattern(text, doneClaimPatterns)) {
+                            // Path A: ready-to-continue + done-claim detected
+                            const todos = w.todos || []
+                            const hasOpenTodos = todos.some(isOpenTodo)
+                            
+                            if (hasOpenTodos) {
+                                // Model claims done but todos remain open
+                                const candidate = {
+                                    prompt: doneWithoutWorkPrompt,
+                                    source: "done-claim",
+                                    priority: 1,
+                                }
+                                if (!bestCandidate || candidate.priority < bestCandidate.priority) {
+                                    bestCandidate = candidate
+                                }
+                            } else if (!containsWorkDescription(allAssistantText)) {
+                                // No open todos, no work description → request details
+                                // Only fire if we haven't exceeded maxRetries
+                                if (w.doneClaimNoTodosAttempts < maxRetries) {
+                                    const candidate = {
+                                        prompt: doneWithoutDetailsPrompt,
+                                        source: "done-claim-no-todos",
+                                        priority: 1,
+                                    }
+                                    if (!bestCandidate || candidate.priority < bestCandidate.priority) {
+                                        bestCandidate = candidate
+                                    }
+                                }
+                            }
+                            // else: has work description, skip (already satisfied)
+                        } else {
+                            // No done-claim, just ready-to-continue
+                            const candidate = {
+                                prompt: continuePrompt,
+                                source: "ready-to-continue",
+                                priority: 1,
+                            }
+                            if (!bestCandidate || candidate.priority < bestCandidate.priority) {
+                                bestCandidate = candidate
+                            }
                         }
                     }
                     
                     // Also trigger on done-claim patterns even without "ready to continue" text
                     // This catches cases where model says "task completed" but doesn't use 🎉 or tool_call
-                    if (!bestCandidate && containsDoneClaimPattern(text)) {
+                    if (!bestCandidate && containsDoneClaimPattern(text, doneClaimPatterns)) {
                         const todos = w.todos || []
                         const hasOpenTodos = todos.some(isOpenTodo)
                         
-                    if (hasOpenTodos) {
-                        await log("info", `${short(sid)} - model claims done but todos remain open. Sending recovery prompt...`)
-                        bestCandidate = {
+                        if (hasOpenTodos) {
+                            await log("info", `${short(sid)} - model claims done but todos remain open. Sending recovery prompt...`)
+                            bestCandidate = {
                             prompt: doneWithoutWorkPrompt,
                             source: "done-claim-no-emoji",
                             priority: 1,
@@ -1807,6 +1848,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     await log("info", `${short(sid)} - max open-todos nudges (${maxRetries}) reached, waiting for activity`)
                     return
                 }
+                w.todoNudgeAttempts++
             } else if (isDoneClaimNoTodos) {
                 w.doneClaimNoTodosAttempts++
             } else {
@@ -1875,6 +1917,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         await log("info", `Abort+Resume on ${short(sid)} (${idleSec}s idle). Aborting...`)
 
         w.pluginAbortInFlight = true
+        w.pluginAbortAt = Date.now()
         try {
             await ctx.client.session.abort({ path: { id: sid } })
             await log("info", `${short(sid)} - abort OK`)
@@ -1884,6 +1927,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             await log("warn", `${short(sid)} - abort failed: ${errMsg}`)
             w.aborting = false
             w.pluginAbortInFlight = false
+            w.pluginAbortAt = 0
             return false
         }
 
@@ -1913,6 +1957,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             return false
         } finally {
             w.pluginAbortInFlight = false
+            w.pluginAbortAt = 0
         }
     }
 
@@ -2750,10 +2795,13 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
                 if (isMessageAborted) {
                     for (const [wSid, w] of sessions) {
-                        if (!w.pluginAbortInFlight) {
+                        const PLUGIN_ABORT_GRACE_MS = 1000
+                        const isOwnAbort = w.pluginAbortInFlight && (Date.now() - (w.pluginAbortAt || 0) < PLUGIN_ABORT_GRACE_MS)
+                        if (!isOwnAbort) {
                             w.userCancelled = true
                             w.status = "idle"
                             resetIdleFlags(w)
+                            if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
                         }
                     }
                     log("info", "User abort (ESC)")

@@ -945,7 +945,7 @@ describe("task_complete tool", () => {
         await hooks.tool!["task_complete"].execute({}, { sessionID: "ses_rearm" } as any)
 
         // Genuine user message (continuing unset) starts a new round of work
-        await hooks["chat.message"]!({ sessionID: "ses_rearm" } as any)
+        await hooks["chat.message"]!({ sessionID: "ses_rearm" } as any, { message: {} as any, parts: [] } as any)
 
         const r3 = await hooks.tool!["task_complete"].execute({}, { sessionID: "ses_rearm" } as any)
         expect(r3).toContain("Task completion acknowledged")

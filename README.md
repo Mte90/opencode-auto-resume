@@ -415,6 +415,8 @@ With options:
 | `thinkingToolRecoveryPrompt` | `THINKING_TOOL_RECOVERY_PROMPT` | Override the thinking-tool recovery prompt |
 | `doneWithoutWorkPrompt` | `DONE_WITHOUT_WORK_PROMPT` | Override the done-claim-with-open-todos prompt |
 | `doneWithoutDetailsPrompt` | `DONE_WITHOUT_DETAILS_PROMPT` | Override the done-claim-with-no-todos report prompt |
+| `doneClaimPatterns` | `DONE_CLAIM_PATTERNS` | Array of regex strings overriding the default done-claim detection patterns (case-insensitive, multiline). Invalid regexes are skipped. Empty array falls back to defaults. |
+| `readyToContinuePatterns` | `READY_TO_CONTINUE_PATTERNS` | Array of regex strings overriding the default ready-to-continue detection patterns (case-insensitive). Invalid regexes are skipped. Empty array falls back to defaults. |
 | `silentDeadStreamMinTokens` | `200` | Min output tokens to treat a textless `finish:"unknown"` message as a dead stream |
 | `busyStallStrategy` | `"continue"` | Busy-stall response: `"continue"`, `"abort"` (abort-first), or `"off"` (disabled) |
 | `contextSaturationThreshold` | `0.85` | Ratio of used/usable context that routes a saturated parent to magic-context `ctx-wrapup` (only when magic-context is installed) |

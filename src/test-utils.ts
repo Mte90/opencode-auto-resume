@@ -28,6 +28,8 @@ export interface SessionWatch {
     gaveUp: boolean
     orphanWatchStartAt: number | null
     aborting: boolean
+    pluginAbortInFlight: boolean
+    pluginAbortAt: number
     toolTextRecovered: boolean
     toolTextAttempts: number
     continueTimestamps: number[]
@@ -165,3 +167,47 @@ export function buildOpenTodosReminder(todos: Todo[]): string {
     const thisWord = open.length > 1 ? "these" : "this"
     return `You have ${open.length} unfinished task${plural}:\n${list}\n\nPlease continue working on ${thisWord} ${taskWord}.`
 }
+
+export function containsDoneClaimPattern(text: string, patterns: RegExp[] = DONE_CLAIM_PATTERNS): boolean {
+    const lines = text.split('\n')
+    const lastLines = lines.slice(-5).join('\n')
+    return patterns.some((pat) => pat.test(lastLines))
+}
+
+export function containsReadyToContinuePattern(text: string, patterns: RegExp[] = READY_TO_CONTINUE_PATTERNS): boolean {
+    const lines = text.split('\n')
+    const lastLine = lines[lines.length - 1]?.trim()
+    if (!lastLine) return false
+    const lastLines = lines.slice(-3).join('\n')
+    return patterns.some((pat) => pat.test(lastLines))
+}
+
+const DEFAULT_DONE_CLAIM_PATTERNS = [
+    /^task\s+done[.!]*$/im,
+    /^done[.!]*$/im,
+    /^all\s+done[.!]*$/im,
+    /^finished[.!]*$/im,
+    /^complete[.!]*$/im,
+    /^task\s+complete[.!]*$/im,
+    /^task\s+completed[.!]*$/im,
+    /^all\s+tasks?\s+complete[.!]*$/im,
+    /^all\s+tasks?\s+completed[.!]*$/im,
+    /^(?:i['']?m\s+)?done\s+with\s+task/im,
+    /\bdone\s+with\s+(?:the\s+)?(?:task|work|implementation)/im,
+    /\bfinished\s+(?:the\s+)?(?:task|work|implementation)/im,
+    /\b(?:all|everything)\s+(?:is\s+)?(?:complete|done|finished)/im,
+    /\bnothing\s+(?:else\s+)?(?:left|remaining|to do)/im,
+]
+
+const DEFAULT_READY_TO_CONTINUE_PATTERNS = [
+    /ready to continue with task/i,
+    /continuing with task/i,
+    /continue with task/i,
+    /proceeding with task/i,
+    /ready to proceed with task/i,
+    /will continue with task/i,
+    /moving on to task/i,
+]
+
+export const DONE_CLAIM_PATTERNS = DEFAULT_DONE_CLAIM_PATTERNS
+export const READY_TO_CONTINUE_PATTERNS = DEFAULT_READY_TO_CONTINUE_PATTERNS
