@@ -464,15 +464,15 @@ describe("WP-05 watchdog — recovery retry & escalation", () => {
         expect(logCalls.some(l => l.message.includes("lastError=abort+resume failed"))).toBe(true)
     })
 
-    test("watchdog retry prompt failure resets recoveryAttempts and re-triggers", async () => {
-        const { ctx, logCalls, promptCalls, abortCalls } = createWatchdogContext({
+    test("watchdog retry prompt failure does NOT reset budget → loop stays bounded (no infinite re-trigger)", async () => {
+        const { ctx, logCalls, promptCalls } = createWatchdogContext({
             statusMap: { ses_rrf: "idle" },
             messages: {
                 ses_rrf: [
                     { role: "assistant", parts: [{ type: "text", text: "working" }] },
                 ],
             },
-            // Call 1: initial recovery send. Call 2: the watchdog retry — fails.
+            // Call 1: initial recovery send. Call 2: the watchdog retry — throws.
             failFromCall: 2,
         })
         const hooks = await AutoResumePlugin(ctx, {
@@ -487,18 +487,25 @@ describe("WP-05 watchdog — recovery retry & escalation", () => {
         await hooks.event!(makeErrorEvent(sid, "ProviderError", "stream failed") as any)
         await hooks.event!(makeStatusEvent(sid, "idle") as any)
 
-        // Call 1 (initial) + call 2 (retry, fails) + call 3 (retry's internal
-        // retry, fails) + call 4 (timer-loop re-trigger) + call 5 (its internal
-        // retry, fails again). The watchdog chain resets recoveryAttempts to 0
-        // each time, so the timer loop keeps re-initiating.
-        const reTriggered = await waitFor(() => promptCalls.length >= 5, 3000)
-        expect(reTriggered).toBe(true)
-        expect(promptCalls.length).toBeGreaterThanOrEqual(5)
-        expect(abortCalls.length).toBe(0)
-        expect(logCalls.some(l => l.level === "warn" && l.message.includes("recovery retry failed: simulated prompt failure"))).toBe(true)
+        // FIX under test: a failed recovery retry used to reset recoveryAttempts
+        // to 0, letting the main timer-loop re-arm "continue" forever (the
+        // infinite loop that could only be stopped by closing the session).
+        // Now the budget is consumed, so the loop terminates after the attempt.
+        const retryFailed = await waitFor(
+            () => logCalls.some(l => l.level === "warn" && l.message.includes("recovery retry failed: simulated prompt failure")),
+            3000,
+        )
+        expect(retryFailed).toBe(true)
         expect(logCalls.some(l => l.message.includes("Retrying recovery on"))).toBe(true)
-        expect(logCalls.some(l => l.level === "warn" && l.message.includes("pending recovery failed: simulated prompt failure"))).toBe(true)
-        expect(logCalls.filter(l => l.message.includes("Pending recovery triggered")).length).toBeGreaterThanOrEqual(2)
+
+        // Bounded: the OLD buggy reset pushed promptCalls to 5+ and kept
+        // climbing (the old test asserted >= 5). The fix keeps it flat — let it
+        // settle and assert it is stable AND below that threshold.
+        await wait(400)
+        const settled = promptCalls.length
+        await wait(400)
+        expect(promptCalls.length).toBe(settled)
+        expect(promptCalls.length).toBeLessThan(5)
     })
 
     test("abort+resume escalation succeeds: entry, abort OK, and continue done logs", async () => {        const { ctx, logCalls, promptCalls, abortCalls } = createWatchdogContext({

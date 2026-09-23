@@ -816,6 +816,15 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             return
         }
         if (w.userCancelled || w.completionSignaled) return
+        // Hard stop (choke point): once this session's recovery cycle has given up,
+        // refuse to send ANY further continue prompt, from any code path. This
+        // guarantees the jinja/ECONNREFUSED continue-loop cannot run from any
+        // entry point. Re-arms only on a genuine new user message
+        // (resetSessionFlags / resetBusyFlags clear gaveUp).
+        if (w.gaveUp) {
+            await log("debug", `${short(sid)} - gaveUp latched, refusing further continue prompts`)
+            return
+        }
         if (!w.continuing) dbg(`State transition on ${short(sid)}: continuing=false -> true`)
         w.continuing = true
         if (w.watchdogRetryGuard) {
@@ -940,8 +949,14 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         } catch (err) {
                             const errMsg = err instanceof Error ? err.message : String(err)
                             await log("warn", `${short(sid)} - recovery retry failed: ${errMsg}`)
-                            // Let the timer loop re-initiate the recovery
-                            w.recoveryAttempts = 0
+                            // A recovery prompt that fails to send (model server
+                            // down / ECONNREFUSED, or a template/jinja error) must
+                            // COUNT against the retry budget so the
+                            // maxRecoveryRetries cap is reachable and we escalate to
+                            // abort+resume below. Resetting recoveryAttempts to 0
+                            // here let a permanently-failing server re-fire "continue"
+                            // forever — the infinite loop that could only be stopped
+                            // by closing the session (jinja/ECONNREFUSED incident).
                         }
                         w.watchdogRetryGuard = false
                     } else {
@@ -953,8 +968,16 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         dbg(`Watchdog check on ${short(sid)}: status=${w.status}, recoveryAttempts=${w.recoveryAttempts}, maxRetries=${maxRecoveryRetries}, watchdogLatencyMs=${Date.now() - w.lastRetryAt} -> ABORT_RESUME`)
                         const resumed = await tryAbortAndResume(sid, w)
                         if (!resumed && !w.aborting) {
-                            await log("warn", `Recovery exhausted on ${short(sid)}: attempts=${w.recoveryAttempts}, lastError=abort+resume failed`)
-                            dbg(`Watchdog check on ${short(sid)}: status=${w.status} -> GAVE_UP`)
+                            // Hard stop: abort+resume ALSO failed (server still down).
+                            // Latch gaveUp so the main timer loop does NOT re-arm, and
+                            // disarm the pending recovery. This is the definitive end
+                            // of the continue loop; it re-arms only on a genuine new
+                            // user message (resetSessionFlags clears gaveUp).
+                            w.gaveUp = true
+                            w.pendingRecovery = false
+                            w.pendingRecoveryReason = null
+                            await log("warn", `Recovery exhausted on ${short(sid)}: attempts=${w.recoveryAttempts}, lastError=abort+resume failed — GAVE UP (re-arms on next user message)`)
+                            dbg(`Watchdog check on ${short(sid)}: status=${w.status} -> GAVE_UP (latched)`)
                             if (w.pendingRecoveryAt > 0) {
                                 dbg(`Total recovery cycle on ${short(sid)} (failed): totalCycleMs=${Date.now() - w.pendingRecoveryAt}`)
                             }
