@@ -60,6 +60,11 @@ interface SessionWatch {
 	gaveUp: boolean
 	aborting: boolean
 	recovering: boolean
+	/** Latched when a failure carries an OOC error that `continue` can never clear; recovery (continue + abort+resume) is refused until a genuine user/agent turn. */
+	oocLocked: boolean
+	oocLockReason: string | null
+	/** True while one of our own recovery continues is in flight — distinguishes a self-caused execution.started from a genuine turn. */
+	selfRecovery: boolean
 
 	// Assistant text accumulation (v2 replacement for session.messages())
 	textParts: Map<string, string> // assistantMessageID -> accumulated text
@@ -119,6 +124,9 @@ const DEFAULT_LOOP_MAX_CONTINUES = 3
 const DEFAULT_LOOP_WINDOW_MS = 10 * 60_000
 const DEFAULT_MAX_RECOVERY_RETRIES = 2
 const DEFAULT_DEBUG = false
+
+/** OOC (out-of-context) errors that `continue` can never clear — recovery is locked out on these. */
+const OOC_ERROR_RE = /exceeds the available context size|context size \(\d+\)|too large to compact|too many tokens|prompt is too long/i
 
 const MAX_IDLE_SESSIONS = 50
 const IDLE_CLEANUP_MS = 10 * 60_000
@@ -381,6 +389,9 @@ export default Plugin.define({
 					gaveUp: false,
 					aborting: false,
 					recovering: false,
+					oocLocked: false,
+					oocLockReason: null,
+					selfRecovery: false,
 					textParts: new Map(),
 					lastAssistantText: "",
 					lastAssistantMessageID: null,
@@ -520,6 +531,7 @@ export default Plugin.define({
 		 * kicks the session back to life, replacing the separate `prompt()`.
 		 */
 		async function notifyAndPrompt(sid: string, text: string, notification: string, resume = true): Promise<boolean> {
+			ensureWatch(sid).selfRecovery = true
 			try {
 				await ctx.session.synthetic({
 					sessionID: sid,
@@ -545,6 +557,10 @@ export default Plugin.define({
 
 		async function tryAbortAndResume(sid: string, w: SessionWatch): Promise<boolean> {
 			if (w.aborting) return false
+			if (w.oocLocked) {
+				dbg(`${short(sid)} oocLocked — refusing abort+resume escalation`)
+				return false
+			}
 			w.aborting = true
 			log("warn", `${short(sid)} escalating: interrupt + fresh continue`)
 			try {
@@ -566,6 +582,16 @@ export default Plugin.define({
 			return ok
 		}
 
+		/** Latch the OOC lock when a failure carries an out-of-context error (which `continue` can never clear). */
+		function maybeLockOoc(sid: string, errMsg: string) {
+			const w = ensureWatch(sid)
+			if (w.oocLocked) return
+			if (!OOC_ERROR_RE.test(errMsg)) return
+			w.oocLocked = true
+			w.oocLockReason = errMsg.slice(0, 200)
+			log("warn", `${short(sid)} OOC error latched — recovery locked out until a genuine turn: ${errMsg.slice(0, 120)}`)
+		}
+
 		/**
 		 * Core recovery ladder for a stuck/failed session.
 		 * plain continue with backoff -> more attempts -> abort+resume escalation.
@@ -573,6 +599,10 @@ export default Plugin.define({
 		async function recover(sid: string, reason: string) {
 			const w = ensureWatch(sid)
 			if (w.recovering || w.aborting || w.gaveUp || w.userCancelled || w.permissionPending) return
+			if (w.oocLocked) {
+				dbg(`${short(sid)} oocLocked — refusing recovery (reason: ${w.oocLockReason?.slice(0, 80)})`)
+				return
+			}
 			// Record intent first, then evaluate the loop guard, so the Nth
 			// continue within the window is the one that escalates.
 			recordContinue(sid)
@@ -777,6 +807,14 @@ export default Plugin.define({
 				case "session.execution.started": {
 					const sid = sidOf(ev)
 					if (!sid) return
+					const w = ensureWatch(sid)
+					if (w.selfRecovery) {
+						w.selfRecovery = false
+					} else if (w.oocLocked) {
+						w.oocLocked = false
+						w.oocLockReason = null
+						log("info", `${short(sid)} genuine execution — clearing OOC lock`)
+					}
 					markBusy(sid)
 					return
 				}
@@ -785,7 +823,9 @@ export default Plugin.define({
 					const sid = sidOf(ev)
 					if (!sid) return
 					markIdle(sid)
-					ensureWatch(sid).pendingRecoveryArmed = false
+					const w = ensureWatch(sid)
+					w.pendingRecoveryArmed = false
+					w.selfRecovery = false // stale — no in-flight recovery prompt by the time we idle
 					void inspectOnIdle(sid)
 					return
 				}
@@ -916,6 +956,7 @@ export default Plugin.define({
 					touch(sid) // provider-level retry is progress of its own kind
 					const errType = String(ev.data?.error?.type ?? "")
 					const errMsg = String(ev.data?.error?.message ?? "")
+					maybeLockOoc(sid, errMsg)
 					log("info", `${short(sid)} provider retry #${ev.data?.attempt ?? "?"}: ${errType || errMsg}`)
 					if (!isStreamingFailure(errMsg) && errType !== "retryable") return
 					// Let the provider retries play out first; only intervene if it stays quiet
@@ -932,6 +973,7 @@ export default Plugin.define({
 					const w = ensureWatch(sid)
 					const errMsg = String(ev.data?.error?.message ?? "")
 					const errType = String(ev.data?.error?.type ?? "")
+					maybeLockOoc(sid, errMsg)
 					markIdle(sid)
 					w.pendingRecoveryArmed = true // our delayed recovery must survive this idle transition
 					if (errMsg.includes("interrupted by user") || errType.includes("cancel")) {
