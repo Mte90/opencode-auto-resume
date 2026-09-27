@@ -84,6 +84,10 @@ interface SessionWatch {
 	waitingOnSubagent: boolean
 	lastWasTaskTool: boolean
 	idleSince: number | null
+	/** Set while the session is mid native compaction — recovery must never interrupt it. */
+	compacting: boolean
+	/** Timestamp of the latest `session.compaction.started` (stale-guard for the flag). */
+	compactionStartedAt: number | null
 
 	// Tool-loop tracking
 	recentToolCalls: ToolCallRecord[]
@@ -130,6 +134,8 @@ const OOC_ERROR_RE = /exceeds the available context size|context size \(\d+\)|to
 
 const MAX_IDLE_SESSIONS = 50
 const IDLE_CLEANUP_MS = 10 * 60_000
+/** A compaction silent for this long without an ended/failed event is wedged — stale-clear the flag. */
+const COMPACTION_STALE_TTL_MS = 30 * 60_000
 const TEXT_BUFFER_TRIM_LEN = 20_000
 
 const CONTINUE_PROMPT = "continue"
@@ -404,6 +410,8 @@ export default Plugin.define({
 					waitingOnSubagent: false,
 					lastWasTaskTool: false,
 					idleSince: null,
+					compacting: false,
+					compactionStartedAt: null,
 					recentToolCalls: [],
 				}
 				sessions.set(sid, w)
@@ -561,6 +569,10 @@ export default Plugin.define({
 				dbg(`${short(sid)} oocLocked — refusing abort+resume escalation`)
 				return false
 			}
+			if (w.compacting) {
+				dbg(`${short(sid)} mid-compaction — refusing abort+resume escalation`)
+				return false
+			}
 			w.aborting = true
 			log("warn", `${short(sid)} escalating: interrupt + fresh continue`)
 			try {
@@ -603,6 +615,10 @@ export default Plugin.define({
 				dbg(`${short(sid)} oocLocked — refusing recovery (reason: ${w.oocLockReason?.slice(0, 80)})`)
 				return
 			}
+			if (w.compacting) {
+				dbg(`${short(sid)} mid-compaction — refusing recovery (reason: ${reason})`)
+				return
+			}
 			// Record intent first, then evaluate the loop guard, so the Nth
 			// continue within the window is the one that escalates.
 			recordContinue(sid)
@@ -632,6 +648,19 @@ export default Plugin.define({
 					// user took over.
 					if (w.userCancelled || w.gaveUp) return
 					if (w.status === "idle" && !w.pendingRecoveryArmed) return // recovered by itself meanwhile
+					// A turn sent to a busy session interrupts its in-flight step
+					// ("Step interrupted"). Never interrupt mid-compaction, and
+					// never interrupt a busy session that is still live (events
+					// within the chunk window): it is working, not stalled. The
+					// watchdog re-arms if it truly stalls.
+					if (w.compacting) {
+						dbg(`${short(sid)} mid-compaction at inject time — not interrupting`)
+						return
+					}
+					if (w.status === "busy" && Date.now() - w.lastActivityAt < chunkTimeoutMs) {
+						dbg(`${short(sid)} still busy and live at inject time (${Math.round((Date.now() - w.lastActivityAt) / 1000)}s since last event) — not interrupting`)
+						return
+					}
 					const ok = await notifyAndPrompt(sid, opts.continuePrompt ?? CONTINUE_PROMPT, "stalled — retrying")
 					w.pendingRecoveryArmed = false
 					if (ok) {
@@ -651,6 +680,10 @@ export default Plugin.define({
 		async function targetedRecovery(sid: string, kind: string, prompt: string, budgetKey: "toolTextAttempts" | "doneClaimAttempts" | "intentNudgeAttempts") {
 			const w = ensureWatch(sid)
 			if (w.recovering || w.userCancelled || w.permissionPending) return
+			if (w.compacting) {
+				dbg(`${short(sid)} mid-compaction — skipping ${kind} nudge`)
+				return
+			}
 			recordContinue(sid)
 			if (continuesInWindow(w) >= loopMaxContinues) {
 				log("warn", `${short(sid)} loop guard before ${kind} nudge — abort+resume`)
@@ -767,6 +800,19 @@ export default Plugin.define({
 
 			for (const [sid, w] of sessions) {
 				if (w.status !== "busy" || w.userCancelled) continue
+				// Stale compaction flag: a compaction that never reports
+				// ended/failed within the TTL is wedged — clear the guard so
+				// recovery can eventually intervene.
+				if (w.compacting && w.compactionStartedAt && now - w.compactionStartedAt > COMPACTION_STALE_TTL_MS) {
+					w.compacting = false
+					w.compactionStartedAt = null
+					log("warn", `${short(sid)} compaction flag stale (>${COMPACTION_STALE_TTL_MS / 60000}m) — clearing guard`)
+				}
+				// NEVER interrupt a session that is mid-compaction.
+				if (w.compacting) {
+					dbg(`${short(sid)} mid-compaction — skipping stall detection`)
+					continue
+				}
 				const silence = now - w.lastActivityAt
 				if (silence < chunkTimeoutMs + gracePeriodMs) continue
 				if (w.permissionPending) {
@@ -838,6 +884,9 @@ export default Plugin.define({
 					// (or a missing reason on older runtimes) must not.
 					const reason = typeof ev.data?.reason === "string" ? ev.data.reason : undefined
 					w.userCancelled = !w.aborting && (reason === undefined || reason === "user")
+					// A user interrupt also ends any in-flight compaction.
+					w.compacting = false
+					w.compactionStartedAt = null
 					w.recovering = false
 					markIdle(sid)
 					return
@@ -855,6 +904,33 @@ export default Plugin.define({
 					const sid = sidOf(ev)
 					if (!sid) return
 					sessions.delete(sid)
+					return
+				}
+
+				// --- compaction (NEVER interrupt a session that is compacting) ---
+				case "session.compaction.started": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					const w = ensureWatch(sid)
+					if (!w.compacting) {
+						w.compacting = true
+						w.compactionStartedAt = Date.now()
+						log("info", `${short(sid)} compaction started — auto-resume recovery suspended until it ends`)
+					}
+					touch(sid)
+					return
+				}
+				case "session.compaction.ended":
+				case "session.compaction.failed": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					const w = ensureWatch(sid)
+					if (w.compacting) {
+						w.compacting = false
+						w.compactionStartedAt = null
+						log("info", `${short(sid)} compaction ${ev.type.endsWith("failed") ? "failed" : "ended"} — guard cleared`)
+					}
+					touch(sid)
 					return
 				}
 
