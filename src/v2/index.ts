@@ -278,6 +278,30 @@ function containsActionIntent(text: string): boolean {
 	return lastLine.endsWith(":") && lastLine.length > 5 && lastLine.length < 500
 }
 
+/**
+ * True when a turn cleanly ends by handing control back to the user — a
+ * question, or an explicit prompt for their input. Nudging such a turn
+ * injects a synthetic `continue` that starts an in-flight step, and when the
+ * user's real reply then arrives it interrupts that step → "Step interrupted"
+ * (the execution.interrupted event). A hand-off turn is, by design, awaiting
+ * the user, so it must never be nudged.
+ */
+function isUserHandoff(text: string): boolean {
+	const lines = text.split("\n")
+	let last = ""
+	for (let i = lines.length - 1; i >= 0; i--) {
+		const t = lines[i].trim()
+		if (t.length > 0) {
+			last = t
+			break
+		}
+	}
+	if (!last) return false
+	if (last.endsWith("?") || last.endsWith("？")) return true
+	const patterns = [/let\s+me\s+know/i, /your\s+call/i, /up\s+to\s+you/i, /which\s+(would|do\s+you|option)/i, /should\s+I/i, /want\s+me\s+to/i, /would\s+you\s+like/i]
+	return patterns.some((p) => p.test(last))
+}
+
 function backoffMs(attempt: number, base: number, max: number): number {
 	return Math.min(base * Math.pow(2, attempt - 1), max)
 }
@@ -746,6 +770,15 @@ export default Plugin.define({
 			let text = w.lastAssistantText
 			if (!text) text = await lastAssistantTextFromContext(sid)
 			if (!text) return
+
+			// A turn that ends by handing control back to the user (a question or an
+			// explicit prompt) is awaiting their reply; a synthetic nudge here starts
+			// an in-flight step that their real reply then interrupts ("Step
+			// interrupted"). Never nudge a hand-off turn.
+			if (isUserHandoff(text)) {
+				dbg(`${short(sid)} idle turn ends with a user hand-off — skipping targeted recovery`)
+				return
+			}
 
 			if (containsToolCallAsText(text)) {
 				await targetedRecovery(sid, "tool-call-as-text", opts.toolTextRecoveryPrompt ?? TOOL_TEXT_RECOVERY_PROMPT, "toolTextAttempts")
