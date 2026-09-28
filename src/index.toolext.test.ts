@@ -90,12 +90,12 @@ describe("checkForToolCallAsText detection", () => {
             }
         })
 
-        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1 })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, toolTextCheckDelayMs: 10, minActivityGapMs: 0, warmupMs: 0 })
         await hooks.event!(makeStatusEvent("ses_blocker1", "busy") as any)
         await hooks.event!(makeTodoUpdatedEvent("ses_test1", OPEN_TODOS) as any)
         await hooks.event!(makeStatusEvent("ses_test1", "busy") as any)
         await hooks.event!(makeStatusEvent("ses_test1", "idle") as any)
-        await wait(3500)
+        await wait(500)
 
         const recoveryCall = promptCalls.find(c => c.body.includes("tool call"))
         expect(recoveryCall).toBeDefined()
@@ -114,12 +114,12 @@ describe("checkForToolCallAsText detection", () => {
             }
         })
 
-        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1 })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, toolTextCheckDelayMs: 10, minActivityGapMs: 0, warmupMs: 0 })
         await hooks.event!(makeStatusEvent("ses_blocker2", "busy") as any)
         await hooks.event!(makeTodoUpdatedEvent("ses_test2", OPEN_TODOS) as any)
         await hooks.event!(makeStatusEvent("ses_test2", "busy") as any)
         await hooks.event!(makeStatusEvent("ses_test2", "idle") as any)
-        await wait(3500)
+        await wait(500)
 
         const recoveryCall = promptCalls.find(c => c.body.includes("tool call"))
         expect(recoveryCall).toBeDefined()
@@ -138,12 +138,12 @@ describe("checkForToolCallAsText detection", () => {
             }
         })
 
-        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1 })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, toolTextCheckDelayMs: 10, minActivityGapMs: 0, warmupMs: 0 })
         await hooks.event!(makeStatusEvent("ses_blocker3", "busy") as any)
         await hooks.event!(makeTodoUpdatedEvent("ses_test3", OPEN_TODOS) as any)
         await hooks.event!(makeStatusEvent("ses_test3", "busy") as any)
         await hooks.event!(makeStatusEvent("ses_test3", "idle") as any)
-        await wait(3500)
+        await wait(500)
 
         const recoveryCall = promptCalls.find(c => c.body.includes("tool call"))
         expect(recoveryCall).toBeDefined()
@@ -162,11 +162,11 @@ describe("checkForToolCallAsText detection", () => {
             }
         })
 
-        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1 })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, toolTextCheckDelayMs: 10, minActivityGapMs: 0, warmupMs: 0 })
         await hooks.event!(makeTodoUpdatedEvent("ses_test4", OPEN_TODOS) as any)
         await hooks.event!(makeStatusEvent("ses_test4", "busy") as any)
         await hooks.event!(makeStatusEvent("ses_test4", "idle") as any)
-        await wait(3500)
+        await wait(500)
 
         // Check for any prompt call - the recovery prompt text
         expect(promptCalls.length).toBeGreaterThan(0)
@@ -187,12 +187,12 @@ describe("checkForToolCallAsText detection", () => {
             }
         })
 
-        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1 })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, toolTextCheckDelayMs: 10, minActivityGapMs: 0, warmupMs: 0 })
         await hooks.event!(makeStatusEvent("ses_blocker5", "busy") as any)
         await hooks.event!(makeTodoUpdatedEvent("ses_test5", OPEN_TODOS) as any)
         await hooks.event!(makeStatusEvent("ses_test5", "busy") as any)
         await hooks.event!(makeStatusEvent("ses_test5", "idle") as any)
-        await wait(3500)
+        await wait(500)
 
         const recoveryCall = promptCalls.find(c => c.body.includes("reasoning"))
         expect(recoveryCall).toBeDefined()
@@ -213,11 +213,11 @@ describe("checkForToolCallAsText detection", () => {
             }
         })
 
-        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1 })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, toolTextCheckDelayMs: 10, minActivityGapMs: 0, warmupMs: 0 })
         await hooks.event!(makeTodoUpdatedEvent("ses_test6", OPEN_TODOS) as any)
         await hooks.event!(makeStatusEvent("ses_test6", "busy") as any)
         await hooks.event!(makeStatusEvent("ses_test6", "idle") as any)
-        await wait(3500)
+        await wait(500)
 
         const continueCall = promptCalls.find(c => c.body.includes("unfinished task"))
         expect(continueCall).toBeDefined()
@@ -240,11 +240,11 @@ describe("checkForToolCallAsText detection", () => {
             }
         })
 
-        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1 })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, toolTextCheckDelayMs: 10, minActivityGapMs: 0, warmupMs: 0 })
         await hooks.event!(makeTodoUpdatedEvent("ses_test7", OPEN_TODOS) as any)
         await hooks.event!(makeStatusEvent("ses_test7", "busy") as any)
         await hooks.event!(makeStatusEvent("ses_test7", "idle") as any)
-        await wait(3500)
+        await wait(500)
 
         // First attempt sends continue, loop detection needs multiple checkForToolCallAsText cycles
         const continueCall = promptCalls.find(c => c.body.includes("unfinished task"))
@@ -271,11 +271,11 @@ describe("checkForToolCallAsText detection", () => {
             }
         })
 
-        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1 })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, toolTextCheckDelayMs: 10, minActivityGapMs: 0, warmupMs: 0 })
         await hooks.event!(makeTodoUpdatedEvent("ses_test8", OPEN_TODOS) as any)
         await hooks.event!(makeStatusEvent("ses_test8", "busy") as any)
         await hooks.event!(makeStatusEvent("ses_test8", "idle") as any)
-        await wait(3500)
+        await wait(500)
 
         // Pattern detection needs multiple cycles, first sends reminder
         const continueCall = promptCalls.find(c => c.body.includes("unfinished task"))
@@ -297,11 +297,11 @@ describe("checkForToolCallAsText detection", () => {
             }
         })
 
-        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1 })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, toolTextCheckDelayMs: 10, minActivityGapMs: 0, warmupMs: 0 })
         await hooks.event!(makeTodoUpdatedEvent("ses_test9", OPEN_TODOS) as any)
         await hooks.event!(makeStatusEvent("ses_test9", "busy") as any)
         await hooks.event!(makeStatusEvent("ses_test9", "idle") as any)
-        await wait(3500)
+        await wait(500)
 
         const continueCall = promptCalls.find(c => c.body.includes("unfinished task"))
         expect(continueCall).toBeDefined()
@@ -348,11 +348,11 @@ describe("checkForToolCallAsText detection", () => {
             }
         })
 
-        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1 })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, toolTextCheckDelayMs: 10, minActivityGapMs: 0, warmupMs: 0 })
         await hooks.event!(makeTodoUpdatedEvent("ses_test11", OPEN_TODOS) as any)
         await hooks.event!(makeStatusEvent("ses_test11", "busy") as any)
         await hooks.event!(makeStatusEvent("ses_test11", "idle") as any)
-        await wait(3500)
+        await wait(500)
 
         // Check for any prompt call - done without work recovery
         expect(promptCalls.length).toBeGreaterThan(0)
@@ -373,11 +373,11 @@ describe("checkForToolCallAsText detection", () => {
             }
         })
 
-        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, minActivityGapMs: 0 })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, minActivityGapMs: 0, toolTextCheckDelayMs: 10, warmupMs: 0 })
         await hooks.event!(makeTodoUpdatedEvent("ses_test12", CLOSED_TODOS) as any)
         await hooks.event!(makeStatusEvent("ses_test12", "busy") as any)
         await hooks.event!(makeStatusEvent("ses_test12", "idle") as any)
-        await wait(3500)
+        await wait(500)
 
         const reportCalls = promptCalls.filter(c => c.body.includes("detailed report"))
         expect(reportCalls.length).toBe(1)
@@ -398,11 +398,11 @@ describe("checkForToolCallAsText detection", () => {
             }
         })
 
-        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1 })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, toolTextCheckDelayMs: 10, minActivityGapMs: 0, warmupMs: 0 })
         await hooks.event!(makeTodoUpdatedEvent("ses_test13", []) as any)
         await hooks.event!(makeStatusEvent("ses_test13", "busy") as any)
         await hooks.event!(makeStatusEvent("ses_test13", "idle") as any)
-        await wait(3500)
+        await wait(500)
 
         expect(promptCalls.length).toBe(0)
     })
@@ -422,11 +422,11 @@ describe("checkForToolCallAsText detection", () => {
             }
         })
 
-        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1 })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, toolTextCheckDelayMs: 10, minActivityGapMs: 0, warmupMs: 0 })
         await hooks.event!(makeTodoUpdatedEvent("ses_test14", OPEN_TODOS) as any)
         await hooks.event!(makeStatusEvent("ses_test14", "busy") as any)
         await hooks.event!(makeStatusEvent("ses_test14", "idle") as any)
-        await wait(3500)
+        await wait(500)
 
         const continueCall = promptCalls.find(c => c.body.includes("unfinished task"))
         expect(continueCall).toBeDefined()
@@ -450,11 +450,11 @@ describe("checkForToolCallAsText detection", () => {
             }
         })
 
-        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1 })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, toolTextCheckDelayMs: 10, minActivityGapMs: 0, warmupMs: 0 })
         await hooks.event!(makeTodoUpdatedEvent("ses_test15", OPEN_TODOS) as any)
         await hooks.event!(makeStatusEvent("ses_test15", "busy") as any)
         await hooks.event!(makeStatusEvent("ses_test15", "idle") as any)
-        await wait(3500)
+        await wait(500)
 
         // Without internal busy state, reminder will be sent
         const continueCall = promptCalls.find(c => c.body.includes("unfinished task"))
@@ -480,12 +480,12 @@ describe("checkForToolCallAsText detection", () => {
             }
         })
 
-        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1 })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, toolTextCheckDelayMs: 10, minActivityGapMs: 0, warmupMs: 0 })
         await hooks.event!(makeStatusEvent("ses_blocker_cb1", "busy") as any)
         await hooks.event!(makeTodoUpdatedEvent("ses_codeblock1", OPEN_TODOS) as any)
         await hooks.event!(makeStatusEvent("ses_codeblock1", "busy") as any)
         await hooks.event!(makeStatusEvent("ses_codeblock1", "idle") as any)
-        await wait(3500)
+        await wait(500)
 
         const recoveryCall = promptCalls.find(c => c.body.includes("tool call"))
         expect(recoveryCall).toBeUndefined()
@@ -510,12 +510,12 @@ describe("checkForToolCallAsText detection", () => {
             }
         })
 
-        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1 })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, toolTextCheckDelayMs: 10, minActivityGapMs: 0, warmupMs: 0 })
         await hooks.event!(makeStatusEvent("ses_blocker_cb2", "busy") as any)
         await hooks.event!(makeTodoUpdatedEvent("ses_codeblock2", OPEN_TODOS) as any)
         await hooks.event!(makeStatusEvent("ses_codeblock2", "busy") as any)
         await hooks.event!(makeStatusEvent("ses_codeblock2", "idle") as any)
-        await wait(3500)
+        await wait(500)
 
         const recoveryCall = promptCalls.find(c => c.body.includes("tool call"))
         expect(recoveryCall).toBeUndefined()
@@ -537,11 +537,11 @@ describe("checkForToolCallAsText detection", () => {
         })
 
         // Use maxRetries: 1 to quickly hit the limit
-        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, maxRetries: 1 })
+        const hooks = await AutoResumePlugin(ctx, { enabled: true, baseBackoffMs: 1, maxRetries: 1, toolTextCheckDelayMs: 10, minActivityGapMs: 0, warmupMs: 0 })
         await hooks.event!(makeTodoUpdatedEvent("ses_test16", OPEN_TODOS) as any)
         await hooks.event!(makeStatusEvent("ses_test16", "busy") as any)
         await hooks.event!(makeStatusEvent("ses_test16", "idle") as any)
-        await wait(3500)
+        await wait(500)
 
         // Should have at most 1 prompt (the first attempt)
         expect(promptCalls.length).toBeLessThanOrEqual(1)
@@ -679,13 +679,15 @@ describe("action-intent detection", () => {
             enabled: true,
             baseBackoffMs: 1,
             warmupMs: 60000,
-            actionIntentPrompt: "AI_TRIGGER_CHECKFOR"
+            actionIntentPrompt: "AI_TRIGGER_CHECKFOR",
+            toolTextCheckDelayMs: 10,
+            minActivityGapMs: 0
         })
         await hooks.event!(makeStatusEvent("ses_blocker_ai4", "busy") as any)
         await hooks.event!(makeTodoUpdatedEvent("ses_ai4", OPEN_TODOS) as any)
         await hooks.event!(makeStatusEvent("ses_ai4", "busy") as any)
         await hooks.event!(makeStatusEvent("ses_ai4", "idle") as any)
-        await wait(3500)
+        await wait(500)
 
         const aiCall = promptCalls.find(c => c.body.includes("AI_TRIGGER_CHECKFOR"))
         expect(aiCall).toBeDefined()
@@ -712,13 +714,16 @@ describe("configurable prompts", () => {
         const hooks = await AutoResumePlugin(ctx, {
             enabled: true,
             baseBackoffMs: 1,
-            continuePrompt: "KEEP_GOING_CUSTOM"
+            continuePrompt: "KEEP_GOING_CUSTOM",
+            toolTextCheckDelayMs: 10,
+            minActivityGapMs: 0,
+            warmupMs: 0
         })
         await hooks.event!(makeStatusEvent("ses_blocker_cp1", "busy") as any)
         await hooks.event!(makeTodoUpdatedEvent("ses_cp1", OPEN_TODOS) as any)
         await hooks.event!(makeStatusEvent("ses_cp1", "busy") as any)
         await hooks.event!(makeStatusEvent("ses_cp1", "idle") as any)
-        await wait(3500)
+        await wait(500)
 
         const customCall = promptCalls.find(c => c.body.includes("KEEP_GOING_CUSTOM"))
         expect(customCall).toBeDefined()
@@ -743,13 +748,16 @@ describe("configurable prompts", () => {
         const hooks = await AutoResumePlugin(ctx, {
             enabled: true,
             baseBackoffMs: 1,
-            toolTextRecoveryPrompt: "CUSTOM_TOOL_RECOVERY"
+            toolTextRecoveryPrompt: "CUSTOM_TOOL_RECOVERY",
+            toolTextCheckDelayMs: 10,
+            minActivityGapMs: 0,
+            warmupMs: 0
         })
         await hooks.event!(makeStatusEvent("ses_blocker_cp2", "busy") as any)
         await hooks.event!(makeTodoUpdatedEvent("ses_cp2", OPEN_TODOS) as any)
         await hooks.event!(makeStatusEvent("ses_cp2", "busy") as any)
         await hooks.event!(makeStatusEvent("ses_cp2", "idle") as any)
-        await wait(3500)
+        await wait(500)
 
         const customCall = promptCalls.find(c => c.body.includes("CUSTOM_TOOL_RECOVERY"))
         expect(customCall).toBeDefined()
@@ -781,13 +789,16 @@ describe("debug mode", () => {
             const hooks = await AutoResumePlugin(ctx, {
                 enabled: true,
                 baseBackoffMs: 1,
-                debug: true
+                debug: true,
+                toolTextCheckDelayMs: 10,
+                minActivityGapMs: 0,
+                warmupMs: 0
             })
             await hooks.event!(makeStatusEvent("ses_blocker_dbg1", "busy") as any)
             await hooks.event!(makeTodoUpdatedEvent("ses_dbg1", OPEN_TODOS) as any)
             await hooks.event!(makeStatusEvent("ses_dbg1", "busy") as any)
             await hooks.event!(makeStatusEvent("ses_dbg1", "idle") as any)
-            await wait(3500)
+            await wait(500)
 
             const debugLogs = logs.filter(l => l.includes("[debug]"))
             expect(debugLogs.length).toBeGreaterThan(0)
@@ -819,13 +830,16 @@ describe("debug mode", () => {
 
             const hooks = await AutoResumePlugin(ctx, {
                 enabled: true,
-                baseBackoffMs: 1
+                baseBackoffMs: 1,
+                toolTextCheckDelayMs: 10,
+                minActivityGapMs: 0,
+                warmupMs: 0
             })
             await hooks.event!(makeStatusEvent("ses_blocker_dbg2", "busy") as any)
             await hooks.event!(makeTodoUpdatedEvent("ses_dbg2", OPEN_TODOS) as any)
             await hooks.event!(makeStatusEvent("ses_dbg2", "busy") as any)
             await hooks.event!(makeStatusEvent("ses_dbg2", "idle") as any)
-            await wait(3500)
+            await wait(500)
 
             const debugLogs = logs.filter(l => l.includes("[debug]"))
             expect(debugLogs.length).toBe(0)
@@ -867,7 +881,7 @@ describe("awaiting-input gate (pending tool_use)", () => {
         await hooks.event!(makeTodoUpdatedEvent("ses_await1", OPEN_TODOS) as any)
         await hooks.event!(makeStatusEvent("ses_await1", "busy") as any)
         await hooks.event!(makeStatusEvent("ses_await1", "idle") as any)
-        await wait(3500)
+        await wait(500)
 
         expect(promptCalls.length).toBe(0)
     })
@@ -902,7 +916,7 @@ describe("awaiting-input gate (pending tool_use)", () => {
         await hooks.event!(makeTodoUpdatedEvent("ses_await2", OPEN_TODOS) as any)
         await hooks.event!(makeStatusEvent("ses_await2", "busy") as any)
         await hooks.event!(makeStatusEvent("ses_await2", "idle") as any)
-        await wait(3500)
+        await wait(500)
 
         expect(promptCalls.length).toBeGreaterThan(0)
     })
@@ -937,7 +951,7 @@ describe("awaiting-input gate (pending tool_use)", () => {
         await hooks.event!(makeTodoUpdatedEvent("ses_await3", OPEN_TODOS) as any)
         await hooks.event!(makeStatusEvent("ses_await3", "busy") as any)
         await hooks.event!(makeStatusEvent("ses_await3", "idle") as any)
-        await wait(3500)
+        await wait(500)
 
         expect(promptCalls.length).toBeGreaterThan(0)
     })
@@ -1033,7 +1047,7 @@ describe("active-user suppression (recent inbound user message, no pending tool)
         await hooks.event!(makeUserMessageEvent("ses_act1", "go on") as any)
         await hooks.event!(makeStatusEvent("ses_act1", "busy") as any)
         await hooks.event!(makeStatusEvent("ses_act1", "idle") as any)
-        await wait(3500)
+        await wait(500)
 
         expect(promptCalls.length).toBe(0)
     })
@@ -1066,7 +1080,7 @@ describe("active-user suppression (recent inbound user message, no pending tool)
         await wait(100)
         await hooks.event!(makeStatusEvent("ses_act2", "busy") as any)
         await hooks.event!(makeStatusEvent("ses_act2", "idle") as any)
-        await wait(3500)
+        await wait(500)
 
         expect(promptCalls.length).toBeGreaterThan(0)
     })
