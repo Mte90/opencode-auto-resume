@@ -112,6 +112,7 @@ export interface AutoResumeOptions {
 	doneWithoutWorkPrompt?: string
 	actionIntentPrompt?: string
 	debug?: boolean
+	activeUserWindowMs?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -128,6 +129,7 @@ const DEFAULT_LOOP_MAX_CONTINUES = 3
 const DEFAULT_LOOP_WINDOW_MS = 10 * 60_000
 const DEFAULT_MAX_RECOVERY_RETRIES = 2
 const DEFAULT_DEBUG = false
+const DEFAULT_ACTIVE_USER_WINDOW_MS = 15 * 60_000
 
 /** OOC (out-of-context) errors that `continue` can never clear — recovery is locked out on these. */
 const OOC_ERROR_RE = /exceeds the available context size|context size \(\d+\)|too large to compact|too many tokens|prompt is too long/i
@@ -388,6 +390,7 @@ export default Plugin.define({
 		const loopWindowMs = opts.loopWindowMs ?? DEFAULT_LOOP_WINDOW_MS
 		const maxRecoveryRetries = opts.maxRecoveryRetries ?? DEFAULT_MAX_RECOVERY_RETRIES
 		const debug = opts.debug ?? DEFAULT_DEBUG
+	const activeUserWindowMs = opts.activeUserWindowMs ?? DEFAULT_ACTIVE_USER_WINDOW_MS
 
 		const dbg = (...args: unknown[]) => {
 			if (debug) console.log("[auto-resume:debug]", ...args)
@@ -763,7 +766,33 @@ export default Plugin.define({
 			}
 		}
 
-		async function inspectOnIdle(sid: string) {
+		async function shouldStandDownForUser(sid: string, activeUserWindowMs: number): Promise<boolean> {
+	try {
+		const result = await ctx.session.context({ sessionID: sid })
+		const messages: unknown[] = Array.isArray(result) ? result : ((result as { messages?: unknown[] })?.messages ?? [])
+		if (messages.length === 0) return false
+		const newest = messages[messages.length - 1] as { type?: string; content?: { type?: string; state?: { status?: string } }[]; time?: { created?: number }; info?: { time?: { created?: number } } }
+		// (a) A pending tool call (e.g. the `question` tool) means the model is waiting
+		//     on the user's answer — a synthetic nudge here would be interrupted by their
+		//     real reply ("Step interrupted").
+		if (newest?.type === "assistant") {
+			for (const part of newest.content ?? []) {
+				const t = part?.type ?? ""
+				if ((t === "tool_use" || t === "tool" || t === "tool_call" || t.startsWith("tool")) && part?.state?.status === "pending") return true
+			}
+		}
+		// (b) The user was recently active — they are mid-conversation, not stuck.
+		if (newest?.type === "user") {
+			const ts = newest.time?.created ?? newest.info?.time?.created
+			if (typeof ts === "number" && Date.now() - ts < activeUserWindowMs) return true
+		}
+		return false
+	} catch {
+		return false
+	}
+}
+
+async function inspectOnIdle(sid: string) {
 			const w = ensureWatch(sid)
 			// Prefer the live delta buffer; fall back to the authoritative message
 			// history when it is empty (e.g. the plugin loaded mid-turn) or stale.
@@ -777,6 +806,11 @@ export default Plugin.define({
 			// interrupted"). Never nudge a hand-off turn.
 			if (isUserHandoff(text)) {
 				dbg(`${short(sid)} idle turn ends with a user hand-off — skipping targeted recovery`)
+				return
+			}
+
+			if (await shouldStandDownForUser(sid, activeUserWindowMs)) {
+				dbg(`${short(sid)} user has pending input or was recently active — standing down`)
 				return
 			}
 
