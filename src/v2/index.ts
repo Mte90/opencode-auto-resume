@@ -32,7 +32,39 @@
  *   { "plugins": [{ "package": "./plugins/auto-resume-v2.ts", "options": { ... } }] }
  */
 
-import { Plugin } from "@opencode/plugin"
+/**
+ * v2 entrypoint shape.
+ *
+ * The package depends on `@opencode-ai/plugin`, which exports `Plugin` only as a
+ * *type* — `(input, options?) => Promise<Hooks>`. There is no runtime
+ * `Plugin.define` in it, so the previous `import { Plugin } from
+ * "@opencode/plugin"` did not resolve and the file could not be built or
+ * type-checked at all (see the build script, which only ever built v1's
+ * `src/index.ts`). The v2 contract is simply `{ id, setup }`, so define the
+ * identity helper locally rather than importing a symbol that does not exist.
+ */
+type AutoResumePlugin = {
+	id: string
+	setup: (ctx: AutoResumePluginInput) => unknown
+}
+
+const define = <T>(plugin: T): T => plugin
+
+/**
+ * The subset of the v2 plugin input this plugin actually consumes. Typed
+ * structurally so the file type-checks standalone, without pinning a
+ * @opencode-ai/plugin version whose `Plugin` type describes the v1 contract.
+ */
+interface AutoResumePluginInput {
+	/** Per-plugin options from config. */
+	options?: Record<string, unknown>
+	/** Event stream (AsyncIterable of `{ type, data }`). */
+	event: { subscribe: (opts?: { signal?: AbortSignal }) => AsyncIterable<V2Event> }
+	/** Server-side session/messaging operations. */
+	session: Record<string, (...args: any[]) => any>
+	/** Application logger, when the host provides one. */
+	app?: { log?: (level: string, message: string) => unknown }
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -59,6 +91,14 @@ interface SessionWatch {
 	lastRetryAt: number
 	gaveUp: boolean
 	aborting: boolean
+	/** Timestamp of the last plugin-initiated `session.interrupt()`. Any abort-shaped
+	 * event inside `SELF_ABORT_TTL_MS` of it is ours, not the user's. */
+	selfAbortAt: number
+	/** Count of plugin-initiated interrupts in the current `INTERRUPT_WINDOW_MS`. */
+	interruptsThisWindow: number
+	interruptWindowStart: number
+	/** Timestamp of the last recovery injection, for `injectIntervalMs` debouncing. */
+	lastInjectAt: number
 	recovering: boolean
 	/** Latched when a failure carries an OOC error that `continue` can never clear; recovery (continue + abort+resume) is refused until a genuine user/agent turn. */
 	oocLocked: boolean
@@ -81,7 +121,6 @@ interface SessionWatch {
 
 	// Guards
 	permissionPending: boolean
-	waitingOnSubagent: boolean
 	lastWasTaskTool: boolean
 	idleSince: number | null
 	/** Set while the session is mid native compaction — recovery must never interrupt it. */
@@ -106,7 +145,8 @@ export interface AutoResumeOptions {
 	maxBackoffMs?: number
 	loopMaxContinues?: number
 	loopWindowMs?: number
-	maxRecoveryRetries?: number
+	/** Minimum gap between recovery injections for one session. */
+	injectIntervalMs?: number
 	continuePrompt?: string
 	toolTextRecoveryPrompt?: string
 	doneWithoutWorkPrompt?: string
@@ -127,12 +167,38 @@ const DEFAULT_BASE_BACKOFF_MS = 1_000
 const DEFAULT_MAX_BACKOFF_MS = 8_000
 const DEFAULT_LOOP_MAX_CONTINUES = 3
 const DEFAULT_LOOP_WINDOW_MS = 10 * 60_000
-const DEFAULT_MAX_RECOVERY_RETRIES = 2
 const DEFAULT_DEBUG = false
 const DEFAULT_ACTIVE_USER_WINDOW_MS = 15 * 60_000
 
 /** OOC (out-of-context) errors that `continue` can never clear — recovery is locked out on these. */
 const OOC_ERROR_RE = /exceeds the available context size|context size \(\d+\)|too large to compact|too many tokens|prompt is too long/i
+
+/**
+ * Window after `session.interrupt()` during which any abort-shaped event is
+ * attributed to us rather than to the user. The runtime delivers
+ * `session.execution.interrupted` asynchronously, so a boolean `aborting` flag
+ * cleared on a fixed timer is not a reliable "this abort was mine" marker.
+ */
+const SELF_ABORT_TTL_MS = 30_000
+/** Interrupt-shaped failure signatures. v2 reports an interrupt as
+ * `{type:"aborted", message:"Step interrupted"}`, which the older
+ * `("interrupted by user" | type contains "cancel")` filter never matched. */
+const ABORT_ERROR_TYPE_RE = /^(abort|aborted|cancel|cancelled|canceled|interrupted)$/i
+const ABORT_ERROR_MSG_RE = /step interrupted|interrupted by user|request cancelled|request canceled/i
+/** Hard cap on plugin-initiated interrupts. An interrupt persists an errored
+ * assistant message that the UI surfaces as a send failure, so it is a last
+ * resort, not a routine recovery step. */
+const MAX_INTERRUPTS_PER_WINDOW = 2
+const INTERRUPT_WINDOW_MS = 10 * 60_000
+/**
+ * Minimum gap between two recovery injections for the same session.
+ * Synthetic turns are not free: sending one to a session that is already
+ * running supersedes its in-flight step, which the runtime reports as
+ * "Step interrupted". Debouncing collapses the several independent recovery
+ * paths (stall watchdog, intent nudge, tool-loop nudge) into at most one
+ * injection per interval.
+ */
+const DEFAULT_INJECT_INTERVAL_MS = 15_000
 
 const MAX_IDLE_SESSIONS = 50
 const IDLE_CLEANUP_MS = 10 * 60_000
@@ -374,10 +440,10 @@ function isTaskToolCall(ev: V2Event): boolean {
 // Plugin
 // ---------------------------------------------------------------------------
 
-export default Plugin.define({
+export default define({
 	id: "auto-resume.v2",
 
-	setup: async (ctx) => {
+	setup: async (ctx: AutoResumePluginInput) => {
 		const opts = (ctx.options ?? {}) as AutoResumeOptions
 
 		const chunkTimeoutMs = opts.chunkTimeoutMs ?? DEFAULT_CHUNK_TIMEOUT_MS
@@ -388,9 +454,9 @@ export default Plugin.define({
 		const maxBackoff = opts.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS
 		const loopMaxContinues = opts.loopMaxContinues ?? DEFAULT_LOOP_MAX_CONTINUES
 		const loopWindowMs = opts.loopWindowMs ?? DEFAULT_LOOP_WINDOW_MS
-		const maxRecoveryRetries = opts.maxRecoveryRetries ?? DEFAULT_MAX_RECOVERY_RETRIES
 		const debug = opts.debug ?? DEFAULT_DEBUG
-	const activeUserWindowMs = opts.activeUserWindowMs ?? DEFAULT_ACTIVE_USER_WINDOW_MS
+		const activeUserWindowMs = opts.activeUserWindowMs ?? DEFAULT_ACTIVE_USER_WINDOW_MS
+		const injectIntervalMs = opts.injectIntervalMs ?? DEFAULT_INJECT_INTERVAL_MS
 
 		const dbg = (...args: unknown[]) => {
 			if (debug) console.log("[auto-resume:debug]", ...args)
@@ -398,6 +464,16 @@ export default Plugin.define({
 
 		function log(level: "info" | "warn" | "error", msg: string) {
 			const line = `[auto-resume] ${msg}`
+			// Prefer the server log sink so plugin output is actually retrievable
+			// (console output from a hosted plugin is not captured anywhere useful).
+			try {
+				const appLog = (ctx as any)?.app?.log
+				if (typeof appLog === "function") {
+					void appLog.call((ctx as any).app, level === "info" ? "info" : level, line)
+				}
+			} catch {
+				// fall through to console
+			}
 			if (level === "error") console.error(line)
 			else if (level === "warn") console.warn(line)
 			else console.log(line)
@@ -421,6 +497,10 @@ export default Plugin.define({
 					lastRetryAt: 0,
 					gaveUp: false,
 					aborting: false,
+					selfAbortAt: 0,
+					interruptsThisWindow: 0,
+					interruptWindowStart: 0,
+					lastInjectAt: 0,
 					recovering: false,
 					oocLocked: false,
 					oocLockReason: null,
@@ -434,7 +514,6 @@ export default Plugin.define({
 					intentNudgeAttempts: 0,
 					pendingRecoveryArmed: false,
 					permissionPending: false,
-					waitingOnSubagent: false,
 					lastWasTaskTool: false,
 					idleSince: null,
 					compacting: false,
@@ -466,7 +545,6 @@ export default Plugin.define({
 				w.recentToolCalls = []
 				w.textParts.clear()
 				w.lastAssistantText = ""
-				w.waitingOnSubagent = false
 			}
 			w.status = "busy"
 			w.idleSince = null
@@ -500,6 +578,84 @@ export default Plugin.define({
 				w.continueTimestamps.shift()
 			}
 			return w.continueTimestamps.length
+		}
+
+		/**
+		 * True while a plugin-initiated abort is still in flight. The runtime delivers
+		 * `session.execution.interrupted` asynchronously after `interrupt()` returns, so
+		 * the transient `w.aborting` boolean is not a reliable discriminator.
+		 */
+		function selfAbortActive(w: SessionWatch): boolean {
+			return w.selfAbortAt > 0 && Date.now() - w.selfAbortAt < SELF_ABORT_TTL_MS
+		}
+
+		/** Does this failure signature mean "the turn was interrupted"? */
+		function isAbortError(errType: string, errMsg: string): boolean {
+			return ABORT_ERROR_TYPE_RE.test(errType.trim()) || ABORT_ERROR_MSG_RE.test(errMsg)
+		}
+
+		/** Remaining plugin-initiated interrupts allowed in the current window. */
+		function interruptBudget(w: SessionWatch): number {
+			if (w.interruptWindowStart === 0 || Date.now() - w.interruptWindowStart > INTERRUPT_WINDOW_MS) {
+				w.interruptWindowStart = Date.now()
+				w.interruptsThisWindow = 0
+			}
+			return MAX_INTERRUPTS_PER_WINDOW - w.interruptsThisWindow
+		}
+
+		/**
+		 * Fallback source of truth for "which sessions are running". v2's plugin
+		 * SessionDomain does not expose `session.active()` (see Mte90/opencode-auto-resume#33),
+		 * so when it is missing we derive the set from our own event-derived busy flags.
+		 * Without this the subagent-wait guard below can never fire.
+		 */
+		function busySessions(): string[] {
+			const out: string[] = []
+			for (const [sid, w] of sessions) {
+				if (w.status === "busy" && !w.userCancelled) out.push(sid)
+			}
+			return out
+		}
+
+		/**
+		 * Single choke point for every recovery injection. Guarantees at most one
+		 * synthetic per `injectIntervalMs` and refuses to talk to a live session,
+		 * because a turn sent to a busy session supersedes its in-flight step
+		 * ("Step interrupted").
+		 *
+		 * `allowDuringSelfAbort` is for the abort+resume escalation, which by
+		 * construction runs inside the plugin's own abort window: it is the one
+		 * injection that is *supposed* to follow `interrupt()`. That path skips
+		 * both the abort-window check and the busy guard, because:
+		 *  - we just killed the step ourselves, so "this session is working" is
+		 *    false, and the runtime may not have delivered the idle transition
+		 *    yet; and
+		 *  - swallowing the continue there leaves a session interrupted with
+		 *    nothing to restart it, which is the failure this whole fix targets.
+		 * It stays rate-limited by `w.aborting` and `MAX_INTERRUPTS_PER_WINDOW`.
+		 */
+		async function injectOnce(
+			sid: string,
+			text: string,
+			notification: string,
+			allowDuringSelfAbort = false,
+		): Promise<boolean> {
+			const w = ensureWatch(sid)
+			if (!allowDuringSelfAbort && selfAbortActive(w)) {
+				dbg(`${short(sid)} injection refused — inside our own abort window`)
+				return false
+			}
+			if (!allowDuringSelfAbort && w.status === "busy" && Date.now() - w.lastActivityAt < chunkTimeoutMs) {
+				dbg(`${short(sid)} injection refused — session busy and live (${Math.round((Date.now() - w.lastActivityAt) / 1000)}s since last event)`)
+				return false
+			}
+			const since = Date.now() - w.lastInjectAt
+			if (!allowDuringSelfAbort && w.lastInjectAt > 0 && since < injectIntervalMs) {
+				dbg(`${short(sid)} injection debounced — ${Math.round(since / 1000)}s since last (min ${injectIntervalMs / 1000}s)`)
+				return false
+			}
+			w.lastInjectAt = Date.now()
+			return notifyAndPrompt(sid, text, notification)
 		}
 
 		function cleanupIdleSessions() {
@@ -591,7 +747,7 @@ export default Plugin.define({
 		}
 
 		async function tryAbortAndResume(sid: string, w: SessionWatch): Promise<boolean> {
-			if (w.aborting) return false
+			if (w.aborting || selfAbortActive(w)) return false
 			if (w.oocLocked) {
 				dbg(`${short(sid)} oocLocked — refusing abort+resume escalation`)
 				return false
@@ -600,8 +756,15 @@ export default Plugin.define({
 				dbg(`${short(sid)} mid-compaction — refusing abort+resume escalation`)
 				return false
 			}
+			if (interruptBudget(w) <= 0) {
+				w.continueTimestamps = []
+				log("warn", `${short(sid)} interrupt budget exhausted (${MAX_INTERRUPTS_PER_WINDOW}/${INTERRUPT_WINDOW_MS / 60000}m) — skipping interrupt, loop guard reset`)
+				return false
+			}
 			w.aborting = true
-			log("warn", `${short(sid)} escalating: interrupt + fresh continue`)
+			w.selfAbortAt = Date.now()
+			w.interruptsThisWindow++
+			log("warn", `${short(sid)} escalating: interrupt + fresh continue (${w.interruptsThisWindow}/${MAX_INTERRUPTS_PER_WINDOW} per ${INTERRUPT_WINDOW_MS / 60000}m)`)
 			try {
 				await ctx.session.interrupt({ sessionID: sid })
 			} catch (err) {
@@ -612,9 +775,15 @@ export default Plugin.define({
 			await new Promise((r) => setTimeout(r, 2_000))
 			w.aborting = false
 			w.resumeAttempts = 0
-			const ok = await notifyAndPrompt(sid, opts.continuePrompt ?? CONTINUE_PROMPT, "abort+resume escalation")
+			// Deliberately does not recordContinue(): our own escalation must not feed
+			// the loop guard that triggered it, or the guard trips on its own output.
+			// Through the same choke point as every other path. The runtime
+			// delivers session.execution.interrupted asynchronously, so an
+			// escalation that lands on top of a concurrent recovery injection is
+			// exactly the case that produced the simultaneous bursts of synthetic
+			// continues (and the "Step interrupted" they caused).
+			const ok = await injectOnce(sid, opts.continuePrompt ?? CONTINUE_PROMPT, "abort+resume escalation", true)
 			if (ok) {
-				recordContinue(sid)
 				w.lastRetryAt = Date.now()
 				log("info", `${short(sid)} resumed after abort`)
 			}
@@ -646,15 +815,19 @@ export default Plugin.define({
 				dbg(`${short(sid)} mid-compaction — refusing recovery (reason: ${reason})`)
 				return
 			}
-			// Record intent first, then evaluate the loop guard, so the Nth
-			// continue within the window is the one that escalates.
-			recordContinue(sid)
+			if (selfAbortActive(w)) {
+				dbg(`${short(sid)} self-abort in flight — refusing recovery (reason: ${reason})`)
+				return
+			}
+			// Evaluate the loop guard BEFORE recording this continue, so the plugin
+			// never escalates on continues it injected itself.
 			if (continuesInWindow(w) >= loopMaxContinues) {
 				log("warn", `${short(sid)} hallucination loop (${loopMaxContinues} continues/${loopWindowMs / 1000}s) — abort+resume`)
 				await tryAbortAndResume(sid, w)
 				w.continueTimestamps = []
 				return
 			}
+			recordContinue(sid)
 			if (w.resumeAttempts >= maxRetries) {
 				log("warn", `${short(sid)} giving up after ${maxRetries} attempts (${reason})`)
 				w.gaveUp = true
@@ -688,7 +861,7 @@ export default Plugin.define({
 						dbg(`${short(sid)} still busy and live at inject time (${Math.round((Date.now() - w.lastActivityAt) / 1000)}s since last event) — not interrupting`)
 						return
 					}
-					const ok = await notifyAndPrompt(sid, opts.continuePrompt ?? CONTINUE_PROMPT, "stalled — retrying")
+					const ok = await injectOnce(sid, opts.continuePrompt ?? CONTINUE_PROMPT, "stalled — retrying")
 					w.pendingRecoveryArmed = false
 					if (ok) {
 						w.lastRetryAt = Date.now()
@@ -711,13 +884,17 @@ export default Plugin.define({
 				dbg(`${short(sid)} mid-compaction — skipping ${kind} nudge`)
 				return
 			}
-			recordContinue(sid)
+			if (selfAbortActive(w)) {
+				dbg(`${short(sid)} self-abort in flight — skipping ${kind} nudge`)
+				return
+			}
 			if (continuesInWindow(w) >= loopMaxContinues) {
 				log("warn", `${short(sid)} loop guard before ${kind} nudge — abort+resume`)
 				await tryAbortAndResume(sid, w)
 				w.continueTimestamps = []
 				return
 			}
+			recordContinue(sid)
 			if (w[budgetKey] >= maxRetries) {
 				dbg(`${short(sid)} ${kind} budget exhausted`)
 				return
@@ -725,10 +902,11 @@ export default Plugin.define({
 			w[budgetKey]++
 			log("info", `${short(sid)} ${kind} detected — sending targeted prompt (${w[budgetKey]}/${maxRetries})`)
 			w.recovering = true
-			const ok = await notifyAndPrompt(sid, prompt, "recovering: " + kind)
+			// injectOnce debounces: this nudge counts once, not alongside a
+			// concurrent stall-watchdog injection.
+			const ok = await injectOnce(sid, prompt, "recovering: " + kind)
 			w.recovering = false
 			if (ok) {
-				recordContinue(sid)
 				touch(sid)
 				markBusy(sid)
 			}
@@ -843,14 +1021,22 @@ async function inspectOnIdle(sid: string) {
 		 * `session.active()` exists on the v2 client but is not part of the
 		 * plugin SessionDomain pick — access defensively; empty map if missing.
 		 */
+		/**
+		 * `session.active()` exists on the v2 client but is not part of the plugin
+		 * SessionDomain pick, so it is normally absent — see
+		 * Mte90/opencode-auto-resume#33. Fall back to our own event-derived busy
+		 * flags rather than returning an empty set: returning `[]` made the
+		 * subagent-wait guard below unreachable, so a parent session that went
+		 * quiet while its child ran was declared stalled and interrupted.
+		 */
 		async function getActiveSessions(): Promise<string[]> {
 			try {
 				const fn = (ctx.session as any).active
-				if (typeof fn !== "function") return []
+				if (typeof fn !== "function") return busySessions()
 				const active = await fn.call(ctx.session)
 				return Object.keys(active ?? {}).filter((k) => typeof k === "string")
 			} catch {
-				return []
+				return busySessions()
 			}
 		}
 
@@ -886,8 +1072,8 @@ async function inspectOnIdle(sid: string) {
 					dbg(`${short(sid)} silent but permission pending — skipping`)
 					continue
 				}
-				if (w.waitingOnSubagent) {
-					dbg(`${short(sid)} silent but waiting on subagent — skipping`)
+				if (selfAbortActive(w)) {
+					dbg(`${short(sid)} silent but inside our own abort window — skipping`)
 					continue
 				}
 				// If another session is actively running and this one went silent
@@ -939,6 +1125,13 @@ async function inspectOnIdle(sid: string) {
 					const w = ensureWatch(sid)
 					w.pendingRecoveryArmed = false
 					w.selfRecovery = false // stale — no in-flight recovery prompt by the time we idle
+					// Never run the idle heuristics on top of our own abort: the idle
+					// transition caused by interrupt() would otherwise trigger a second,
+					// independent injection.
+					if (selfAbortActive(w)) {
+						dbg(`${short(sid)} idle after plugin-initiated abort — skipping targeted recovery`)
+						return
+					}
 					void inspectOnIdle(sid)
 					return
 				}
@@ -950,7 +1143,13 @@ async function inspectOnIdle(sid: string) {
 					// interrupt should suppress recovery; shutdown/superseded/inactivity
 					// (or a missing reason on older runtimes) must not.
 					const reason = typeof ev.data?.reason === "string" ? ev.data.reason : undefined
-					w.userCancelled = !w.aborting && (reason === undefined || reason === "user")
+					// Use the latch, not the transient `aborting` flag: the runtime
+				// delivers this event asynchronously, after `aborting` may have
+				// already been cleared. Only a genuine user stop latches
+				// userCancelled; `shutdown`/`superseded`/`inactivity` must not
+				// permanently disable recovery for the session.
+				const mine = w.aborting || selfAbortActive(w)
+				if (!mine) w.userCancelled = reason === undefined || reason === "user"
 					// A user interrupt also ends any in-flight compaction.
 					w.compacting = false
 					w.compactionStartedAt = null
@@ -1016,6 +1215,28 @@ async function inspectOnIdle(sid: string) {
 					return
 				}
 				case "session.step.ended": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					touch(sid)
+					return
+				}
+				// Liveness between step start and the first token. Without these a
+				// step that starts and then produces nothing for `chunkTimeoutMs`
+				// looks identical to a stall.
+				case "session.step.streamed":
+				case "session.text.started":
+				case "session.reasoning.started":
+				case "session.synthetic": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					touch(sid)
+					return
+				}
+				// A long tool-input generation (e.g. a big heredoc write) emits no
+				// text deltas; treating that silence as a stall resumes a session
+				// that is in fact working.
+				case "session.tool.input.started":
+				case "session.tool.input.delta": {
 					const sid = sidOf(ev)
 					if (!sid) return
 					touch(sid)
@@ -1116,14 +1337,25 @@ async function inspectOnIdle(sid: string) {
 					const w = ensureWatch(sid)
 					const errMsg = String(ev.data?.error?.message ?? "")
 					const errType = String(ev.data?.error?.type ?? "")
-					maybeLockOoc(sid, errMsg)
-					markIdle(sid)
-					w.pendingRecoveryArmed = true // our delayed recovery must survive this idle transition
-					if (errMsg.includes("interrupted by user") || errType.includes("cancel")) {
-						dbg(`${short(sid)} failure was user-initiated — not recovering`)
+					// Our own abort: do not recover from it, and do not arm the delayed
+					// recovery (arming here is what kept the watchdog injecting into an
+					// already-interrupted session).
+					if (w.aborting || selfAbortActive(w)) {
+						dbg(`${short(sid)} ${ev.type} is this plugin's own abort (${errType || "error"}) — not recovering`)
+						w.recovering = false
 						w.pendingRecoveryArmed = false
 						return
 					}
+					// Any interrupt-shaped failure (ours or the user's) is not recoverable.
+					// v2 reports these as {type:"aborted", message:"Step interrupted"}.
+					if (isAbortError(errType, errMsg)) {
+						dbg(`${short(sid)} failure was an interrupt (${errType || "error"}) — not recovering`)
+						w.pendingRecoveryArmed = false
+						return
+					}
+					maybeLockOoc(sid, errMsg)
+					markIdle(sid)
+					w.pendingRecoveryArmed = true // our delayed recovery must survive this idle transition
 					log("warn", `${short(sid)} ${ev.type}: ${errType || "error"} ${errMsg.slice(0, 160)}`)
 					void recover(sid, `${ev.type}${isStreamingFailure(errMsg) ? " (streaming)" : ""}`)
 					return
