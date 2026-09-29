@@ -121,6 +121,8 @@ interface SessionWatch {
 
 	// Guards
 	permissionPending: boolean
+	/** Timestamp of the latest `permission.asked` (stale-guard for the flag). */
+	permissionPendingAt: number | null
 	lastWasTaskTool: boolean
 	idleSince: number | null
 	/** Set while the session is mid native compaction — recovery must never interrupt it. */
@@ -204,7 +206,28 @@ const MAX_IDLE_SESSIONS = 50
 const IDLE_CLEANUP_MS = 10 * 60_000
 /** A compaction silent for this long without an ended/failed event is wedged — stale-clear the flag. */
 const COMPACTION_STALE_TTL_MS = 30 * 60_000
+/** A `permission.asked` unanswered this long is treated as abandoned — stale-clear the flag. */
+const PERMISSION_STALE_TTL_MS = 30 * 60_000
 const TEXT_BUFFER_TRIM_LEN = 20_000
+
+/**
+ * Tool-part states as reported by the v2 message projection.
+ *
+ * v2 never writes "pending": an in-flight tool part reads "running", and it
+ * settles to "completed" or "error". "pending" was the v1 spelling, so a guard
+ * that tested for it literally could never fire on v2.
+ */
+const TOOL_STATE_RUNNING = "running"
+/** Kept for v1-shaped payloads; harmless on v2. */
+const TOOL_STATE_PENDING = "pending"
+const TOOL_STATE_COMPLETED = "completed"
+
+/**
+ * Tools whose only real completion is the user answering. A `question` that
+ * comes back "error" was interrupted, not answered, so it must still hold the
+ * turn open.
+ */
+const AWAITING_USER_TOOLS = new Set(["question", "permission", "ask", "confirm"])
 
 const CONTINUE_PROMPT = "continue"
 
@@ -514,6 +537,7 @@ export default define({
 					intentNudgeAttempts: 0,
 					pendingRecoveryArmed: false,
 					permissionPending: false,
+					permissionPendingAt: null,
 					lastWasTaskTool: false,
 					idleSince: null,
 					compacting: false,
@@ -558,7 +582,26 @@ export default define({
 				w.status = "idle"
 				w.idleSince = Date.now()
 			}
-			w.permissionPending = false
+			// NOTE: this used to clear `permissionPending`. The `session.idle` handler
+			// calls markIdle() and then inspectOnIdle(), so the flag was always false by
+			// the time the guard that honours it ran — the permission guard was dead on
+			// exactly the transition it exists for. `permission.replied` is now the only
+			// thing that clears it, plus a stale-clear for a `permission.asked` whose
+			// reply never arrives.
+			clearStalePermissionFlag(sid, w)
+		}
+
+		/**
+		 * A `permission.asked` with no matching `permission.replied` would otherwise
+		 * stand the session down forever. Mirrors the compaction stale-guard.
+		 */
+		function clearStalePermissionFlag(sid: string, w: SessionWatch) {
+			if (!w.permissionPending) return
+			if (w.permissionPendingAt && Date.now() - w.permissionPendingAt > PERMISSION_STALE_TTL_MS) {
+				dbg(`${short(sid)} permission prompt silent >${PERMISSION_STALE_TTL_MS / 60000}m — clearing flag`)
+				w.permissionPending = false
+				w.permissionPendingAt = null
+			}
 		}
 
 		function recordContinue(sid: string) {
@@ -949,14 +992,29 @@ export default define({
 		const result = await ctx.session.context({ sessionID: sid })
 		const messages: unknown[] = Array.isArray(result) ? result : ((result as { messages?: unknown[] })?.messages ?? [])
 		if (messages.length === 0) return false
-		const newest = messages[messages.length - 1] as { type?: string; content?: { type?: string; state?: { status?: string } }[]; time?: { created?: number }; info?: { time?: { created?: number } } }
-		// (a) A pending tool call (e.g. the `question` tool) means the model is waiting
-		//     on the user's answer — a synthetic nudge here would be interrupted by their
-		//     real reply ("Step interrupted").
+		const newest = messages[messages.length - 1] as {
+			type?: string
+			content?: { type?: string; name?: string; state?: { status?: string } }[]
+			time?: { created?: number }
+			info?: { time?: { created?: number } }
+		}
+		// (a) A tool call still awaiting its result means the model is waiting on the
+		//     user — a synthetic nudge here would be interrupted by their real reply
+		//     ("Step interrupted").
+		//
+		//     This used to test `state.status === "pending"`, which v2 never emits, so
+		//     the branch was unreachable and the nudge fired with an unanswered
+		//     `question` on screen. See TOOL_STATE_* above.
 		if (newest?.type === "assistant") {
 			for (const part of newest.content ?? []) {
 				const t = part?.type ?? ""
-				if ((t === "tool_use" || t === "tool" || t === "tool_call" || t.startsWith("tool")) && part?.state?.status === "pending") return true
+				if (!(t === "tool_use" || t === "tool" || t === "tool_call" || t.startsWith("tool"))) continue
+				const status = part?.state?.status
+				if (status === TOOL_STATE_RUNNING || status === TOOL_STATE_PENDING) return true
+				// An interactive tool only reaches a terminal state once the user has
+				// actually answered. "error" here means the question was interrupted,
+				// not that it was answered, so keep standing down.
+				if (status !== TOOL_STATE_COMPLETED && AWAITING_USER_TOOLS.has(part?.name ?? "")) return true
 			}
 		}
 		// (b) The user was recently active — they are mid-conversation, not stuck.
@@ -1068,6 +1126,9 @@ async function inspectOnIdle(sid: string) {
 				}
 				const silence = now - w.lastActivityAt
 				if (silence < chunkTimeoutMs + gracePeriodMs) continue
+				// Same stale-guard as the compaction flag: an unanswered `permission.asked`
+				// must not stand this session down forever.
+				clearStalePermissionFlag(sid, w)
 				if (w.permissionPending) {
 					dbg(`${short(sid)} silent but permission pending — skipping`)
 					continue
@@ -1300,7 +1361,9 @@ async function inspectOnIdle(sid: string) {
 				case "permission.asked": {
 					const sid = sidOf(ev)
 					if (!sid) return
-					ensureWatch(sid).permissionPending = true
+					const w = ensureWatch(sid)
+					w.permissionPending = true
+					w.permissionPendingAt = Date.now()
 					return
 				}
 				case "permission.replied": {
@@ -1308,6 +1371,7 @@ async function inspectOnIdle(sid: string) {
 					if (!sid) return
 					const w = ensureWatch(sid)
 					w.permissionPending = false
+					w.permissionPendingAt = null
 					touch(sid)
 					return
 				}
