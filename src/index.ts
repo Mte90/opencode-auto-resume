@@ -75,9 +75,10 @@ export interface SessionWatch {
 
 const DEFAULT_CHUNK_TIMEOUT_MS = 45_000
 const DEFAULT_CHECK_INTERVAL_MS = 5_000
+const DEFAULT_DISCOVERY_DELAY_MS = 5_000
 // Active-user window: an inbound user message this recent means the user is
 // engaged (likely composing) — idle open-todos nudges stand down.
-const DEFAULT_ACTIVE_USER_WINDOW_MS = 15 * 60_000
+const DEFAULT_ACTIVE_USER_WINDOW_MS = 5 * 60_000
 const DEFAULT_GRACE_PERIOD_MS = 3_000
 const DEFAULT_MAX_RETRIES = 3
 const DEFAULT_MAX_BACKOFF_MS = 8_000
@@ -516,6 +517,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     (options?.minActivityGapMs as number) ?? DEFAULT_MIN_ACTIVITY_GAP_MS
     const warmupMs: number =
     (options?.warmupMs as number) ?? DEFAULT_WARMUP_MS
+    const discoveryDelayMs: number =
+    (options?.discoveryDelayMs as number) ?? DEFAULT_DISCOVERY_DELAY_MS
     const debug: boolean =
     (options?.debug as boolean) ?? DEFAULT_DEBUG
     const streamingFailureErrorNames: string[] =
@@ -1861,7 +1864,6 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     await log("info", `${short(sid)} - max open-todos nudges (${maxRetries}) reached, waiting for activity`)
                     return
                 }
-                w.todoNudgeAttempts++
             } else if (isDoneClaimNoTodos) {
                 w.doneClaimNoTodosAttempts++
             } else {
@@ -1869,7 +1871,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 w.toolTextAttempts++
             }
 
-            const attemptNum = isOpenTodosReminder ? w.todoNudgeAttempts : isDoneClaimNoTodos ? w.doneClaimNoTodosAttempts : w.toolTextAttempts
+            const attemptNum = isOpenTodosReminder ? w.todoNudgeAttempts + 1 : isDoneClaimNoTodos ? w.doneClaimNoTodosAttempts : w.toolTextAttempts
             await log(
                 "info",
                 `${bestCandidate.source} detected on ${short(sid)}! ` +
@@ -2026,13 +2028,17 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         try {
             const response = await ctx.client.session.list()
             const list = extractMessages(response as Record<string, unknown>)
+            // session.list() never carries a status field (SDK contract) —
+            // fetch real statuses once so discovered already-idle sessions
+            // become eligible for the periodic nudge after a plugin restart.
+            const statusMap = await getSessionStatusMap()
 
             for (const s of list) {
                 const sid = s.id as string
                 if (sid && typeof sid === "string" && sid.startsWith("ses_")) {
                     const isNew = !sessions.has(sid)
                     ensureWatch(sid)
-                    const status = s.status as string | undefined
+                    const status = (s.status as string | undefined) ?? statusMap[sid]
                     if (status) {
                         const w = sessions.get(sid)!
                         w.status = status as SessionWatch["status"]
@@ -2314,7 +2320,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         if (discoveryTimer.unref) discoveryTimer.unref()
 
         // Run initial discovery after a short delay
-        setTimeout(discoverSessions, 5_000)
+        setTimeout(discoverSessions, discoveryDelayMs)
     }
 
     startTimer()
@@ -2600,12 +2606,12 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                                 // 🎉 with open todos is a FALSE POSITIVE - don't latch completionSignaled, send nudge
                                 await log("info", `${short(sid)} - 🎉 detected but ${open.length} open todos remain, sending nudge`)
                                 const reminder = buildOpenTodosReminder(todos)
-                                await tryResume(sid, w, "Idle with open todos (celebration false positive)", reminder)
-                                w.todoNudgeAttempts++
+                                const sent = await tryResume(sid, w, "Idle with open todos (celebration false positive)", reminder)
+                                if (sent) w.todoNudgeAttempts++
                             } else {
                                 const reminder = buildOpenTodosReminder(todos)
-                                await tryResume(sid, w, "Idle with open todos", reminder)
-                                w.todoNudgeAttempts++
+                                const sent = await tryResume(sid, w, "Idle with open todos", reminder)
+                                if (sent) w.todoNudgeAttempts++
                             }
                         }
                     }

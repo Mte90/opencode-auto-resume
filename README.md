@@ -250,7 +250,7 @@ If the assistant claims the task is done ("task done", "finished", "all complete
 The session is not stalled while the ball is in the user's court. Two gates stand down idle nudges:
 
 - **Awaiting input**: the newest assistant message holds a `tool_use` part with `state.status: "pending"` (e.g. an open `question` tool call). All idle checks, the periodic recheck, delayed action-intent callbacks, and the tool-text scan skip prompting until a newer user message clears the gate. Completed tool calls never engage it.
-- **Recently active user**: any inbound user message within `activeUserWindowMs` (default 15 minutes) means the user is engaged — likely composing a reply, which leaves no pending tool call behind. Open-todos nudges (idle + periodic), the tool-text reminder fallback, and action-intent callbacks stand down until the window expires.
+- **Recently active user**: any inbound user message within `activeUserWindowMs` (default 5 minutes) means the user is engaged — likely composing a reply, which leaves no pending tool call behind. Open-todos nudges (idle + periodic), the tool-text reminder fallback, and action-intent callbacks stand down until the window expires.
 
 ---
 
@@ -407,6 +407,7 @@ With options:
 | `toolTextCheckDelayMs` | `3000` | Delay before scanning an idle session for tool-as-text; also the recovery watchdog delay |
 | `minActivityGapMs` | `1000` | Skip recovery if the session was active within this gap |
 | `warmupMs` | `15000` | Action-intent detection disabled while a session is younger than this |
+| `discoveryDelayMs` | `5000` | Delay before the initial session discovery run after plugin attach |
 | `debug` | `false` | Enable `[debug]` console diagnostics |
 | `resumeOnActionIntent` | `true` | Enable action-intent (`:`-terminated line) nudges |
 | `continuePrompt` | `"continue"` | Prompt text for stall/streaming/dead-stream recovery |
@@ -420,7 +421,7 @@ With options:
 | `silentDeadStreamMinTokens` | `200` | Min output tokens to treat a textless `finish:"unknown"` message as a dead stream |
 | `busyStallStrategy` | `"continue"` | Busy-stall response: `"continue"`, `"abort"` (abort-first), or `"off"` (disabled) |
 | `contextSaturationThreshold` | `0.85` | Ratio of used/usable context that routes a saturated parent to magic-context `ctx-wrapup` (only when magic-context is installed) |
-| `activeUserWindowMs` | `900000` | Inbound-user-message recency window (15 min) during which idle nudges stand down (user likely composing) |
+| `activeUserWindowMs` | `300000` | Inbound-user-message recency window (5 min) during which idle nudges stand down (user likely composing) |
 | `subagentNativeCompactionEnabled` | `false` | Opt-in native `session.summarize()` for saturated subagent sessions (no magic-context detection required) |
 
 Message patterns are matched case-insensitively. Error names use exact match.
