@@ -10,7 +10,7 @@ LLM sessions fail in predictable ways. This plugin monitors all sessions and aut
 
 ### Stall recovery
 
-The stream goes silent but the session stays "busy". The UI shows a blinking cursor with no progress. If no events arrive for 48 seconds (`chunkTimeoutMs` + `gracePeriodMs`), the plugin sends `"continue"` with exponential backoff. After 3 failed attempts it gives up.
+The stream goes silent but the session stays "busy". The UI shows a blinking cursor with no progress. If no events arrive for ~3 minutes (`chunkTimeoutMs` + `gracePeriodMs`), the plugin sends `"continue"` with exponential backoff. After 3 failed attempts it gives up.
 
 The `busyStallStrategy` option controls this path: `"continue"` (default), `"abort"` (abort-first), or `"off"` — see [Recovery model](#recovery-model) for what a busy prompt can and cannot do while the runner is live.
 
@@ -367,7 +367,7 @@ With options:
 {
   "plugin": [
     ["opencode-auto-resume", {
-      "chunkTimeoutMs": 45000,
+      "chunkTimeoutMs": 180000,
       "gracePeriodMs": 3000,
       "maxRetries": 3
     }]
@@ -382,7 +382,7 @@ With options:
   "plugin": [
     [
       "file:///home/YOURUSER/.config/opencode/plugins/opencode-auto-resume/dist/index.js",
-      { "chunkTimeoutMs": 45000, "maxRetries": 3 }
+      { "chunkTimeoutMs": 180000, "maxRetries": 3 }
     ]
   ]
 }
@@ -392,7 +392,7 @@ With options:
 
 | Option | Default | Description |
 |---|---|---|
-| `chunkTimeoutMs` | `45000` | Inactivity timeout before considering stream stalled |
+| `chunkTimeoutMs` | `180000` | Inactivity timeout before considering stream stalled |
 | `gracePeriodMs` | `3000` | Extra wait before acting (lets ESC/status events arrive) |
 | `checkIntervalMs` | `5000` | Timer poll interval |
 | `maxRetries` | `3` | Max auto-resume attempts before giving up |
@@ -446,7 +446,7 @@ The plugin handles all recovery automatically — no manual intervention needed.
 | Problem | Solution |
 |---|---|
 | Resumes after ESC | Increase `gracePeriodMs` to `5000` |
-| Too aggressive | Increase `chunkTimeoutMs` to `60000` |
+| Stall recovery too aggressive | Decrease `chunkTimeoutMs` (e.g. `45000`) |
 | Too slow to react | Decrease `checkIntervalMs` to `2000` |
 | Orphan parent not detected | Increase `subagentWaitMs` to `20000` |
 | Hallucination loop not caught | Decrease `loopMaxContinues` to `2` |

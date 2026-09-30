@@ -73,7 +73,7 @@ export interface SessionWatch {
     checkedToolPartIDs: Set<string>
 }
 
-const DEFAULT_CHUNK_TIMEOUT_MS = 45_000
+const DEFAULT_CHUNK_TIMEOUT_MS = 180_000
 const DEFAULT_CHECK_INTERVAL_MS = 5_000
 const DEFAULT_DISCOVERY_DELAY_MS = 5_000
 // Active-user window: an inbound user message this recent means the user is
