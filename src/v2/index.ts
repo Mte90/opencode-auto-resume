@@ -1224,6 +1224,25 @@ async function inspectOnIdle(sid: string) {
 					sessions.delete(sid)
 					return
 				}
+				// --- reverts ---
+				// v2 emits a three-stage revert family. `staged` is intermediate
+				// (the user can still clear it), while `cleared` and `committed`
+				// are terminal; drop our watch state on the terminal stages so a
+				// rewind cannot leave a stale recovery armed against old turns.
+				case "session.revert.staged": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					// Staging is user activity, but not terminal: keep the state.
+					touch(sid)
+					return
+				}
+				case "session.revert.cleared":
+				case "session.revert.committed": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					sessions.delete(sid)
+					return
+				}
 				// v1 legacy: not emitted in v2 (reverts now surface as
 				// `session.revert.cleared` / `session.revert.committed`). Kept
 				// defensively so older runtimes still drop their watch state.
