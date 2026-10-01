@@ -12,9 +12,7 @@ config keeps loading unchanged.
 
 | Option | Why it is inert on v2 |
 | --- | --- |
-| `contextSaturationThreshold` | v2 has no token or context-limit read on the plugin context, so there is nothing to compare the threshold against. |
-| `subagentNativeCompactionEnabled` | Same: without a context-limit read, saturation cannot be detected, so there is nothing to gate a compaction on. |
-| `silentDeadStreamMinTokens` | Same. The heuristic it tunes compares generated token count against a floor. |
+| `silentDeadStreamMinTokens` | The heuristic it tunes compares generated token count against a floor. That count is a single assistant message's output, not the session's cumulative usage, and v2 exposes no per-message stream for it. |
 | `subagentWaitMs` | The v1 orphan-watch timer that this delays has no v2 counterpart; the v2 port decides parent-vs-stalled from its own event-derived busy set. |
 | `toolTextCheckDelayMs` | The delayed raw-tool-call-as-text re-check is v1's polling shape. v2 evaluates the text once, on idle, from the authoritative message history. |
 | `thinkingToolRecoveryPrompt` | The thinking-contains-a-tool-call detector is part of the v1 idle-nudge pass and is not ported. |
@@ -133,3 +131,34 @@ construction. Two detectors run on the idle path instead, both ported from v1:
 v1 cross-checks both against tracked todo state before latching. v2 has no todo
 state yet, so the emoji latches on its own — see `doneWithoutWorkPrompt` in the
 inert table above for what that costs.
+
+## Context saturation
+
+A session can fill its context window without ever looking stalled — it just keeps
+working until it chokes. On idle, when used/usable crosses
+`contextSaturationThreshold` (default 0.85), routing depends on session kind,
+exactly as in v1:
+
+- **Subagent** — opt-in only. With `subagentNativeCompactionEnabled: true` the
+  plugin requests native compaction. v1 called `session.summarize()`; v2 spells it
+  `session.compact`.
+- **Parent** — only when magic-context is installed, because its setup disables
+  native compaction and compacting here would double-compress. The plugin sends
+  the `ctx-wrapup` command through `session.command`, not as prompt text, since
+  prompt text is not expanded into a command.
+
+Both are one-shot per turn, and both are fail-safe: a missing limit, a missing
+token count, a user cancellation, or a signalled completion means no intervention
+at all.
+
+Three v2 API shapes are worth recording, because each replaced something v1 had:
+
+| Need | v1 | v2 |
+|---|---|---|
+| Tokens in the window | accumulated from `message.updated` | `session.usage.updated`, summing `input + output + reasoning + cache.read + cache.write` — the same five fields v1 added up, matching `TokenUsage.total` |
+| The model's window | walk the raw provider list for `limit` | `ctx.model.get(providerID, modelID)` → `Model.Info.limit` |
+| Is magic-context installed? | `config.get().plugin` | `ctx.plugin.list()` → `Plugin.Info[]`; v2 removed the `config` domain |
+
+The usable window is `limit.context - Math.min(20_000, limit.output)` — v1's
+arithmetic, kept identical so the same threshold means the same thing on both
+builds.

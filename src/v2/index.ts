@@ -77,7 +77,20 @@ interface AutoResumePluginInput {
 	 * type-checks standalone. Optional: a host may not supply it, and every
 	 * use must degrade gracefully when it is absent.
 	 */
-	client?: { session: { get: (opts: { path: { id: string } }) => Promise<{ data?: { parentID?: string } }> } }
+	client?: { session: Record<string, (...args: any[]) => any> }
+	/**
+	 * Model catalogue. v2's `ModelDomain.get(providerID, modelID)` returns
+	 * `Model.Info`, whose `limit` is `{ context, input?, output }` — the usable
+	 * context window for context-saturation checks. Optional: a host may not
+	 * supply it, and the saturation check degrades to "no intervention".
+	 */
+	model?: { get: (providerID: string, modelID: string) => unknown }
+	/**
+	 * Installed-plugin inventory (`ctx.plugin.list()`). v2 removed the `config`
+	 * domain, so this is how a plugin detects that magic-context is present before
+	 * routing a saturated parent to it.
+	 */
+	plugin?: { list: () => Promise<unknown> }
 	/** Application logger, when the host provides one. */
 	app?: { log?: (level: string, message: string) => unknown }
 }
@@ -135,6 +148,10 @@ interface SessionWatch {
 	/** Set when the model's own completion signal was seen (a trailing 🎉).
 	 * Latches so a finished session stops being nudged. */
 	completionSignaled: boolean
+	/** Tokens currently in the context window, from `session.usage.updated`. */
+	lastTokenTotal: number
+	/** Saturation intervention is one-shot per turn, like v1's `contextWrapupAttempts`. */
+	contextWrapupAttempts: number
 	/** Set when a failure-triggered recovery is pending, so the delayed prompt isn't cancelled by the failure's own idle transition. */
 	pendingRecoveryArmed: boolean
 
@@ -159,6 +176,8 @@ interface SessionWatch {
 	// Agent/model from last step (informational logging only; sessions are stateful in v2)
 	agent?: string
 	model?: string
+	/** `Model.Ref` from the last step, for the usable-context lookup. */
+	modelRef?: { providerID: string; modelID: string }
 }
 
 export interface AutoResumeOptions {
@@ -270,6 +289,13 @@ function appendLogFile(target: string, level: string, line: string): void {
 		// propagate into the recovery path.
 	}
 }
+
+/**
+ * The command magic-context registers to reclaim context on a saturated parent.
+ * Sent through `session.command` rather than as prompt text, because prompt text is
+ * not expanded into a command.
+ */
+const CTX_WRAPUP_TRIGGER = "ctx-wrapup"
 
 // ---------------------------------------------------------------------------
 // Constants & defaults
@@ -742,6 +768,9 @@ export default define({
 		// Live since the v2 discovery sweep landed (see discoverSessions).
 		const discoveryDelayMs = opts.discoveryDelayMs ?? DEFAULT_DISCOVERY_DELAY_MS
 		const minActivityGapMs = opts.minActivityGapMs ?? DEFAULT_MIN_ACTIVITY_GAP_MS
+		// Live since the v2 token read landed (see tokenTotalOf / checkContextSaturation).
+		const contextSaturationThreshold = opts.contextSaturationThreshold ?? DEFAULT_CONTEXT_SATURATION_THRESHOLD
+		const subagentNativeCompactionEnabled = opts.subagentNativeCompactionEnabled ?? false
 		const streamingFailureErrorNames = opts.streamingFailureErrorNames ?? DEFAULT_STREAMING_FAILURE_ERROR_NAMES
 		const streamingFailureMessagePatterns = opts.streamingFailureMessagePatterns ?? DEFAULT_STREAMING_FAILURE_MESSAGE_PATTERNS
 		const doneWithoutDetailsPrompt = opts.doneWithoutDetailsPrompt ?? DONE_WITHOUT_DETAILS_PROMPT
@@ -782,8 +811,6 @@ export default define({
 		// and the gap is documented rather than surprising. See
 		// docs/known-issues-v2.md.
 		const FEATURE_GATED_OPTIONS = [
-			"contextSaturationThreshold",
-			"subagentNativeCompactionEnabled",
 			"silentDeadStreamMinTokens",
 			"subagentWaitMs",
 			"toolTextCheckDelayMs",
@@ -932,6 +959,8 @@ export default define({
 					doneClaimAttempts: 0,
 					intentNudgeAttempts: 0,
 					completionSignaled: false,
+					lastTokenTotal: 0,
+					contextWrapupAttempts: 0,
 					pendingRecoveryArmed: false,
 					permissionPending: false,
 					permissionPendingAt: null,
@@ -1581,6 +1610,13 @@ async function inspectOnIdle(sid: string) {
 					dbg(`${short(sid)} done-claim carries a work description — skipping details prompt`)
 				}
 			}
+
+			// A full context window is a separate failure mode from a stalled one: the
+			// session keeps working happily until it chokes. Judged last, because it is
+			// the only check here that acts on the session rather than the text, and a
+			// saturated session that also produced a terse done-claim wants the
+			// reclamation, not the details prompt.
+			await checkContextSaturation(sid)
 		}
 
 		// ---------------------------------------------------------------------
@@ -1711,21 +1747,100 @@ async function inspectOnIdle(sid: string) {
 		}, discoveryDelayMs)
 
 		// ---------------------------------------------------------------------
-		// Session discovery
+		// Context saturation
 		// ---------------------------------------------------------------------
 
 		/**
+		 * v2 emits `session.usage.updated` with the session's current usage, so the
+		 * token count is read rather than reconstructed. `TokenUsage.total` in the
+		 * schema sums input + output + reasoning + cache read + cache write; v1
+		 * accumulated the same way.
+		 */
+		function tokenTotalOf(tokens: unknown): number {
+			if (!tokens || typeof tokens !== "object") return 0
+			const t = tokens as {
+				input?: number
+				output?: number
+				reasoning?: number
+				cache?: { read?: number; write?: number }
+			}
+			const cache = t.cache ?? {}
+			return posNum(t.input) + posNum(t.output) + posNum(t.reasoning) + posNum(cache.read) + posNum(cache.write)
+		}
+		function posNum(v: unknown): number {
+			return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0
+		}
+
+		/**
+		 * The usable context window for a session's model: the full window minus the
+		 * smaller of a 20k output reserve and the model's own output limit. This is
+		 * v1's arithmetic (`limit.context - Math.min(20_000, limit.output)`), kept
+		 * identical so the same threshold means the same thing on both builds.
+		 *
+		 * v2 hands the limit over directly on `ctx.model.get()` — `Model.Info.limit`
+		 * is `{ context, input?, output }` — where v1 had to walk the raw provider
+		 * list. Cached per model, because the answer never changes at runtime.
+		 */
+		const usableLimitCache = new Map<string, number>()
+		async function getUsableContextLimit(sid: string): Promise<number | null> {
+			try {
+				let ref = sessions.get(sid)?.modelRef
+				if (!ref) {
+					// No step observed yet (plugin loaded mid-session): take the ref off
+					// the newest assistant message instead.
+					const msgs = await ctx.session.context({ sessionID: sid })
+					if (Array.isArray(msgs)) {
+						for (let i = msgs.length - 1; i >= 0; i--) {
+							const m = msgs[i] as {
+								type?: string
+								model?: { providerID?: string; id?: string; modelID?: string }
+							}
+							if (m?.type !== "assistant" || !m.model) continue
+							const providerID = m.model.providerID
+							const modelID = m.model.modelID ?? m.model.id
+							if (typeof providerID === "string" && typeof modelID === "string") {
+								ref = { providerID, modelID }
+								const w = sessions.get(sid)
+								if (w) w.modelRef = ref
+							}
+							break
+						}
+					}
+				}
+				if (!ref) return null
+				const key = `${ref.providerID}/${ref.modelID}`
+				const cached = usableLimitCache.get(key)
+				if (cached !== undefined) return cached
+
+				const info = (ctx.model as any)?.get?.(ref.providerID, ref.modelID)
+				if (!info) return null
+				const limit = (info as { limit?: { context?: number; output?: number } }).limit
+				if (!limit || typeof limit.context !== "number" || limit.context === 0) return null
+				const usable = limit.context - Math.min(20_000, limit.output ?? 0)
+				if (!Number.isFinite(usable) || usable <= 0) return null
+				usableLimitCache.set(key, usable)
+				return usable
+			} catch (e) {
+				dbg(`usable-context-limit lookup failed for ${short(sid)}:`, e instanceof Error ? e.message : String(e))
+				return null
+			}
+		}
+
+		/**
 		 * v2 hands plugins a narrowed `ctx.session` domain (see
-		 * `packages/plugin/src/promise/session.ts`) that omits `list` and
-		 * `active`, so both are read defensively: off the session domain first,
+		 * `packages/plugin/src/promise/session.ts`) that omits `list`, `active` and
+		 * `compact`, so those are read defensively: off the session domain first,
 		 * then off the raw client. A host that supplies neither degrades to the
 		 * event-derived busy set rather than failing.
+		 *
+		 * `args` matters for the client's methods, which take a request object
+		 * (`{ sessionID }`), unlike the plugin-domain wrappers.
 		 */
-		async function callSessionApi<T>(name: string): Promise<T | undefined> {
+		async function callSessionApi<T>(name: string, args?: Record<string, unknown>): Promise<T | undefined> {
 			const fromDomain = (ctx.session as any)[name]
 			if (typeof fromDomain === "function") {
 				try {
-					return (await fromDomain.call(ctx.session)) as T
+					return (await fromDomain.call(ctx.session, args)) as T
 				} catch (e) {
 					dbg(`ctx.session.${name}() failed:`, e instanceof Error ? e.message : String(e))
 				}
@@ -1733,12 +1848,48 @@ async function inspectOnIdle(sid: string) {
 			const fromClient = ctx.client?.session?.[name as "get"]
 			if (typeof fromClient === "function") {
 				try {
-					return (await (fromClient as any).call(ctx.client!.session)) as T
+					return (await (fromClient as any).call(ctx.client!.session, args)) as T
 				} catch (e) {
 					dbg(`ctx.client.session.${name}() failed:`, e instanceof Error ? e.message : String(e))
 				}
 			}
 			return undefined
+		}
+
+		/**
+		 * Is magic-context installed?
+		 *
+		 * v1 read `config.get().plugin`. v2 has no `config` domain on the plugin
+		 * context, but `ctx.plugin.list()` carries the same information in the
+		 * server's own words: `Plugin.Info[]` with an `id` plus a `source` that is a
+		 * package spec, a local path, or an SDK module. Matching id *and* source is
+		 * what makes this work regardless of how the plugin was installed.
+		 *
+		 * Cached, negative verdict included — an idle check must not re-list plugins.
+		 */
+		let magicContextDetected: boolean | null = null
+		async function isMagicContextInstalled(): Promise<boolean> {
+			if (magicContextDetected !== null) return magicContextDetected
+			try {
+				const list = (ctx.plugin as any)?.list
+				if (typeof list !== "function") {
+					dbg("magic-context detection: ctx.plugin.list unavailable, treating as not installed")
+					return false
+				}
+				const plugins = unwrapList(await list.call(ctx.plugin)) as Array<{ id?: string; source?: unknown }>
+				magicContextDetected = plugins.some((p) => {
+					const id = typeof p?.id === "string" ? p.id : ""
+					if (id.toLowerCase().includes("magic-context")) return true
+					const src = p?.source as { target?: string; path?: string } | undefined
+					const spec = src?.target ?? src?.path ?? ""
+					return typeof spec === "string" && spec.toLowerCase().includes("magic-context")
+				})
+				dbg(`magic-context detection: ${magicContextDetected ? "installed" : "not installed"}`)
+				return magicContextDetected
+			} catch (e) {
+				dbg("magic-context detection failed, treating as not installed:", e instanceof Error ? e.message : String(e))
+				return false
+			}
 		}
 
 		/** Unwrap the `{ data }` envelope the client uses, or pass an array through. */
@@ -1749,6 +1900,78 @@ async function inspectOnIdle(sid: string) {
 				if (Array.isArray(data)) return data as Array<Record<string, unknown>>
 			}
 			return []
+		}
+
+		/**
+		 * v1's saturation routing, ported to the v2 API.
+		 *
+		 * A session can fill its window without stalling — it just keeps working
+		 * until it chokes. On idle, when used/usable crosses the threshold, routing
+		 * depends on session kind:
+		 *
+		 *   subagent — opt-in only (`subagentNativeCompactionEnabled`). v1 called
+		 *             `session.summarize()`; v2 spells it `session.compact`, which
+		 *             is NOT in the plugin `session` Pick, so it goes through the same
+		 *             defensive lookup as `list`/`active`.
+		 *   parent   — only when magic-context is installed, because its setup
+		 *             disables native compaction and compacting here would
+		 *             double-compress. v1 sent the `ctx-wrapup` command through the
+		 *             client; `session.command` IS on the plugin domain in v2.
+		 *
+		 * Fail-safe, as in v1: a missing limit, a missing token count, a user
+		 * cancellation, or a signalled completion means no intervention at all.
+		 * The intervention is one-shot per turn.
+		 */
+		async function checkContextSaturation(sid: string): Promise<void> {
+			const w = sessions.get(sid)
+			if (!w) return
+			if (w.lastTokenTotal <= 0) return
+			if (w.contextWrapupAttempts >= 1) return
+			if (w.userCancelled || w.completionSignaled || w.aborting) return
+
+			const usable = await getUsableContextLimit(sid)
+			if (!usable) return
+			if (w.lastTokenTotal / usable < contextSaturationThreshold) return
+
+			const pct = Math.round((w.lastTokenTotal / usable) * 100)
+			if (await isSubAgentSession(sid)) {
+				if (!subagentNativeCompactionEnabled) {
+					dbg(`${short(sid)} subagent at ${pct}% of usable context; native compaction is opt-in`)
+					return
+				}
+				w.contextWrapupAttempts++
+				log(
+					"warn",
+					`${short(sid)} context saturation (subagent): ${w.lastTokenTotal}/${usable} tokens (${pct}% of usable); triggering native compaction`,
+				)
+				// Re-check the latches: the awaits above left a window for the user
+				// to cancel in.
+				if (w.userCancelled || w.completionSignaled) return
+				const compacted = await callSessionApi<unknown>("compact", { sessionID: sid })
+				if (compacted === undefined) {
+					log("warn", `${short(sid)} native compaction is not exposed on this host — skipping`)
+				}
+				return
+			}
+
+			if (!(await isMagicContextInstalled())) {
+				dbg(`${short(sid)} at ${pct}% of usable context; magic-context not installed, not intervening`)
+				return
+			}
+			w.contextWrapupAttempts++
+			log(
+				"warn",
+				`${short(sid)} context saturation: ${w.lastTokenTotal}/${usable} tokens (${pct}% of usable); sending magic-context wrapup command`,
+			)
+			if (w.userCancelled || w.completionSignaled) return
+			try {
+				await (ctx.session as any).command({ sessionID: sid, name: CTX_WRAPUP_TRIGGER })
+			} catch (e) {
+				log(
+					"warn",
+					`${short(sid)} magic-context wrapup command failed: ${e instanceof Error ? e.message : String(e)}`,
+				)
+			}
 		}
 
 		/**
@@ -1829,6 +2052,21 @@ async function inspectOnIdle(sid: string) {
 					markBusy(sid)
 					return
 				}
+				case "session.usage.updated": {
+					// The session's current context usage. `tokenTotalOf` mirrors
+					// `TokenUsage.total` in the schema (input + output + reasoning +
+					// cache read + cache write) so the ratio means the same thing here
+					// as in v1, which accumulated the same five fields.
+					const sid = sidOf(ev)
+					if (!sid) return
+					const total = tokenTotalOf(ev.data?.tokens)
+					if (total <= 0) return
+					const w = ensureWatch(sid)
+					w.lastTokenTotal = total
+					dbg(`${short(sid)} usage: ${total} tokens`)
+					return
+				}
+
 				case "session.execution.succeeded":
 				case "session.idle": {
 					const sid = sidOf(ev)
@@ -1940,10 +2178,19 @@ async function inspectOnIdle(sid: string) {
 					if (!sid) return
 					const w = ensureWatch(sid)
 					w.agent = typeof ev.data?.agent === "string" ? ev.data.agent : w.agent
-					w.model =
-						ev.data?.model && typeof ev.data.model === "object"
-							? `${ev.data.model.providerID ?? ev.data.model.provider ?? "?"}/${ev.data.model.modelID ?? ev.data.model.id ?? "?"}`
-							: w.model
+					{
+						const m = ev.data?.model as { providerID?: string; provider?: string; modelID?: string; id?: string } | undefined
+						const providerID = m?.providerID ?? m?.provider
+						const modelID = m?.modelID ?? m?.id
+						if (typeof providerID === "string" && typeof modelID === "string") {
+							w.modelRef = { providerID, modelID }
+							w.model = `${providerID}/${modelID}`
+						} else if (m) {
+							w.model = `${providerID ?? "?"}/${modelID ?? "?"}`
+						} else {
+							w.model = w.model
+						}
+					}
 					w.lastWasTaskTool = false
 					markBusy(sid)
 					return
