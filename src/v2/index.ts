@@ -91,6 +91,12 @@ interface AutoResumePluginInput {
 	 * routing a saturated parent to it.
 	 */
 	plugin?: { list: () => Promise<unknown> }
+	/**
+	 * Key/value store scoped to the plugin (`ctx.storage.get/set/remove/scan`).
+	 * Read-only here: auto-resume does not own a todo list, it reads the one the
+	 * installed todo tool writes, so this only ever calls `get`.
+	 */
+	storage?: { get: (key: string) => Promise<unknown> }
 	/** Application logger, when the host provides one. */
 	app?: { log?: (level: string, message: string) => unknown }
 }
@@ -144,10 +150,25 @@ interface SessionWatch {
 	toolTextAttempts: number
 	continueTimestamps: number[]
 	doneClaimAttempts: number
+	/** Done-claim with todos still open. Separate from `doneClaimAttempts`: the two
+	 * prompts ask for different things, so spending one budget must not silence the other. */
+	doneClaimOpenTodosAttempts: number
+	/** Open-todos reminders (the celebration false positive). Persists across turns —
+	 * an open list does not become finished by the model saying it is. */
+	todoNudgeAttempts: number
 	intentNudgeAttempts: number
 	/** Set when the model's own completion signal was seen (a trailing 🎉).
 	 * Latches so a finished session stops being nudged. */
 	completionSignaled: boolean
+	/** The session's todo list, read from the todo tool's storage key. */
+	todos: Todo[]
+	todosFetchedAt: number
+	/** Id of the newest inbound user message already acted on, so a replayed or
+	 * re-delivered message does not re-arm the done-claim budgets. Identity, not
+	 * clock time — see noteInboundUserMessage. */
+	lastUserMessageID?: string
+	/** Timestamp fallback for the same check, for messages carrying no id. */
+	lastUserMessageSeenAt: number
 	/** Tokens currently in the context window, from `session.usage.updated`. */
 	lastTokenTotal: number
 	/** Saturation intervention is one-shot per turn, like v1's `contextWrapupAttempts`. */
@@ -331,6 +352,8 @@ const DEFAULT_TOOL_TEXT_CHECK_DELAY_MS = 3_000
 const DEFAULT_SUBAGENT_WAIT_MS = 15_000
 const DEFAULT_SILENT_DEAD_STREAM_MIN_TOKENS = 200
 const DEFAULT_CONTEXT_SATURATION_THRESHOLD = 0.85
+/** How long a fetched todo list is trusted before being re-read. */
+const TODO_CACHE_TTL_MS = 3_000
 const DEFAULT_MAX_RECOVERY_RETRIES = 2
 // Referenced from FEATURE_GATED_OPTIONS docs; kept so the intended v1 default is
 // recorded next to the gate that explains why it is not applied yet.
@@ -612,14 +635,58 @@ function containsWorkDescription(text: string): boolean {
 /**
  * True when the last assistant turn closes with a celebration emoji.
  *
- * A 🎉 is the model's own "I finished" signal. v1 uses it to latch completion
- * rather than keep nudging — but only when no work is left, otherwise a
- * premature 🎉 would be treated as a real finish. Ported without the todo
- * cross-check, so on v2 it latches on the emoji alone.
+ * A 🎉 is the model's own "I finished" signal, used to latch completion rather
+ * than keep nudging. The emoji alone is not trustworthy: a model that finishes
+ * early celebrates early, and latching on that turns a false positive into
+ * silence. The todo cross-check that catches it lives at the call site, where
+ * the fetched list is in hand.
  */
 function endsWithCelebration(text: string): boolean {
 	const normalized = text.trim().replace(/[.!?]+$/, "")
 	return normalized.endsWith("🎉")
+}
+
+/**
+ * One entry of a session's todo list.
+ *
+ * Read from the todo tool that is already installed, not from a list this
+ * plugin keeps. The record shape is the one `todowrite` writes —
+ * `storage.set("todos/<sessionID>", {todos, updatedAt})` — so whatever todo
+ * tool the session uses is what this sees, and auto-resume never has to own a
+ * second copy that can drift.
+ */
+interface Todo {
+	content: string
+	status: "pending" | "in_progress" | "completed" | "cancelled"
+	priority: "high" | "medium" | "low"
+}
+
+function isOpenTodo(t: Todo): boolean {
+	return t.status === "pending" || t.status === "in_progress"
+}
+
+function getOpenTodos(todos: Todo[]): Todo[] {
+	if (!Array.isArray(todos)) return []
+	return todos.filter(isOpenTodo)
+}
+
+/**
+ * The prompt for a turn that claims to be finished with work still listed.
+ *
+ * Names the open items rather than saying "continue", because the model has
+ * already decided it is done — a bare continuation prompt gets answered with
+ * another done-claim. Falls back to a plain "continue" when the list is
+ * unusable, which is strictly better than sending an empty reminder.
+ */
+function buildOpenTodosReminder(todos: Todo[]): string {
+	if (!Array.isArray(todos)) return "continue"
+	const open = todos.filter(isOpenTodo)
+	if (open.length === 0) return "continue"
+	const list = open.map((t, i) => `${i + 1}. [${t.status}] ${t.content}`).join("\n")
+	const plural = open.length > 1 ? "s" : ""
+	const taskWord = open.length > 1 ? "tasks" : "task"
+	const thisWord = open.length > 1 ? "these" : "this"
+	return `You have ${open.length} unfinished task${plural}:\n${list}\n\nPlease continue working on ${thisWord} ${taskWord}.`
 }
 
 /** Model ends with ":" announcing intent without executing. */
@@ -776,6 +843,9 @@ export default define({
 		const streamingFailureErrorNames = opts.streamingFailureErrorNames ?? DEFAULT_STREAMING_FAILURE_ERROR_NAMES
 		const streamingFailureMessagePatterns = opts.streamingFailureMessagePatterns ?? DEFAULT_STREAMING_FAILURE_MESSAGE_PATTERNS
 		const doneWithoutDetailsPrompt = opts.doneWithoutDetailsPrompt ?? DONE_WITHOUT_DETAILS_PROMPT
+		// Live since the todo read landed (see readTodos): a done-claim with items still
+		// listed gets this prompt instead of the details prompt.
+		const doneWithoutWorkPrompt = opts.doneWithoutWorkPrompt ?? DONE_WITHOUT_WORK_PROMPT
 		const thinkingToolRecoveryPrompt = opts.thinkingToolRecoveryPrompt ?? THINKING_TOOL_RECOVERY_PROMPT
 
 		/** Compile a user-supplied regex-source list, skipping anything invalid. */
@@ -815,7 +885,6 @@ export default define({
 		const FEATURE_GATED_OPTIONS = [
 			"subagentWaitMs",
 			"toolTextCheckDelayMs",
-			"doneWithoutWorkPrompt",
 		] as const
 
 		// Options this build understands. Anything else in the user's config is
@@ -957,8 +1026,13 @@ export default define({
 					toolTextAttempts: 0,
 					continueTimestamps: [],
 					doneClaimAttempts: 0,
+					doneClaimOpenTodosAttempts: 0,
+					todoNudgeAttempts: 0,
 					intentNudgeAttempts: 0,
 					completionSignaled: false,
+					todos: [],
+					todosFetchedAt: 0,
+					lastUserMessageSeenAt: 0,
 					lastTokenTotal: 0,
 					contextWrapupAttempts: 0,
 					pendingRecoveryArmed: false,
@@ -994,7 +1068,16 @@ export default define({
 				// hallucination-loop detector counts across busy cycles by design.
 				w.resumeAttempts = 0
 				w.toolTextAttempts = 0
-				w.doneClaimAttempts = 0
+				// Deliberately NOT resetting doneClaimAttempts / doneClaimOpenTodosAttempts.
+				// v1 moved both out of the busy-cycle reset for a reason (#26): a model
+				// that keeps re-announcing completion would get a fresh budget on every
+				// turn it announced, so the nudge never stopped. They re-arm only on a
+				// genuine new work cycle — an inbound user message, via
+				// noteInboundUserMessage().
+				// The open-todos nudge is the opposite case and does reset here: an open
+				// list is new information each turn, not a model that keeps saying the
+				// same thing.
+				w.todoNudgeAttempts = 0
 				w.intentNudgeAttempts = 0
 				// A new turn re-opens the question of whether the work is finished.
 				w.completionSignaled = false
@@ -1409,7 +1492,53 @@ export default define({
 		}
 
 		/** Targeted recovery prompts (tool-as-text, done-claims, intent nudges). */
-		async function targetedRecovery(sid: string, kind: string, prompt: string, budgetKey: "toolTextAttempts" | "doneClaimAttempts" | "intentNudgeAttempts") {
+		/**
+		 * Read the session's todo list.
+		 *
+		 * v1 tracked todos from a `todo.updated` event and a server API. v2 has
+		 * neither: the todo table exists in the v2 database but no route reaches
+		 * it and nothing emits an event for it. What v2 does have is the storage
+		 * domain, and the installed todo tool already writes the list there under
+		 * a stable, per-session key.
+		 *
+		 * So this reads the key rather than owning a list. That is the difference
+		 * between a second copy that can drift and the real one — and it means
+		 * auto-resume works with whichever todo tool is installed instead of
+		 * requiring its own.
+		 *
+		 * Cached for a short TTL: this is read on every idle inspection, and the
+		 * list can only change while the model is working, which is not when we
+		 * ask. Returns `[]` on any failure — every caller treats "no list" as
+		 * "cannot conclude", never as "nothing is open".
+		 */
+		async function readTodos(sid: string): Promise<Todo[]> {
+			const w = ensureWatch(sid)
+			const now = Date.now()
+			if (w.todosFetchedAt && now - w.todosFetchedAt < TODO_CACHE_TTL_MS) return w.todos
+			if (!ctx.storage) return w.todos
+			try {
+				const raw = await ctx.storage.get(`todos/${sid}`)
+				const record = raw as { todos?: unknown; updatedAt?: unknown } | null | undefined
+				const list = Array.isArray(record?.todos) ? record.todos : []
+				w.todos = list.filter(
+					(t): t is Todo =>
+						!!t && typeof t === "object" && typeof (t as Todo).content === "string" &&
+						typeof (t as Todo).status === "string",
+				)
+				w.todosFetchedAt = now
+				return w.todos
+			} catch (e) {
+				dbg(`${short(sid)} todo read failed:`, e instanceof Error ? e.message : String(e))
+				return w.todos
+			}
+		}
+
+		async function targetedRecovery(
+			sid: string,
+			kind: string,
+			prompt: string,
+			budgetKey: "toolTextAttempts" | "doneClaimAttempts" | "doneClaimOpenTodosAttempts" | "todoNudgeAttempts" | "intentNudgeAttempts",
+		) {
 			const w = ensureWatch(sid)
 			if (w.recovering || w.userCancelled || w.permissionPending) return
 			if (w.compacting) {
@@ -1667,9 +1796,56 @@ export default define({
 	}
 }
 
-async function inspectOnIdle(sid: string) {
+/**
+		 * Re-arm the done-claim budgets when a genuinely new work cycle starts.
+		 *
+		 * The signal is an inbound user message, and what makes one genuine is that
+		 * it is a *different* message — identified by id, not by timestamp. A
+		 * re-delivered or replayed message has the same id and is not new work;
+		 * comparing clock times instead would treat any drift between two reads of
+		 * the history as a new request and hand the model a fresh budget every time
+		 * it repeated itself, which is exactly what #26 was. Timestamps are only the
+		 * fallback, for messages that carry no id.
+		 *
+		 * The history is already loaded, so this costs nothing extra.
+		 *
+		 * Doing this only here (and not on every busy cycle) is the #26 fix: a model
+		 * that re-announces completion each turn would otherwise be handed a fresh
+		 * budget each time it announced, and the nudge would never stop.
+		 */
+		function noteInboundUserMessage(sid: string, w: SessionWatch, messages: unknown[]): void {
+			let latest: { id?: string; at?: number } | null = null
+			for (let i = messages.length - 1; i >= 0; i--) {
+				const m = messages[i] as {
+					id?: string
+					type?: string
+					role?: string
+					time?: { created?: number }
+					info?: { time?: { created?: number }; role?: string }
+				}
+				const isUser = m?.type === "user" || m?.role === "user" || m?.info?.role === "user"
+				if (!isUser) continue
+				latest = { id: typeof m.id === "string" ? m.id : undefined, at: m.time?.created ?? m.info?.time?.created }
+				break
+			}
+			if (!latest) return
+			const isNew = latest.id
+				? latest.id !== w.lastUserMessageID
+				: typeof latest.at === "number" && latest.at > w.lastUserMessageSeenAt
+			if (!isNew) return
+			w.lastUserMessageID = latest.id
+			if (typeof latest.at === "number") w.lastUserMessageSeenAt = latest.at
+			if (w.doneClaimAttempts > 0 || w.doneClaimOpenTodosAttempts > 0) {
+				dbg(`${short(sid)} new user message — re-arming the done-claim budgets`)
+			}
+			w.doneClaimAttempts = 0
+			w.doneClaimOpenTodosAttempts = 0
+		}
+
+		async function inspectOnIdle(sid: string) {
 			const w = ensureWatch(sid)
 			const messages = await loadMessages(sid)
+			noteInboundUserMessage(sid, w, messages)
 
 			// Judged first, and before anything that needs text: a stream that died
 			// before delivering any text is precisely the case where every
@@ -1700,10 +1876,28 @@ async function inspectOnIdle(sid: string) {
 			// work finished, so nudging here would talk over a deliberate stop.
 			// Latched rather than re-derived, because the next idle with no new text
 			// would otherwise re-check the same turn forever.
+			//
+			// Cross-checked against the todo list, because the emoji alone is not
+			// trustworthy: a model that finishes early celebrates early, and latching
+			// on that turns a false positive into permanent silence. With work still
+			// listed, the celebration is a false positive and the right answer is to
+			// name what is unfinished.
 			if (endsWithCelebration(text)) {
+				const open = getOpenTodos(await readTodos(sid))
+				if (open.length > 0) {
+					// Deliberately not latching: the list is still open, so this turn is
+					// not a completion and the next one must be free to judge again.
+					await targetedRecovery(
+						sid,
+						"open-todos-celebration-false-positive",
+						buildOpenTodosReminder(open),
+						"todoNudgeAttempts",
+					)
+					return
+				}
 				if (!w.completionSignaled) {
 					w.completionSignaled = true
-					log("info", `${short(sid)} turn ends with a celebration — latching completion, not nudging`)
+					log("info", `${short(sid)} turn ends with a celebration and no open todos — latching completion, not nudging`)
 				} else {
 					dbg(`${short(sid)} completion already latched — skipping`)
 				}
@@ -1731,16 +1925,26 @@ async function inspectOnIdle(sid: string) {
 				await targetedRecovery(sid, "action-intent", opts.actionIntentPrompt ?? opts.continuePrompt ?? CONTINUE_PROMPT, "intentNudgeAttempts")
 				return
 			}
-			if (containsDoneClaimPattern(text, doneClaimPatterns) && w.doneClaimAttempts < maxRetries) {
-				// Ask once for the work report. v2 used to gate this on a 400-char
-				// length, which cannot tell "Task done." from a real summary and so
-				// both over-nudged terse reports and let short-but-real ones pass.
-				// containsWorkDescription is the same structural test v1 uses, and
-				// prompting again after a real report loops forever (#26).
-				if (!containsWorkDescription(text)) {
-					await targetedRecovery(sid, "done-claim-no-details", doneWithoutDetailsPrompt, "doneClaimAttempts")
-				} else {
-					dbg(`${short(sid)} done-claim carries a work description — skipping details prompt`)
+			if (containsDoneClaimPattern(text, doneClaimPatterns)) {
+				// Two different prompts for two different situations, which is why the
+				// budgets are separate: spending the details prompt must not silence the
+				// one that says work is still listed.
+				const open = getOpenTodos(await readTodos(sid))
+				if (open.length > 0) {
+					await targetedRecovery(sid, "done-claim-open-todos", doneWithoutWorkPrompt, "doneClaimOpenTodosAttempts")
+					return
+				}
+				if (w.doneClaimAttempts < maxRetries) {
+					// Ask once for the work report. v2 used to gate this on a 400-char
+					// length, which cannot tell "Task done." from a real summary and so
+					// both over-nudged terse reports and let short-but-real ones pass.
+					// containsWorkDescription is the same structural test v1 uses, and
+					// prompting again after a real report loops forever (#26).
+					if (!containsWorkDescription(text)) {
+						await targetedRecovery(sid, "done-claim-no-details", doneWithoutDetailsPrompt, "doneClaimAttempts")
+					} else {
+						dbg(`${short(sid)} done-claim carries a work description — skipping details prompt`)
+					}
 				}
 			}
 

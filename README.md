@@ -231,6 +231,8 @@ Repeat calls with no new user message in between are guarded: the first acknowle
 
 An assistant message ending with 🎉 resets the tool-text timer and prevents a trigger — the emoji signals the agent considers the task complete.
 
+The emoji alone is not trusted: a model that finishes early celebrates early, and latching on that turns a false positive into silence. Both builds cross-check the session's todo list first, and with items still open the 🎉 is treated as a false positive — the reminder names what is unfinished instead. See [The todo list](docs/known-issues-v2.md#the-todo-list) for how v2 reads that list.
+
 ---
 
 ### Ready-to-continue auto-resume
@@ -315,6 +317,14 @@ Aborts the active run, then continues. The only family that can unblock a live r
 Paths: orphan parent, subagent stuck (parent side), hallucination loop, streaming-failure escalation. All aborts pass the active-tool guards first, and plugin-initiated aborts are marked so they are not mistaken for user ESC (`session.error` → `MessageAbortedError` race).
 
 ## Architecture
+
+The diagram below is v1's: it is drawn against the v1 SSE event stream, the v1
+`todo.updated` event and the v1 `session.todo()` API. The v2 build reads the same
+information through different doors — `session.usage.updated` for tokens,
+`ctx.model.get()` for the window, `ctx.plugin.list()` to detect magic-context,
+`ctx.session.context()` for message history, and `ctx.storage` for the todo list
+(the v2 `todo` table has no route and emits no event). See
+[docs/known-issues-v2.md](docs/known-issues-v2.md) for each substitution.
 
 ```
 Any SSE Event
@@ -456,7 +466,7 @@ Defaults are the same on v1 and v2 unless a row says otherwise.
 | `actionIntentPrompt` | same as `continuePrompt` | Prompt sent on action-intent detection |
 | `toolTextRecoveryPrompt` | `TOOL_TEXT_RECOVERY_PROMPT` | Override the tool-call-as-text recovery prompt |
 | `thinkingToolRecoveryPrompt` | `THINKING_TOOL_RECOVERY_PROMPT` | Override the thinking-tool recovery prompt |
-| `doneWithoutWorkPrompt` | `DONE_WITHOUT_WORK_PROMPT` | Override the done-claim-with-open-todos prompt |
+| `doneWithoutWorkPrompt` | `DONE_WITHOUT_WORK_PROMPT` | Override the done-claim-with-open-todos prompt. Needs a todo tool writing `todos/<sessionID>` into storage; without one it never fires |
 | `doneWithoutDetailsPrompt` | `DONE_WITHOUT_DETAILS_PROMPT` | Override the done-claim-with-no-todos report prompt |
 | `doneClaimPatterns` | `DONE_CLAIM_PATTERNS` | Array of regex strings overriding the default done-claim detection patterns (case-insensitive, multiline). Invalid regexes are skipped. Empty array falls back to defaults. |
 | `readyToContinuePatterns` | `READY_TO_CONTINUE_PATTERNS` | Array of regex strings overriding the default ready-to-continue detection patterns (case-insensitive). Invalid regexes are skipped. Empty array falls back to defaults. |
@@ -468,8 +478,7 @@ Defaults are the same on v1 and v2 unless a row says otherwise.
 | `injectIntervalMs` | v2 only | Minimum gap between recovery injections for one session. No v1 equivalent |
 | `logFile` | v2 only | Where this build appends its log. v2 removed v1's server log endpoint, so without this the plugin is silent. Defaults to `~/.local/state/opencode-v2/auto-resume.log` |
 
-Accepted but **not applied** on v2: `subagentWaitMs`, `toolTextCheckDelayMs`,
-`doneWithoutWorkPrompt`. See
+Accepted but **not applied** on v2: `subagentWaitMs`, `toolTextCheckDelayMs`. See
 [docs/known-issues-v2.md](docs/known-issues-v2.md) for why.
 
 Message patterns are matched case-insensitively. Error names use exact match.

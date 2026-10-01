@@ -14,10 +14,11 @@ config keeps loading unchanged.
 | --- | --- |
 | `subagentWaitMs` | The v1 orphan-watch timer that this delays has no v2 counterpart; the v2 port decides parent-vs-stalled from its own event-derived busy set. |
 | `toolTextCheckDelayMs` | The delayed raw-tool-call-as-text re-check is v1's polling shape. v2 evaluates the text once, on idle, from the authoritative message history. |
-| `doneWithoutWorkPrompt` | Both v1 use sites for this prompt are gated on tracked todo state. v2 has no todo state, so the prompt has no trigger. |
 
-`doneWithoutDetailsPrompt` **is** applied on v2, and is the replacement for
-`doneWithoutWorkPrompt`: it fires on a terse done-claim regardless of todos.
+`doneWithoutDetailsPrompt` and `doneWithoutWorkPrompt` **are** both applied on
+v2, and they are the two halves of v1's done-claim handling: the first asks for a
+work report when there is no list to check, the second when the list still has
+items open.
 
 ## Unrecognised options warn once
 
@@ -126,9 +127,48 @@ construction. Two detectors run on the idle path instead, both ported from v1:
   stop. The latch is per-turn: a new turn re-opens the question, and a later
   idle with no new text does not re-derive it forever.
 
-v1 cross-checks both against tracked todo state before latching. v2 has no todo
-state yet, so the emoji latches on its own — see `doneWithoutWorkPrompt` in the
-inert table above for what that costs.
+v1 cross-checks both against tracked todo state before latching. v2 now does too —
+see "The todo list" below.
+
+## The todo list
+
+v1 tracked a session's todos from a `todo.updated` event, falling back to a server
+API. v2 has neither: the `todo` table is created in the v2 database (migration
+`20260127222353_familiar_lady_ursula.ts`) but no route reaches it and nothing
+emits an event for it, so there is no way to observe the list changing.
+
+What v2 does have is the storage domain, and the installed todo tool already
+writes the list there under a stable per-session key —
+`ctx.storage.set("todos/<sessionID>", { todos, updatedAt })`. auto-resume reads
+that key instead of owning a list of its own.
+
+The consequence worth stating: auto-resume is a **consumer**, not a second owner.
+It works with whichever todo tool is installed rather than requiring its own, and
+there is no copy to drift. It only ever calls `get`. With no `ctx.storage` at all,
+or with a record it cannot parse, it falls back to "no list" — which means the
+older behaviour (latch on the emoji, ask for details on a bare done-claim), never
+a nudge on the strength of a list it failed to read.
+
+Three places consume it:
+
+- **The 🎉 cross-check.** The emoji alone is not trustworthy: a model that
+  finishes early celebrates early, and latching on that turns a false positive
+  into permanent silence. With items still open, the celebration is a false
+  positive and the reminder names what is unfinished. This branch deliberately
+  does **not** latch, so the next turn is free to judge again.
+- **`doneWithoutWorkPrompt`.** A done-claim with open todos. Distinct from
+  `doneWithoutDetailsPrompt`, and on a separate budget — two different problems,
+  so spending one must not silence the other.
+- **`todoCheckAttempts`.** The last v1 use of the list that is not here: a turn
+  that says "ready to continue" while every todo is already closed gets two
+  chances before a plain `continue`.
+
+One fix came with the list. The done-claim budgets no longer reset on every busy
+cycle — only on a genuinely new inbound user message. v1 moved both out of the
+busy reset for #26: a model that re-announces completion each turn was otherwise
+handed a fresh budget each time it announced, so the nudge never stopped. v2
+still had that, and now does not. The open-todos nudge is the opposite case and
+does reset per cycle, because an open list is new information each turn.
 
 ## Context saturation
 

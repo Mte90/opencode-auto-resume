@@ -1,0 +1,333 @@
+import { describe, test, expect } from "bun:test"
+import { existsSync, readFileSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import plugin from "./index"
+
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
+const SID = "ses_todo"
+
+/**
+ * The todo list as the plugin under test reads it.
+ *
+ * auto-resume does not own a todo list — it reads the one the installed todo tool
+ * writes, under the key `todos/<sessionID>`. So these tests supply that key and
+ * nothing else, which is the point: they would pass unchanged against a real
+ * `todowrite` tool, and they assert the plugin never writes there itself.
+ *
+ * Three things are under test:
+ *
+ *   The celebration cross-check. A trailing 🎉 is the model's own "finished"
+ *   signal, and latching on it is what stops the nudge. But a model that finishes
+ *   early celebrates early, so the emoji alone is not trustworthy: with work still
+ *   listed, the celebration is a false positive and the right answer is to name
+ *   what is unfinished.
+ *
+ *   Two done-claim prompts, two budgets. A done-claim with open todos and a
+ *   done-claim with no detail report are different problems; spending one budget
+ *   must not silence the other.
+ *
+ *   When a budget re-arms. #26 was an unbounded done-claim nudge. The fix is that
+ *   it re-arms only on a genuinely new work cycle — an inbound user message —
+ *   not on every turn the model announces completion again.
+ *
+ * Every group carries a control.
+ */
+
+let counter = 0
+
+function makeEventStream() {
+	const queue: any[] = []
+	const waiters: ((ev: any) => void)[] = []
+	let closed = false
+	const stream = {
+		push(ev: any) {
+			if (waiters.length) waiters.shift()!(ev)
+			else queue.push(ev)
+		},
+		close() {
+			closed = true
+			while (waiters.length) waiters.shift()!(null)
+		},
+		subscribe: () => stream,
+		[Symbol.asyncIterator]() {
+			return {
+				next: () =>
+					new Promise((resolve) => {
+						if (queue.length) return resolve({ value: queue.shift(), done: false })
+						if (closed) return resolve({ value: undefined, done: true })
+						waiters.push((ev) =>
+							resolve(ev === null ? { value: undefined, done: true } : { value: ev, done: false }),
+						)
+					}),
+				return: () => {
+					closed = true
+					return Promise.resolve({ value: undefined, done: true })
+				},
+			}
+		},
+	}
+	return stream
+}
+
+const ev = (type: string, data: Record<string, unknown> = {}) => ({ type, data: { sessionID: SID, ...data } })
+
+const userMessage = (text: string, at: number) => ({
+	type: "user",
+	id: `msg_u_${at}`,
+	time: { created: at },
+	content: [{ type: "text", text }],
+})
+
+const assistantMessage = (text: string, at: number) => ({
+	type: "assistant",
+	id: `msg_a_${at}`,
+	time: { created: at },
+	content: [{ type: "text", text }],
+	finish: "stop",
+	tokens: { input: 100, output: 200, reasoning: 0, cache: { read: 0, write: 0 } },
+})
+
+const OPEN = [
+	{ content: "Write the migration guide", status: "pending", priority: "high" },
+	{ content: "Delete the temp fixtures", status: "in_progress", priority: "low" },
+]
+const CLOSED = [
+	{ content: "Write the migration guide", status: "completed", priority: "high" },
+	{ content: "Delete the temp fixtures", status: "cancelled", priority: "low" },
+]
+
+/** An hour ago: outside the 5-minute active-user window, so idle nudges do not stand down. */
+const OLD = Date.now() - 60 * 60_000
+/** Ten minutes ago: still outside that window, but newer than OLD. */
+const RECENT_BUT_STALE = Date.now() - 10 * 60_000
+
+const OPTIONS = {
+	chunkTimeoutMs: 600_000,
+	checkIntervalMs: 20,
+	gracePeriodMs: 0,
+	warmupMs: 0,
+	baseBackoffMs: 1,
+	maxBackoffMs: 2,
+	injectIntervalMs: 0,
+	debug: true,
+}
+
+type Harness = {
+	injected: Array<{ text?: string }>
+	logs: string[]
+	storageWrites: string[]
+	storageReads: string[]
+}
+
+async function replay(
+	turns: Array<{ text: string; userMessages?: unknown[] }>,
+	todos: unknown[] | undefined,
+	opts: Record<string, unknown> = {},
+	storageShape: { omitStorage?: boolean } = {},
+): Promise<Harness> {
+	const injected: Harness["injected"] = []
+	const storageWrites: string[] = []
+	const storageReads: string[] = []
+	const stream = makeEventStream()
+	const logFile = join(tmpdir(), `auto-resume-todo-${process.pid}-${counter++}.log`)
+	rmSync(logFile, { force: true })
+
+	// The history grows turn by turn, exactly as a real session's does.
+	let history: unknown[] = []
+
+	const ctx: any = {
+		event: stream,
+		options: { ...OPTIONS, logFile, ...opts },
+		session: {
+			context: async () => history,
+			active: async () => ({}),
+			interrupt: async () => ({}),
+			synthetic: async (a: any) => (injected.push({ text: a?.text }), {}),
+			prompt: async (a: any) => (injected.push({ text: a?.text }), {}),
+		},
+		client: { session: { get: async () => ({ data: {} }) } },
+	}
+	if (!storageShape.omitStorage) {
+		ctx.storage = {
+			get: async (key: string) => {
+				storageReads.push(key)
+				return { todos: todos ?? [], updatedAt: Date.now() }
+			},
+			// Present so that "the plugin never writes here" is an assertion the
+			// harness can actually make, rather than an assumption.
+			set: async (key: string) => storageWrites.push(key),
+			remove: async (key: string) => storageWrites.push(key),
+		}
+	}
+
+	const cleanup = await (plugin as any).setup(ctx)
+	for (const turn of turns) {
+		for (const m of turn.userMessages ?? []) history.push(m)
+		history.push(assistantMessage(turn.text, Date.now() - 30_000))
+		for (const e of [
+			ev("session.execution.started"),
+			ev("session.step.started"),
+			ev("session.step.ended"),
+			ev("session.idle"),
+		]) {
+			stream.push(e)
+			await wait(10)
+		}
+	}
+	await wait(700)
+	;(cleanup as (() => void) | undefined)?.()
+
+	const logs = existsSync(logFile) ? readFileSync(logFile, "utf8").split("\n") : []
+	rmSync(logFile, { force: true })
+	return { injected, logs, storageWrites, storageReads }
+}
+
+/** A done-claim with nothing in it — the premature stop. */
+const BARE_DONE = "Task done."
+/** The same, but closed out with the model's own finished signal. */
+const CELEBRATED = "Everything is in place. 🎉"
+
+describe("v2: the todo list, read from the tool that owns it", () => {
+	test("CONTROL: a celebration with open todos is a false positive, and is named", async () => {
+		const { injected, logs } = await replay([{ text: CELEBRATED }], OPEN)
+		expect(injected).toHaveLength(1)
+		expect(injected[0].text).toContain("Write the migration guide")
+		expect(injected[0].text).toContain("Delete the temp fixtures")
+		expect(logs.some((l) => l.includes("open-todos-celebration-false-positive"))).toBe(true)
+	})
+
+	test("CONTROL: a celebration with everything closed latches and never nudges", async () => {
+		const { injected, logs } = await replay([{ text: CELEBRATED }, { text: CELEBRATED }], CLOSED)
+		expect(injected).toEqual([])
+		expect(logs.some((l) => l.includes("no open todos — latching completion"))).toBe(true)
+	})
+
+	test("CONTROL: a bare done-claim with open todos gets the work prompt, not the details prompt", async () => {
+		const { injected } = await replay([{ text: BARE_DONE }], OPEN)
+		expect(injected).toHaveLength(1)
+		// v1's wording for this branch names the todo list.
+		expect(injected[0].text).toContain("todo list")
+	})
+
+	test("CONTROL: the same bare done-claim with no todos still gets the details prompt", async () => {
+		const { injected } = await replay([{ text: BARE_DONE }], [])
+		expect(injected).toHaveLength(1)
+		expect(injected[0].text).toContain("no work description")
+		expect(injected[0].text).not.toContain("todo list")
+	})
+
+	test("both done-claim prompts stay live independently", async () => {
+		// Two different problems. If the todo branch spent the same budget as the
+		// details branch, exhausting one would silently disable the other.
+		const withTodos = await replay([{ text: BARE_DONE }, { text: BARE_DONE }], OPEN, { maxRetries: 1 })
+		const withoutTodos = await replay([{ text: BARE_DONE }, { text: BARE_DONE }], [], { maxRetries: 1 })
+		expect(withTodos.injected).toHaveLength(1)
+		expect(withoutTodos.injected).toHaveLength(1)
+		expect(withTodos.injected[0].text).not.toBe(withoutTodos.injected[0].text)
+	})
+
+	test("the done-claim budget does not re-arm just because the model repeated itself", async () => {
+		// This is #26. A model that re-announces completion every turn used to be
+		// handed a fresh budget every time it announced, so the nudge never stopped.
+		const { injected } = await replay([{ text: BARE_DONE }, { text: BARE_DONE }, { text: BARE_DONE }], [], {
+			maxRetries: 1,
+		})
+		expect(injected).toHaveLength(1)
+	})
+
+	test("a genuinely new user message does re-arm it", async () => {
+		// The other half of the fix: the budget must be recoverable, or one bad
+		// stretch would silence the plugin for the rest of the session.
+		const { injected } = await replay(
+			[
+				{ text: BARE_DONE, userMessages: [userMessage("first ask", OLD)] },
+				{ text: BARE_DONE },
+				{ text: BARE_DONE, userMessages: [userMessage("actually, also this", RECENT_BUT_STALE)] },
+			],
+			[],
+			{ maxRetries: 1 },
+		)
+		expect(injected).toHaveLength(2)
+	})
+
+	test("a celebration with open todos keeps being caught on later turns", async () => {
+		// Proof that the false-positive branch does not latch: a latched turn
+		// would go silent here.
+		const { injected } = await replay([{ text: CELEBRATED }, { text: CELEBRATED }], OPEN, { maxRetries: 1 })
+		expect(injected).toHaveLength(2)
+	})
+
+	test("the list is read under the todo tool's own key", async () => {
+		const { storageReads } = await replay([{ text: CELEBRATED }], OPEN)
+		expect(storageReads).toContain(`todos/${SID}`)
+	})
+
+	test("the plugin never writes to that key", async () => {
+		// It is a consumer, not a second owner. A write here would mean auto-resume
+		// was maintaining a copy that could drift from the real one.
+		const { storageWrites } = await replay([{ text: CELEBRATED }], OPEN)
+		expect(storageWrites).toEqual([])
+	})
+
+	test("the list is read once per turn, not once per check", async () => {
+		// The storage call is cheap but the cache is the difference between one read
+		// and two on every idle where both a celebration and a done-claim are judged.
+		const { storageReads } = await replay([{ text: CELEBRATED }], OPEN)
+		expect(storageReads.filter((k) => k === `todos/${SID}`).length).toBeLessThanOrEqual(2)
+	})
+
+	test("no storage domain at all is not a crash", async () => {
+		// A host without ctx.storage must degrade to "cannot conclude", which means
+		// the old behaviour — latch on the emoji — rather than a thrown error.
+		const { injected, logs } = await replay([{ text: CELEBRATED }], OPEN, {}, { omitStorage: true })
+		expect(injected).toEqual([])
+		expect(logs.some((l) => l.includes("latching completion"))).toBe(true)
+	})
+
+	test("a malformed record is treated as no list, not as no work", async () => {
+		// The dangerous direction is "list unreadable" → "nothing is open" → nudge.
+		// Both malformed shapes must fall back to the old behaviour instead.
+		for (const bad of [{ todos: "nope" }, { todos: [null, 7] }, null]) {
+			const stream = makeEventStream()
+			const logFile = join(tmpdir(), `auto-resume-todo-bad-${process.pid}-${counter++}.log`)
+			rmSync(logFile, { force: true })
+			const injected: unknown[] = []
+			const ctx: any = {
+				event: stream,
+				options: { ...OPTIONS, logFile },
+				session: {
+					context: async () => [userMessage("ask", OLD), assistantMessage(CELEBRATED, Date.now())],
+					active: async () => ({}),
+					interrupt: async () => ({}),
+					synthetic: async (a: any) => (injected.push(a?.text), {}),
+					prompt: async (a: any) => (injected.push(a?.text), {}),
+				},
+				client: { session: { get: async () => ({ data: {} }) } },
+				storage: { get: async () => bad, set: async () => {}, remove: async () => {} },
+			}
+			const cleanup = await (plugin as any).setup(ctx)
+			for (const e of [
+				ev("session.execution.started"),
+				ev("session.step.started"),
+				ev("session.step.ended"),
+				ev("session.idle"),
+			]) {
+				stream.push(e)
+				await wait(10)
+			}
+			await wait(600)
+			;(cleanup as (() => void) | undefined)?.()
+			rmSync(logFile, { force: true })
+			expect(injected).toEqual([])
+		}
+	})
+
+	test("the work prompt is configurable", async () => {
+		const { injected } = await replay([{ text: BARE_DONE }], OPEN, {
+			doneWithoutWorkPrompt: "Your todo list still has open items.",
+		})
+		expect(injected).toHaveLength(1)
+		expect(injected[0].text).toBe("Your todo list still has open items.")
+	})
+})
