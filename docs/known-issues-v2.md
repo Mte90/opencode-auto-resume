@@ -12,7 +12,6 @@ config keeps loading unchanged.
 
 | Option | Why it is inert on v2 |
 | --- | --- |
-| `silentDeadStreamMinTokens` | The heuristic it tunes compares generated token count against a floor. That count is a single assistant message's output, not the session's cumulative usage, and v2 exposes no per-message stream for it. |
 | `subagentWaitMs` | The v1 orphan-watch timer that this delays has no v2 counterpart; the v2 port decides parent-vs-stalled from its own event-derived busy set. |
 | `toolTextCheckDelayMs` | The delayed raw-tool-call-as-text re-check is v1's polling shape. v2 evaluates the text once, on idle, from the authoritative message history. |
 | `thinkingToolRecoveryPrompt` | The thinking-contains-a-tool-call detector is part of the v1 idle-nudge pass and is not ported. |
@@ -162,3 +161,33 @@ Three v2 API shapes are worth recording, because each replaced something v1 had:
 The usable window is `limit.context - Math.min(20_000, limit.output)` — v1's
 arithmetic, kept identical so the same threshold means the same thing on both
 builds.
+
+## Silent dead stream
+
+A turn can end having produced nothing the user can see: reasoning only, or a
+finish reason the provider did not describe. OpenCode records the message as
+completed and the session goes idle, so no stall timer expires, no streaming
+failure fires, and the stall watchdog — which only looks at *busy* sessions —
+never sees it. v1's rule is unchanged on v2: walk back to the newest assistant
+message that **has** a finish reason; if it carried no text and generated at least
+`silentDeadStreamMinTokens` output tokens, the stream died mid-response.
+
+The walk skips messages with no finish reason on purpose. An intermediate
+tool-call step has none, and stopping at it would report a dead stream for every
+session that used a tool.
+
+Two things are worth recording about the v2 API:
+
+- The judge is the message, not the event stream, so this needs
+  `session.context()` — every message since the last compaction. The idle
+  inspection now fetches it **once** and shares it across four checks (dead
+  stream, text fallback, pending tool call, active user), where v1 fetched once
+  for the same reason and this port initially fetched three times.
+- Before injecting, the plugin asks the server whether the session is running
+  again (`session.active()`), not only its own event-derived flag. A provider
+  quietly retrying looks identical from the event stream, and the recovery event
+  may not have arrived by the time the turn ends.
+
+`thinkingToolRecoveryPrompt` is the sibling detector that is still inert: it
+covers a *thinking* block containing a raw tool call, which v1 judged from the
+message parts on the same pass.

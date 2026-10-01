@@ -771,6 +771,8 @@ export default define({
 		// Live since the v2 token read landed (see tokenTotalOf / checkContextSaturation).
 		const contextSaturationThreshold = opts.contextSaturationThreshold ?? DEFAULT_CONTEXT_SATURATION_THRESHOLD
 		const subagentNativeCompactionEnabled = opts.subagentNativeCompactionEnabled ?? false
+		// Live since the silent-dead-stream detector landed (lastSilentDeadStream).
+		const silentDeadStreamMinTokens = opts.silentDeadStreamMinTokens ?? DEFAULT_SILENT_DEAD_STREAM_MIN_TOKENS
 		const streamingFailureErrorNames = opts.streamingFailureErrorNames ?? DEFAULT_STREAMING_FAILURE_ERROR_NAMES
 		const streamingFailureMessagePatterns = opts.streamingFailureMessagePatterns ?? DEFAULT_STREAMING_FAILURE_MESSAGE_PATTERNS
 		const doneWithoutDetailsPrompt = opts.doneWithoutDetailsPrompt ?? DONE_WITHOUT_DETAILS_PROMPT
@@ -811,7 +813,6 @@ export default define({
 		// and the gap is documented rather than surprising. See
 		// docs/known-issues-v2.md.
 		const FEATURE_GATED_OPTIONS = [
-			"silentDeadStreamMinTokens",
 			"subagentWaitMs",
 			"toolTextCheckDelayMs",
 			"thinkingToolRecoveryPrompt",
@@ -1465,37 +1466,126 @@ export default define({
 		// ---------------------------------------------------------------------
 
 		/**
-		 * Read the last assistant message's text from the session message history
-		 * (`ctx.session.context()`, stable v2 API). Returns "" when unavailable.
-		 * Guarded so a failure in this forensic path never breaks the watchdog.
+		 * Fetch a session's message history once per idle inspection.
+		 *
+		 * Four separate checks below want the same array — the dead-stream
+		 * detector, the text fallback, the pending-tool and active-user lookups —
+		 * and `ctx.session.context()` is the expensive call in all of them (it is
+		 * every message since the last compaction). v1 fetched once for the same
+		 * reason. The cache lives only for the duration of one inspection, so a
+		 * later idle always sees the freshest history.
+		 *
+		 * Returns `[]` on any failure: this is forensic, and every caller already
+		 * treats "no history" as "cannot conclude".
 		 */
-		async function lastAssistantTextFromContext(sid: string): Promise<string> {
+		async function loadMessages(sid: string): Promise<unknown[]> {
 			try {
-				const messages = await ctx.session.context({ sessionID: sid })
-				if (!Array.isArray(messages)) return ""
-				for (let i = messages.length - 1; i >= 0; i--) {
-					const msg = messages[i] as {
-						type?: string
-						content?: Array<{ type?: string; text?: string }>
-					}
-					if (!msg || msg.type !== "assistant" || !Array.isArray(msg.content)) continue
-					const text = msg.content
-						.filter((part) => part?.type === "text" && typeof part.text === "string")
-						.map((part) => part.text as string)
-						.join("")
-					if (text) return text
-				}
-				return ""
+				const res = await ctx.session.context({ sessionID: sid })
+				return Array.isArray(res) ? res : ((res as { messages?: unknown[] })?.messages ?? [])
 			} catch (e) {
-				dbg("session.context() fallback failed:", e instanceof Error ? e.message : String(e))
-				return ""
+				dbg(`${short(sid)} session.context() failed:`, e instanceof Error ? e.message : String(e))
+				return []
 			}
 		}
 
-		async function shouldStandDownForUser(sid: string, activeUserWindowMs: number): Promise<boolean> {
+		/** The newest assistant message that delivered text, joined. "" when none. */
+		function lastAssistantTextFrom(messages: unknown[]): string {
+			for (let i = messages.length - 1; i >= 0; i--) {
+				const msg = messages[i] as {
+					type?: string
+					content?: Array<{ type?: string; text?: string }>
+				}
+				if (!msg || msg.type !== "assistant" || !Array.isArray(msg.content)) continue
+				const text = msg.content
+					.filter((part) => part?.type === "text" && typeof part.text === "string")
+					.map((part) => part.text as string)
+					.join("")
+				if (text) return text
+			}
+			return ""
+		}
+
+		/**
+		 * v1's `getLastSilentDeadStream`, on the v2 message shape.
+		 *
+		 * The model can finish a turn having produced no text at all — reasoning
+		 * only, or a `finish=unknown` that the provider did not describe. The
+		 * turn looks complete, so nothing raises, and the session simply stops.
+		 * A `finish` with real text behind it means the session answered normally
+		 * and there is nothing to recover.
+		 *
+		 * Only the newest assistant message that *has* a finish is judged, and the
+		 * walk skips messages without one — an intermediate tool-call step has no
+		 * finish, and walking back past a delivered answer to one of those would
+		 * recover a session that just used a tool.
+		 *
+		 * Returns `null` when the newest finished message carried text, or when
+		 * there is no finished message at all.
+		 */
+		function lastSilentDeadStream(messages: unknown[]): { finish: string; outputTokens: number } | null {
+			for (let i = messages.length - 1; i >= 0; i--) {
+				const msg = messages[i] as {
+					type?: string
+					content?: Array<{ type?: string; text?: string }>
+					finish?: string
+					tokens?: { output?: number }
+				}
+				if (msg?.type !== "assistant") continue
+				const finish = typeof msg.finish === "string" ? msg.finish : undefined
+				if (!finish) continue
+				const hasText = Array.isArray(msg.content) &&
+					msg.content.some((p) => p?.type === "text" && typeof p.text === "string" && p.text.length > 0)
+				if (hasText) return null
+				return { finish, outputTokens: posNum(msg.tokens?.output) }
+			}
+			return null
+		}
+
+		/**
+		 * Recover a stream that finished without ever delivering text.
+		 *
+		 * Ported from v1 including its guard: re-check the server's own status
+		 * first, because a provider that is quietly retrying looks identical from
+		 * the event stream, and interrupting that would turn a recovering session
+		 * into a stalled one. Then arm the pending-recovery latch — without it
+		 * `recover()`'s inject-time check reads an idle session as "recovered by
+		 * itself" and drops the injection.
+		 *
+		 * Returns true when it took action, so the caller stops looking.
+		 */
+		async function recoverSilentDeadStream(sid: string, messages: unknown[]): Promise<boolean> {
+			const dead = lastSilentDeadStream(messages)
+			if (!dead) return false
+			if (dead.outputTokens < silentDeadStreamMinTokens) {
+				dbg(
+					`${short(sid)} last finished message has no text, but only ${dead.outputTokens} output tokens (floor ${silentDeadStreamMinTokens}) — not treating it as a dead stream`,
+				)
+				return false
+			}
+			const w = ensureWatch(sid)
+			// Ask the server before injecting, not just our own flag. A provider
+			// that is quietly retrying looks exactly like a dead stream from the
+			// event stream, and the event may not have arrived yet when the turn
+			// ends — which is v1's own reason for re-checking live status here.
+			if (w.status === "busy" || (await getActiveSessions()).includes(sid)) {
+				dbg(`${short(sid)} silent dead stream, but the session is running again — likely a provider retry`)
+				return true
+			}
+			w.pendingRecoveryArmed = true
+			log(
+				"info",
+				`${short(sid)} silent dead stream: finish=${dead.finish}, ${dead.outputTokens} output tokens, no text parts; resuming`,
+			)
+			await recover(sid, `Silent dead stream (${dead.finish})`)
+			return true
+		}
+
+		async function shouldStandDownForUser(
+			sid: string,
+			messages: unknown[],
+			activeUserWindowMs: number,
+		): Promise<boolean> {
 	try {
-		const result = await ctx.session.context({ sessionID: sid })
-		const messages: unknown[] = Array.isArray(result) ? result : ((result as { messages?: unknown[] })?.messages ?? [])
 		if (messages.length === 0) return false
 		const newest = messages[messages.length - 1] as {
 			type?: string
@@ -1552,10 +1642,17 @@ export default define({
 
 async function inspectOnIdle(sid: string) {
 			const w = ensureWatch(sid)
+			const messages = await loadMessages(sid)
+
+			// Judged first, and before anything that needs text: a stream that died
+			// before delivering any text is precisely the case where every
+			// text-based check below would find nothing to look at.
+			if (await recoverSilentDeadStream(sid, messages)) return
+
 			// Prefer the live delta buffer; fall back to the authoritative message
 			// history when it is empty (e.g. the plugin loaded mid-turn) or stale.
 			let text = w.lastAssistantText
-			if (!text) text = await lastAssistantTextFromContext(sid)
+			if (!text) text = lastAssistantTextFrom(messages)
 			if (!text) return
 
 			// A turn that ends by handing control back to the user (a question or an
@@ -1567,7 +1664,7 @@ async function inspectOnIdle(sid: string) {
 				return
 			}
 
-			if (await shouldStandDownForUser(sid, activeUserWindowMs)) {
+			if (await shouldStandDownForUser(sid, messages, activeUserWindowMs)) {
 				dbg(`${short(sid)} user has pending input or was recently active — standing down`)
 				return
 			}

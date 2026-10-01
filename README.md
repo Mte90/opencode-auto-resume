@@ -468,9 +468,9 @@ Defaults are the same on v1 and v2 unless a row says otherwise.
 | `injectIntervalMs` | v2 only | Minimum gap between recovery injections for one session. No v1 equivalent |
 | `logFile` | v2 only | Where this build appends its log. v2 removed v1's server log endpoint, so without this the plugin is silent. Defaults to `~/.local/state/opencode-v2/auto-resume.log` |
 
-Accepted but **not applied** on v2: `silentDeadStreamMinTokens`, `subagentWaitMs`,
-`toolTextCheckDelayMs`, `thinkingToolRecoveryPrompt`,
-`doneWithoutWorkPrompt`. See [docs/known-issues-v2.md](docs/known-issues-v2.md) for why.
+Accepted but **not applied** on v2: `subagentWaitMs`, `toolTextCheckDelayMs`,
+`thinkingToolRecoveryPrompt`, `doneWithoutWorkPrompt`. See
+[docs/known-issues-v2.md](docs/known-issues-v2.md) for why.
 
 Message patterns are matched case-insensitively. Error names use exact match.
 
