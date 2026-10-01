@@ -412,7 +412,7 @@ With options:
 
 ### OpenCode v2 (stable)
 
-The v2 plugin uses the `Plugin.define` API with `ctx.event.subscribe()` (AsyncIterable) instead of the v1 hooks-object pattern, and targets the stable **`@opencode/plugin` 2.0.5** API (opencode v2.0.5+). Add to your `opencode.json`:
+The v2 plugin uses the `{ id, setup }` plugin shape with `ctx.event.subscribe()` (AsyncIterable) instead of the v1 hooks-object pattern, and is written against the stable v2 API (opencode 2.0.5+). It has **no runtime dependencies** — it defines the plugin helper locally and imports only `node:fs`, `node:os` and `node:path` — so there is nothing to `bun add`. Add it to your `opencode.json`:
 
 ```jsonc
 {

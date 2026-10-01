@@ -2,7 +2,10 @@
 
 > Drop this into the PR description (or keep as docs/v2-migration.md upstream).
 > Target: https://github.com/Mte90/opencode-auto-resume
-> Runtime: **opencode v2.0.5 (stable)** with **@opencode/plugin 2.0.5**.
+> Runtime: **opencode v2.0.5 (stable)**. The port has no runtime dependency —
+> `src/v2/index.ts` imports only `node:fs`, `node:os` and `node:path`, and
+> defines its own `{ id, setup }` helper. `@opencode/plugin@2.0.5` is used to
+> typecheck the source, not to run it.
 > Originally ported against opencode2 v0.0.0-beta-18050 / @opencode-ai/plugin
 > 0.0.0-next-17403; re-validated against the stable release (see §7).
 
@@ -11,9 +14,9 @@
 Ports the plugin from the v1 hooks API (`Plugin` factory returning a hooks
 object) to the v2 promise-plugin API (`Plugin.define({ id, setup })` +
 `ctx.event.subscribe()`). All detection/recovery features are preserved.
-Strict-mode typechecked against the real `@opencode/plugin@2.0.5` types;
-validated by a mocked-context runtime suite covering every recovery
-path (12/12 checks).
+Strict-mode typechecked against the real `@opencode/plugin@2.0.5` types, and
+covered by 188 tests across 13 files driven through the real event stream — one
+file per feature area, 774 passing repo-wide including v1.
 
 ## 1. Config key renamed: `plugin` → `plugins`
 
@@ -150,19 +153,29 @@ respected.
 
 ## Options
 
-Unchanged names/defaults from v1: `chunkTimeoutMs` (45000), `gracePeriodMs`
-(3000), `checkIntervalMs` (5000), `maxRetries` (3), `baseBackoffMs` (1000),
-`maxBackoffMs` (8000), `loopMaxContinues` (3), `loopWindowMs` (600000),
-`maxRecoveryRetries` (2), `debug` (false), plus the prompt overrides
-`continuePrompt`, `toolTextRecoveryPrompt`, `doneWithoutWorkPrompt`,
-`actionIntentPrompt`.
+The port reads **all 31 of v1's options** and applies **all 31**. Names and
+defaults are unchanged, and the full table is in the
+[README](../../README.md#configurable-options). Two defaults moved after both
+builds picked them up from upstream: `chunkTimeoutMs` to 180000 (`49957b2`) and
+`activeUserWindowMs` to 300000 (`e1b8374`).
+
+Two options are **v2-only**, with no v1 equivalent, because v2 removed the
+capability they configure:
+
+- `logFile` — v2 has no server log endpoint, so the plugin writes its own
+  (2 MB cap, `AUTO_RESUME_LOG_FILE` overrides).
+- `injectIntervalMs` — a floor on how often one session may be nudged.
+
+For the record, this list is checked against the source in both directions: a test
+fails if an option joins the recognised set without being implemented, and the
+doc check fails if the table names one that is not gated.
 
 ```jsonc
 {
   "plugins": [
     {
       "package": "./plugins/auto-resume-v2.ts",
-      "options": { "chunkTimeoutMs": 45000, "maxRetries": 3 }
+      "options": { "chunkTimeoutMs": 180000, "maxRetries": 3 }
     }
   ]
 }
@@ -173,23 +186,36 @@ Disable by id without touching other plugins: add `"-auto-resume.v2"`.
 ## Testing
 
 - `tsc --strict --noEmit` clean against **`@opencode/plugin@2.0.5`** (stable).
-- Mocked-context runtime suite (bun, 12 tests) against the stable package:
+- Runtime suite (bun, 13 files / 188 tests) against the stable API:
   definition shape · `subscribe({ signal })` · abort-on-cleanup · stall watchdog
   → `synthetic` with visible `description` + `resume` · idle forensics via the
   `session.context()` fallback · healthy idle turn is a no-op · permission-hold
   blocks recovery · `interrupted` `reason="user"` disables recovery ·
   `reason="inactivity"` does **not** · execution-failure recovery ·
   `synthetic`→`prompt` fallback · `session.deleted` drops state —
-  **12/12 passing**.
+  Each later feature area has its own file: unknown tool suggestions,
+  silent dead streams, premature stop, context saturation, the todo list, explicit
+  `task_complete`, reasoning-tool recovery, orphan parent recovery, the settle
+  delay, session discovery, the options surface, and the hand-off and stand-down
+  guards.
+
+  Two tests in the settle-delay file were **vacuous** on the first pass — they
+  passed whether or not the code under test ran. Every test in the v2 port is now
+  mutation-checked: removing the delay, the arming, the history re-read, either
+  guard re-run, the cancel latch, the new-turn cancel or the cleanup each turns
+  the file red. A negative test that never fails is indistinguishable from a
+  detector that never runs.
 
 ## 7. Re-validated against stable v2 (2.0.5)
 
 The port was originally written against the beta (`@opencode-ai/plugin`
 `0.0.0-next-17403`). Re-checked against the stable release:
 
-- **Package renamed**: the dependency is now **`@opencode/plugin`** (stable
-  `2.0.5`), published from the opencode repo. The beta `@opencode-ai/plugin`
-  package is not the stable API. Imports must use `@opencode/plugin`.
+- **Package renamed**: the API types are now **`@opencode/plugin`** (stable
+  `2.0.5`), published from the opencode repo; the beta `@opencode-ai/plugin` is
+  not the stable API. The port typechecks against those types but does not import
+  them — it declares `{ id, setup }` locally, so a **local-file install needs no
+  `bun add` at all** and the built artefact is a single self-contained file.
   Config/discovery is unchanged (`plugins` key, object form, and plugins under
   `.opencode/plugin/` **or** `.opencode/plugins/` are auto-loaded).
 - **Every event the plugin matches still exists** in 2.0.5, with the same names
@@ -211,9 +237,9 @@ The port was originally written against the beta (`@opencode-ai/plugin`
   `ctx.session.interrupt()` input is `{ sessionID, resume? }`.
 - **Docs recommend `ctx.event.subscribe({ signal })`** and aborting the stream
   during cleanup; the port now does this with an `AbortController`.
-- **Local-file installs need the API package resolvable.** opencode loads a
-  local `.ts` plugin with a normal ESM import and snapshots plugin
-  dependencies at server startup, so `@opencode/plugin` must be installed in
-  the config dir (`~/.config/opencode`) and opencode restarted. A *published*
-  plugin should instead declare `@opencode/plugin` in its `dependencies`
-  (replacing `@opencode-ai/plugin`).
+- **Local-file installs need nothing installed.** opencode loads a local `.ts`
+  plugin with a normal ESM import, so *a plugin that imports the API package*
+  would have to have it resolvable and would need a restart. This port does not
+  import it, which removes that constraint — copy the file and restart. A
+  *published* plugin that later does import it should declare
+  `@opencode/plugin` in its `dependencies` (replacing `@opencode-ai/plugin`).
