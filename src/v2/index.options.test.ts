@@ -1,11 +1,15 @@
 import { describe, test, expect } from "bun:test"
-import { readFileSync } from "node:fs"
+import { existsSync, readFileSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "./index"
 
 const SOURCE = readFileSync(join(import.meta.dir, "index.ts"), "utf8")
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_opts"
+
+/** Scratch log path per replay, so parallel cases cannot read each other's lines. */
+let counter = 0
 
 const textPart = (t: string) => ({ type: "text", text: t })
 /** Older than every activeUserWindowMs we pass, so guard (b) cannot mask a failure. */
@@ -84,21 +88,21 @@ async function replay(
 ): Promise<Harness> {
 	const injected: Harness["injected"] = []
 	const interrupts: string[] = []
-	const logs: string[] = []
 	const stream = makeEventStream()
 	const text = harnessOpts.text ?? READY_TEXT
+
+	// v2 removed v1's server log endpoint, so the plugin writes to a file. Point
+	// it at a scratch path and read the lines back after teardown — this is also
+	// what proves the file sink works, rather than assuming it does.
+	const logFile = join(tmpdir(), `auto-resume-test-${process.pid}-${counter++}.log`)
+	rmSync(logFile, { force: true })
 
 	const ctx: any = {
 		event: stream,
 		// The plugin reads its config from `ctx.options`; the second argument to
 		// `setup()` is ignored. Passing options the other way makes every
 		// negative assertion below pass for the wrong reason.
-		options: opts,
-		app: {
-			log: (_level: string, line: string) => {
-				logs.push(String(line))
-			},
-		},
+		options: { ...opts, logFile },
 		session: {
 			context: async () => [oldUserTurn(), assistantTurn(text)],
 			// Empty: no other session is active, so the `lastWasTaskTool` branch
@@ -128,6 +132,8 @@ async function replay(
 	}
 	await wait(600) // handleEvent is sync; its work is async
 	;(cleanup as (() => void) | undefined)?.()
+	const logs = existsSync(logFile) ? readFileSync(logFile, "utf8").split("\n") : []
+	rmSync(logFile, { force: true })
 	return { injected, interrupts, logs }
 }
 
@@ -285,12 +291,26 @@ describe("v2: option reporting at startup", () => {
 	})
 
 	test("the startup line names the accepted-but-inert options in use", async () => {
-		const { logs } = await replay([], { chunkTimeoutMs: 5000, subagentWaitMs: 15_000, discoveryDelayMs: 5_000 })
+		const { logs } = await replay([], { chunkTimeoutMs: 5000, subagentWaitMs: 15_000 })
 		const ready = logs.filter((l) => l.includes("ready (opencode v2)"))
 		expect(ready).toHaveLength(1)
 		expect(ready[0]).toContain("accepted-but-inert=")
 		expect(ready[0]).toContain("subagentWaitMs")
-		expect(ready[0]).toContain("discoveryDelayMs")
+	})
+
+	test("discoveryDelayMs is live on v2, so it is no longer listed as inert", async () => {
+		// Control: a genuinely inert option, set the same way, IS still listed.
+		// Without this the assertion below would pass for the wrong reason.
+		const { logs } = await replay([], {
+			chunkTimeoutMs: 5000,
+			discoveryDelayMs: 5_000,
+			subagentWaitMs: 15_000,
+		})
+		const ready = logs.filter((l) => l.includes("ready (opencode v2)"))
+		expect(ready).toHaveLength(1)
+		expect(ready[0]).toContain("accepted-but-inert=")
+		expect(ready[0]).toContain("subagentWaitMs")
+		expect(ready[0]).not.toContain("discoveryDelayMs")
 	})
 
 	test("the startup line carries no accepted-but-inert list when none are set", async () => {

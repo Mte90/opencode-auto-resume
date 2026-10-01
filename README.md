@@ -463,13 +463,14 @@ Defaults are the same on v1 and v2 unless a row says otherwise.
 | `silentDeadStreamMinTokens` | `200` | Min output tokens to treat a textless `finish:"unknown"` message as a dead stream |
 | `busyStallStrategy` | `"continue"` | Busy-stall response: `"continue"`, `"abort"` (abort-first), or `"off"` (disabled) |
 | `contextSaturationThreshold` | `0.85` | Ratio of used/usable context that routes a saturated parent to magic-context `ctx-wrapup` (only when magic-context is installed) |
-| `activeUserWindowMs` | `900000` | Inbound-user-message recency window (15 min) during which idle nudges stand down (user likely composing) |
+| `activeUserWindowMs` | `300000` on v2, `900000` on v1 | Inbound-user-message recency window during which idle nudges stand down (user likely composing). v1 is stale at 15 min on this branch; upstream `e1b8374` already moved it to 5 min and the v2 build matches that |
 | `subagentNativeCompactionEnabled` | `false` | Opt-in native `session.summarize()` for saturated subagent sessions (no magic-context detection required) |
 | `injectIntervalMs` | v2 only | Minimum gap between recovery injections for one session. No v1 equivalent |
+| `logFile` | v2 only | Where this build appends its log. v2 removed v1's server log endpoint, so without this the plugin is silent. Defaults to `~/.local/state/opencode-v2/auto-resume.log` |
 
 Accepted but **not applied** on v2: `contextSaturationThreshold`,
 `subagentNativeCompactionEnabled`, `silentDeadStreamMinTokens`, `subagentWaitMs`,
-`discoveryDelayMs`, `toolTextCheckDelayMs`, `thinkingToolRecoveryPrompt`,
+`toolTextCheckDelayMs`, `thinkingToolRecoveryPrompt`,
 `doneWithoutWorkPrompt`. See [docs/known-issues-v2.md](docs/known-issues-v2.md) for why.
 
 Message patterns are matched case-insensitively. Error names use exact match.
@@ -481,7 +482,7 @@ Message patterns are matched case-insensitively. Error names use exact match.
 | `ABORT_CONTINUE_DELAY_MS` | `2000` | Delay between abort and continue |
 | `MAX_IDLE_SESSIONS` | `50` | Idle session map cap before cleanup |
 | `IDLE_CLEANUP_MS` | `600000` | Idle session age before cleanup (10 min) |
-| `SESSION_DISCOVERY_INTERVAL_MS` | `60000` | `session.list()` poll interval (60s) — v1 only; the v2 build has no discovery sweep |
+| `SESSION_DISCOVERY_INTERVAL_MS` | `60000` | Session discovery sweep interval (60s). Same on both builds; v2 reads the busy set from `session.active()` rather than a `status` field per row |
 
 ## Verification
 

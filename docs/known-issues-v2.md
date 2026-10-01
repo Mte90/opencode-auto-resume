@@ -16,7 +16,6 @@ config keeps loading unchanged.
 | `subagentNativeCompactionEnabled` | Same: without a context-limit read, saturation cannot be detected, so there is nothing to gate a compaction on. |
 | `silentDeadStreamMinTokens` | Same. The heuristic it tunes compares generated token count against a floor. |
 | `subagentWaitMs` | The v1 orphan-watch timer that this delays has no v2 counterpart; the v2 port decides parent-vs-stalled from its own event-derived busy set. |
-| `discoveryDelayMs` | v2 has no discovery sweep. The port starts watching from the events it receives rather than by enumerating existing sessions on a delay. |
 | `toolTextCheckDelayMs` | The delayed raw-tool-call-as-text re-check is v1's polling shape. v2 evaluates the text once, on idle, from the authoritative message history. |
 | `thinkingToolRecoveryPrompt` | The thinking-contains-a-tool-call detector is part of the v1 idle-nudge pass and is not ported. |
 | `doneWithoutWorkPrompt` | Both v1 use sites for this prompt are gated on tracked todo state. v2 has no todo state, so the prompt has no trigger. |
@@ -47,11 +46,60 @@ the fix is mte090's `e1b8374`, applied to the v2 code path. The stall path
 
 - `maxRetries` is the v2 name. `maxRecoveryRetries` is v1's name for the same
   knob and is still accepted as a fallback, so a v1 config ports unchanged.
-- `activeUserWindowMs` defaults to `300000` (5 min) on both v1 and v2, matching
+- `activeUserWindowMs` defaults to `300000` (5 min) in the v2 build, matching
   upstream `e1b8374`. The v2 port shipped with `900000`, which stood down for
-  three times longer than v1 after any user message.
+  three times longer than intended after any user message. The v1 file on this
+  branch still reads `900000` because it predates `e1b8374`; the PR does not
+  touch v1, and master already carries the fix.
 
 ## v2-only options
 
 - `injectIntervalMs` — minimum gap between recovery injections for one session.
   No v1 equivalent.
+- `logFile` — where this build writes its log. See "Logging" below.
+
+## Logging: there is no server log sink in v2
+
+v1 logged through `ctx.client.app.log({ body: { service, level, message } })`,
+which landed in the opencode log file. v2 removed that endpoint: `ctx.app` is
+`{ name, version, channel }` (`packages/plugin/src/app.ts`), there is no `app`
+group under `packages/protocol/src/groups/`, and a hosted plugin's
+`console.log` is not captured by the OpenChamber process.
+
+A build that only writes to the console is therefore **silent** — a running
+watchdog and a dead one look identical, and there is no way to tell from
+outside whether a stall was seen, skipped, or recovered. This v2 build appends
+to a file instead:
+
+```
+~/.local/state/opencode-v2/auto-resume.log     # default
+```
+
+Override with the `logFile` option or the `AUTO_RESUME_LOG_FILE` environment
+variable; the option wins. The file is truncated once it passes 2 MB, and every
+write is best-effort — an unwritable log directory never breaks the watchdog.
+
+Each line is `ISO-8601 LEVEL [auto-resume] message`. The startup line lists the
+effective timings, so a build that loaded at all is provable from the file:
+
+```
+2026-10-01T18:02:28.412Z INFO  [auto-resume] ready (opencode v2). timeout=180000ms interval=5000ms ...
+```
+
+## Session discovery
+
+v1 swept `session.list()` on an interval and trusted a `status` field per row.
+v2 has something better: `session.active()` is the server's own record of what
+is running, so "busy" is read rather than guessed. The sweep runs once at
+`discoveryDelayMs` (default 5s) and then every 60s, and it:
+
+- seeds a watch for any session that exists, so cleanup and revert handling know
+  about sessions that predate the plugin load, and
+- marks any session the server reports as running as busy, so a turn that was
+  already mid-flight when the plugin attached starts its stall clock now rather
+  than never.
+
+Both calls are read defensively — off the plugin `session` domain first, then
+off the raw client — because v2 hands plugins a narrowed `Pick` that omits both.
+A host that supplies neither degrades to the event-derived busy set rather than
+failing.

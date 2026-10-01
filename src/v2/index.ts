@@ -13,7 +13,11 @@
  *  - Assistant text is accumulated from `session.text.delta` events for liveness;
  *    `ctx.session.context()` (stable v2) supplies the authoritative final
  *    assistant text at idle time — replacing v1's `session.messages()` polling.
- *  - No `ctx.app.log` in v2 — logs go to the console (captured by opencode logs).
+ *  - No `ctx.app.log` in v2: `ctx.app` is only `{name, version, channel}` (see
+ *    `packages/plugin/src/app.ts`), and v2 has no `app.log` endpoint. Console
+ *    output from a hosted plugin is not captured anywhere retrievable, so v1's
+ *    `ctx.client.app.log(...)` has no equivalent. This build therefore appends
+ *    to its own log file — see LOG_FILE below.
  *  - Targets the stable v2 API (`@opencode/plugin`). Event names are unchanged
  *    from the beta port; `session.execution.interrupted` now carries a `reason`.
  *
@@ -49,6 +53,10 @@ type AutoResumePlugin = {
 }
 
 const define = <T>(plugin: T): T => plugin
+
+import { appendFileSync, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs"
+import { homedir } from "node:os"
+import { dirname, join } from "node:path"
 
 /**
  * The subset of the v2 plugin input this plugin actually consumes. Typed
@@ -203,6 +211,61 @@ export interface AutoResumeOptions {
 	doneWithoutDetailsPrompt?: string
 	/** Prompt sent when a tool call was emitted inside reasoning. */
 	thinkingToolRecoveryPrompt?: string
+	/**
+	 * Append this build's log here instead of the default path
+	 * (`~/.local/state/opencode-v2/auto-resume.log`).
+	 *
+	 * v2 removed v1's `app.log` endpoint, so this is the only retrievable
+	 * record of what the plugin did. The `AUTO_RESUME_LOG_FILE` environment
+	 * variable sets the same thing and wins over neither.
+	 */
+	logFile?: string
+}
+
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+
+/**
+ * Where this build's log lines go, and why not somewhere official.
+ *
+ * v1 wrote through `ctx.client.app.log({ body: { service, level, message } })`,
+ * a real endpoint that landed in the opencode log file. v2 removed it:
+ * `ctx.app` is `{ name, version, channel }` (`packages/plugin/src/app.ts`),
+ * there is no `app` group in `packages/protocol/src/groups/`, and a hosted
+ * plugin's `console.log` is not captured by the OpenChamber process. Without
+ * this the plugin is completely silent — you cannot tell a working watchdog
+ * from a dead one, which is exactly the failure that made a stall
+ * indistinguishable from "nothing happened".
+ *
+ * Override with AUTO_RESUME_LOG_FILE. Size-capped so an unattended run cannot
+ * fill the disk.
+ */
+const DEFAULT_LOG_FILE = join(homedir(), ".local", "state", "opencode-v2", "auto-resume.log")
+const LOG_FILE_MAX_BYTES = 2 * 1024 * 1024
+
+/**
+ * Append one line to `target`, best effort.
+ *
+ * Every failure here is swallowed on purpose: logging must never be the reason
+ * the watchdog stops running. The size check races harmlessly between
+ * processes — losing a line beats throwing.
+ */
+function appendLogFile(target: string, level: string, line: string): void {
+	try {
+		mkdirSync(dirname(target), { recursive: true })
+		try {
+			if (existsSync(target) && statSync(target).size > LOG_FILE_MAX_BYTES) {
+				writeFileSync(target, "")
+			}
+		} catch {
+			// Size check is an optimisation, not a requirement.
+		}
+		appendFileSync(target, `${new Date().toISOString()} ${level.toUpperCase().padEnd(5)} ${line}\n`)
+	} catch {
+		// Unwritable log dir, read-only fs, quota — none of these should
+		// propagate into the recovery path.
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -229,7 +292,10 @@ const DEFAULT_DEBUG = false
 const DEFAULT_ACTIVE_USER_WINDOW_MS = 5 * 60_000
 
 // ---- Defaults ported from v1 (Mte90/opencode-auto-resume#33) ----
+// v1 keeps SESSION_DISCOVERY_INTERVAL_MS as an internal constant rather than an
+// option, so it is not configurable here either. 60s matches v1.
 const DEFAULT_DISCOVERY_DELAY_MS = 5_000
+const DEFAULT_SESSION_DISCOVERY_INTERVAL_MS = 60_000
 const DEFAULT_WARMUP_MS = 15_000
 const DEFAULT_MIN_ACTIVITY_GAP_MS = 1_000
 const DEFAULT_TOOL_TEXT_CHECK_DELAY_MS = 3_000
@@ -617,6 +683,7 @@ export default define({
 		const debug = opts.debug ?? DEFAULT_DEBUG
 		const activeUserWindowMs = opts.activeUserWindowMs ?? DEFAULT_ACTIVE_USER_WINDOW_MS
 		const injectIntervalMs = opts.injectIntervalMs ?? DEFAULT_INJECT_INTERVAL_MS
+		const logFile = opts.logFile ?? process.env.AUTO_RESUME_LOG_FILE ?? DEFAULT_LOG_FILE
 
 		// ---- Ported from v1 (Mte90/opencode-auto-resume#33) ----
 		const rawBusyStallStrategy = opts.busyStallStrategy ?? "continue"
@@ -627,6 +694,8 @@ export default define({
 		// mistaken for live behaviour.
 		const resumeOnActionIntent = opts.resumeOnActionIntent !== false
 		const warmupMs = opts.warmupMs ?? DEFAULT_WARMUP_MS
+		// Live since the v2 discovery sweep landed (see discoverSessions).
+		const discoveryDelayMs = opts.discoveryDelayMs ?? DEFAULT_DISCOVERY_DELAY_MS
 		const minActivityGapMs = opts.minActivityGapMs ?? DEFAULT_MIN_ACTIVITY_GAP_MS
 		const streamingFailureErrorNames = opts.streamingFailureErrorNames ?? DEFAULT_STREAMING_FAILURE_ERROR_NAMES
 		const streamingFailureMessagePatterns = opts.streamingFailureMessagePatterns ?? DEFAULT_STREAMING_FAILURE_MESSAGE_PATTERNS
@@ -672,7 +741,6 @@ export default define({
 			"subagentNativeCompactionEnabled",
 			"silentDeadStreamMinTokens",
 			"subagentWaitMs",
-			"discoveryDelayMs",
 			"toolTextCheckDelayMs",
 			"thinkingToolRecoveryPrompt",
 			"doneWithoutWorkPrompt",
@@ -715,6 +783,7 @@ export default define({
 			"doneWithoutDetailsPrompt",
 			"thinkingToolRecoveryPrompt",
 			"doneWithoutWorkPrompt",
+			"logFile",
 		])
 		const unknownOptions = Object.keys(opts).filter((key) => !RECOGNISED_OPTIONS.has(key))
 		if (unknownOptions.length > 0) {
@@ -737,16 +806,11 @@ export default define({
 
 		function log(level: "info" | "warn" | "error", msg: string) {
 			const line = `[auto-resume] ${msg}`
-			// Prefer the server log sink so plugin output is actually retrievable
-			// (console output from a hosted plugin is not captured anywhere useful).
-			try {
-				const appLog = (ctx as any)?.app?.log
-				if (typeof appLog === "function") {
-					void appLog.call((ctx as any).app, level === "info" ? "info" : level, line)
-				}
-			} catch {
-				// fall through to console
-			}
+			// v2 exposes no server log sink to plugins (ctx.app is
+			// {name,version,channel}), so the file is the only retrievable record.
+			appendLogFile(logFile, level, line)
+			// Console too: harmless when nobody captures it, and the reason the
+			// startup line is visible at all when running under `opencode serve`.
 			if (level === "error") console.error(line)
 			else if (level === "warn") console.warn(line)
 			else console.log(line)
@@ -1543,6 +1607,118 @@ async function inspectOnIdle(sid: string) {
 			)
 		}, checkIntervalMs)
 
+		// Discovery sweep. Separate timer from the watchdog because the two have
+		// different jobs and different costs: the watchdog runs every few seconds
+		// and must stay cheap, discovery lists every session and runs every 60s.
+		// The initial sweep waits out discoveryDelayMs so plugin load does not
+		// compete with the turn that triggered it.
+		const discoveryTimer = setInterval(() => {
+			discoverSessions().catch((e) =>
+				log("error", `discovery failed: ${e instanceof Error ? e.message : String(e)}`),
+			)
+		}, DEFAULT_SESSION_DISCOVERY_INTERVAL_MS)
+		const initialDiscovery = setTimeout(() => {
+			discoverSessions().catch(() => {})
+		}, discoveryDelayMs)
+
+		// ---------------------------------------------------------------------
+		// Session discovery
+		// ---------------------------------------------------------------------
+
+		/**
+		 * v2 hands plugins a narrowed `ctx.session` domain (see
+		 * `packages/plugin/src/promise/session.ts`) that omits `list` and
+		 * `active`, so both are read defensively: off the session domain first,
+		 * then off the raw client. A host that supplies neither degrades to the
+		 * event-derived busy set rather than failing.
+		 */
+		async function callSessionApi<T>(name: string): Promise<T | undefined> {
+			const fromDomain = (ctx.session as any)[name]
+			if (typeof fromDomain === "function") {
+				try {
+					return (await fromDomain.call(ctx.session)) as T
+				} catch (e) {
+					dbg(`ctx.session.${name}() failed:`, e instanceof Error ? e.message : String(e))
+				}
+			}
+			const fromClient = ctx.client?.session?.[name as "get"]
+			if (typeof fromClient === "function") {
+				try {
+					return (await (fromClient as any).call(ctx.client!.session)) as T
+				} catch (e) {
+					dbg(`ctx.client.session.${name}() failed:`, e instanceof Error ? e.message : String(e))
+				}
+			}
+			return undefined
+		}
+
+		/** Unwrap the `{ data }` envelope the client uses, or pass an array through. */
+		function unwrapList(response: unknown): Array<Record<string, unknown>> {
+			if (Array.isArray(response)) return response as Array<Record<string, unknown>>
+			if (response && typeof response === "object") {
+				const data = (response as { data?: unknown }).data
+				if (Array.isArray(data)) return data as Array<Record<string, unknown>>
+			}
+			return []
+		}
+
+		/**
+		 * Seed watch state for sessions that already exist, and mark the ones
+		 * currently running as busy.
+		 *
+		 * v1 did this by polling `session.list()` and trusting a `status` field
+		 * on each row. v2 has something better: `session.active()` is the
+		 * server's own record of what is running right now, so "busy" is read
+		 * rather than guessed. A session that was already mid-turn when the
+		 * plugin loaded would otherwise be invisible — no `execution.started`
+		 * ever reaches us for it, so the stall watchdog would have nothing to
+		 * watch.
+		 */
+		async function discoverSessions() {
+			try {
+				const listed = unwrapList(await callSessionApi<unknown>("list"))
+				let seeded = 0
+				for (const row of listed) {
+					const sid = row?.id
+					if (typeof sid !== "string" || !sid.startsWith("ses_")) continue
+					if (!sessions.has(sid)) {
+						ensureWatch(sid)
+						seeded++
+					}
+				}
+
+				// Authoritative busy set. Anything listed as running but not
+				// already tracked busy starts its stall clock now, not from
+				// whenever the plugin happened to attach.
+				const active = await callSessionApi<Record<string, unknown>>("active")
+				let adopted = 0
+				if (active && typeof active === "object") {
+					for (const [sid, val] of Object.entries(active)) {
+						if (!sid.startsWith("ses_")) continue
+						const w = ensureWatch(sid)
+						if (w.status !== "busy") {
+							markBusy(sid)
+							adopted++
+						} else {
+							// Already busy from events; refresh nothing, but make
+							// sure the session is not left `createdAt`-stale so
+							// the warmup window does not swallow its first stall.
+							void val
+						}
+					}
+				}
+
+				if (seeded > 0 || adopted > 0) {
+					log("info", `discovery: seeded ${seeded} session(s), adopted ${adopted} already running`)
+				} else {
+					dbg("discovery: nothing new")
+				}
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err)
+				dbg(`session discovery failed: ${msg}`)
+			}
+		}
+
 		// ---------------------------------------------------------------------
 		// Event stream
 		// ---------------------------------------------------------------------
@@ -1909,6 +2085,8 @@ async function inspectOnIdle(sid: string) {
 			running = false
 			eventAbort.abort()
 			clearInterval(watchdog)
+			clearInterval(discoveryTimer)
+			clearTimeout(initialDiscovery)
 			sessions.clear()
 			log("info", "stopped")
 		}
