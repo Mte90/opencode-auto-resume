@@ -418,6 +418,18 @@ Disable via `"-auto-resume.v2"` in `plugins`.
 
 - **Step-by-step install guide:** [docs/v2/installing.md](docs/v2/installing.md)
 - **Migration notes (v1 → v2, stable validation):** [docs/v2/migration.md](docs/v2/migration.md)
+- **What the v2 port does and does not yet do:** [docs/known-issues-v2.md](docs/known-issues-v2.md)
+
+The v2 build reads every option in the table below. A handful of them are
+accepted without being applied yet, because the v2 feature they tune is not
+ported — they are listed in the startup line as `accepted-but-inert=…` and
+explained in [docs/known-issues-v2.md](docs/known-issues-v2.md). An option name
+this build does not know at all produces a single warning at startup, so a typo
+or an unported key is never silent.
+
+### Configurable options
+
+Defaults are the same on v1 and v2 unless a row says otherwise.
 
 ### Configurable options
 
@@ -453,6 +465,12 @@ Disable via `"-auto-resume.v2"` in `plugins`.
 | `contextSaturationThreshold` | `0.85` | Ratio of used/usable context that routes a saturated parent to magic-context `ctx-wrapup` (only when magic-context is installed) |
 | `activeUserWindowMs` | `900000` | Inbound-user-message recency window (15 min) during which idle nudges stand down (user likely composing) |
 | `subagentNativeCompactionEnabled` | `false` | Opt-in native `session.summarize()` for saturated subagent sessions (no magic-context detection required) |
+| `injectIntervalMs` | v2 only | Minimum gap between recovery injections for one session. No v1 equivalent |
+
+Accepted but **not applied** on v2: `contextSaturationThreshold`,
+`subagentNativeCompactionEnabled`, `silentDeadStreamMinTokens`, `subagentWaitMs`,
+`discoveryDelayMs`, `toolTextCheckDelayMs`, `thinkingToolRecoveryPrompt`,
+`doneWithoutWorkPrompt`. See [docs/known-issues-v2.md](docs/known-issues-v2.md) for why.
 
 Message patterns are matched case-insensitively. Error names use exact match.
 
@@ -463,7 +481,7 @@ Message patterns are matched case-insensitively. Error names use exact match.
 | `ABORT_CONTINUE_DELAY_MS` | `2000` | Delay between abort and continue |
 | `MAX_IDLE_SESSIONS` | `50` | Idle session map cap before cleanup |
 | `IDLE_CLEANUP_MS` | `600000` | Idle session age before cleanup (10 min) |
-| `SESSION_DISCOVERY_INTERVAL_MS` | `60000` | `session.list()` poll interval (60s) |
+| `SESSION_DISCOVERY_INTERVAL_MS` | `60000` | `session.list()` poll interval (60s) — v1 only; the v2 build has no discovery sweep |
 
 ## Verification
 

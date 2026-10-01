@@ -62,6 +62,14 @@ interface AutoResumePluginInput {
 	event: { subscribe: (opts?: { signal?: AbortSignal }) => AsyncIterable<V2Event> }
 	/** Server-side session/messaging operations. */
 	session: Record<string, (...args: any[]) => any>
+	/**
+	 * Opencode API client, when the host provides one. Declared on the real
+	 * `@opencode-ai/plugin` `PluginInput` (`client: ReturnType<typeof
+	 * createOpencodeClient>`); typed here structurally so the file still
+	 * type-checks standalone. Optional: a host may not supply it, and every
+	 * use must degrade gracefully when it is absent.
+	 */
+	client?: { session: { get: (opts: { path: { id: string } }) => Promise<{ data?: { parentID?: string } }> } }
 	/** Application logger, when the host provides one. */
 	app?: { log?: (level: string, message: string) => unknown }
 }
@@ -124,6 +132,10 @@ interface SessionWatch {
 	/** Timestamp of the latest `permission.asked` (stale-guard for the flag). */
 	permissionPendingAt: number | null
 	lastWasTaskTool: boolean
+	/** Cached verdict from `isSubAgentSession()`: true when the server reports a
+	 * `parentID` for this session, i.e. it is a child and must never be injected
+	 * into or interrupted. `undefined` = not yet resolved. */
+	isSubAgent?: boolean
 	idleSince: number | null
 	/** Set while the session is mid native compaction — recovery must never interrupt it. */
 	compacting: boolean
@@ -155,13 +167,55 @@ export interface AutoResumeOptions {
 	actionIntentPrompt?: string
 	debug?: boolean
 	activeUserWindowMs?: number
+
+	// ---- Ported from v1 (Mte90/opencode-auto-resume#33) ----
+	/** v1 name for `maxRetries`. Still accepted so v1 configs port unchanged. */
+	maxRecoveryRetries?: number
+	/** How a stall is recovered: "continue" (default), "abort", or "off". */
+	busyStallStrategy?: "continue" | "abort" | "off"
+	/** Fraction of the usable context window that counts as saturated. */
+	contextSaturationThreshold?: number
+	/** Trigger native compaction on saturation for subagent sessions. */
+	subagentNativeCompactionEnabled?: boolean
+	/** Resume on action-intent detection (default true). */
+	resumeOnActionIntent?: boolean
+	/** Delay before the first session discovery sweep. */
+	discoveryDelayMs?: number
+	/** Quiet period after startup before stall recovery arms. */
+	warmupMs?: number
+	/** Minimum gap between recorded activity timestamps. */
+	minActivityGapMs?: number
+	/** Grace before a raw-tool-call-as-text check fires. */
+	toolTextCheckDelayMs?: number
+	/** Wait for a subagent to report before treating it as stalled. */
+	subagentWaitMs?: number
+	/** Token floor for the silent-dead-stream heuristic. */
+	silentDeadStreamMinTokens?: number
+	/** Error names that mark a streaming failure. */
+	streamingFailureErrorNames?: string[]
+	/** Regex sources that mark a streaming failure message. */
+	streamingFailureMessagePatterns?: string[]
+	/** Regex sources that mark a "task is done" claim. */
+	doneClaimPatterns?: string[]
+	/** Regex sources that mark the model ready to continue. */
+	readyToContinuePatterns?: string[]
+	/** Prompt sent when a done-claim arrives with no work to show. */
+	doneWithoutDetailsPrompt?: string
+	/** Prompt sent when a tool call was emitted inside reasoning. */
+	thinkingToolRecoveryPrompt?: string
 }
 
 // ---------------------------------------------------------------------------
 // Constants & defaults
 // ---------------------------------------------------------------------------
 
-const DEFAULT_CHUNK_TIMEOUT_MS = 45_000
+// 45s -> 180s (2026-09-29): silence is the ONLY stall signal here, and 45s +
+// 3s grace misfires on a single shared GPU where one subagent turn legitimately
+// emits no events for over a minute. Widening the window is a mitigation, not
+// the principled fix — that is positive hang detection (a tool call stuck in
+// running/pending is a real hang; model generation is not), which changes
+// recovery semantics and is still an open decision.
+const DEFAULT_CHUNK_TIMEOUT_MS = 180_000
 const DEFAULT_CHECK_INTERVAL_MS = 5_000
 const DEFAULT_GRACE_PERIOD_MS = 3_000
 const DEFAULT_MAX_RETRIES = 3
@@ -170,7 +224,84 @@ const DEFAULT_MAX_BACKOFF_MS = 8_000
 const DEFAULT_LOOP_MAX_CONTINUES = 3
 const DEFAULT_LOOP_WINDOW_MS = 10 * 60_000
 const DEFAULT_DEBUG = false
-const DEFAULT_ACTIVE_USER_WINDOW_MS = 15 * 60_000
+// Mirrors v1 (Mte90 e1b8374): an inbound user message this recent means the
+// user is engaged (likely composing), so idle nudges stand down. Was 15min here.
+const DEFAULT_ACTIVE_USER_WINDOW_MS = 5 * 60_000
+
+// ---- Defaults ported from v1 (Mte90/opencode-auto-resume#33) ----
+const DEFAULT_DISCOVERY_DELAY_MS = 5_000
+const DEFAULT_WARMUP_MS = 15_000
+const DEFAULT_MIN_ACTIVITY_GAP_MS = 1_000
+const DEFAULT_TOOL_TEXT_CHECK_DELAY_MS = 3_000
+const DEFAULT_SUBAGENT_WAIT_MS = 15_000
+const DEFAULT_SILENT_DEAD_STREAM_MIN_TOKENS = 200
+const DEFAULT_CONTEXT_SATURATION_THRESHOLD = 0.85
+const DEFAULT_MAX_RECOVERY_RETRIES = 2
+// Referenced from FEATURE_GATED_OPTIONS docs; kept so the intended v1 default is
+// recorded next to the gate that explains why it is not applied yet.
+
+const DEFAULT_STREAMING_FAILURE_ERROR_NAMES = [
+	"ProviderError",
+	"APIError",
+	"StreamError",
+	"ConnectionError",
+	"TimeoutError",
+]
+
+const DEFAULT_STREAMING_FAILURE_MESSAGE_PATTERNS = [
+	"streaming response failed",
+	"stream.*fail",
+	"connection.*reset",
+	"connection.*closed",
+	"aborted due to timeout",
+]
+
+const DEFAULT_DONE_CLAIM_PATTERNS = [
+	"task\\s+done[.!]*",
+	"done[.!]*",
+	"all\\s+done[.!]*",
+	"finished[.!]*",
+	"complete[.!]*",
+	"task\\s+complete[.!]*",
+	"task\\s+completed[.!]*",
+	"all\\s+tasks?\\s+complete[.!]*",
+	"all\\s+tasks?\\s+completed[.!]*",
+	"(?:i['’]?m\\s+)?done\\s+with\\s+task",
+	"done\\s+with\\s+(?:the\\s+)?(?:task|work|implementation)",
+	"finished\\s+(?:the\\s+)?(?:task|work|implementation)",
+	"(?:all|everything)\\s+(?:is\\s+)?(?:complete|done|finished)",
+	"nothing\\s+(?:else\\s+)?(?:left|remaining|to do)",
+]
+
+const DEFAULT_READY_TO_CONTINUE_PATTERNS = [
+	"ready to continue with task",
+	"continuing with task",
+	"continue with task",
+	"proceeding with task",
+	"ready to proceed with task",
+	"will continue with task",
+	"moving on to task",
+]
+
+const THINKING_TOOL_RECOVERY_PROMPT =
+	"I noticed you have a tool call generated in your thinking/reasoning. " +
+	"Please execute it using the proper tool calling mechanism instead of keeping it in reasoning."
+
+const DONE_WITHOUT_DETAILS_PROMPT =
+	"Your last response claimed the task is complete but contained no work description. This is not acceptable. " +
+	"You MUST respond now with a full, detailed report of everything you did: " +
+	"for each file you modified, state the full path and the exact changes; " +
+	"list every command you ran to verify and its result; state the final outcome. " +
+	"Do NOT reply with 'done', 'task completed', or any short acknowledgment — " +
+	"your ONLY acceptable response right now is this detailed report. Write it now."
+
+/**
+ * Upper bound on how long a `shell.created` → `shell.exited` pair is trusted
+ * to mean "this session is busy". A shell that never reports an exit (session
+ * torn down, event dropped) would otherwise suppress recovery forever, so
+ * entries are pruned past this. Set well above any realistic long build.
+ */
+const SHELL_OPEN_MAX_MS = 30 * 60_000
 
 /** OOC (out-of-context) errors that `continue` can never clear — recovery is locked out on these. */
 const OOC_ERROR_RE = /exceeds the available context size|context size \(\d+\)|too large to compact|too many tokens|prompt is too long/i
@@ -342,16 +473,16 @@ function containsToolCallAsText(text: string): boolean {
 	return false
 }
 
-function containsReadyToContinuePattern(text: string): boolean {
+function containsReadyToContinuePattern(text: string, patterns: RegExp[] = READY_TO_CONTINUE_PATTERNS): boolean {
 	const lines = text.split("\n")
 	const lastLines = lines.slice(-3).join("\n")
-	return READY_TO_CONTINUE_PATTERNS.some((pat) => pat.test(lastLines))
+	return patterns.some((pat) => pat.test(lastLines))
 }
 
-function containsDoneClaimPattern(text: string): boolean {
+function containsDoneClaimPattern(text: string, patterns: RegExp[] = DONE_CLAIM_PATTERNS): boolean {
 	const lines = text.split("\n")
 	const lastLines = lines.slice(-5).join("\n")
-	return DONE_CLAIM_PATTERNS.some((pat) => pat.test(lastLines))
+	return patterns.some((pat) => pat.test(lastLines))
 }
 
 /** Model ends with ":" announcing intent without executing. */
@@ -397,16 +528,21 @@ function backoffMs(attempt: number, base: number, max: number): number {
 	return Math.min(base * Math.pow(2, attempt - 1), max)
 }
 
-function isStreamingFailure(message: string): boolean {
+function isStreamingFailure(message: string, patterns: string[] = STREAMING_FAILURE_MESSAGE_PATTERNS): boolean {
 	const lower = message.toLowerCase()
 	if (!lower) return false
-	return STREAMING_FAILURE_MESSAGE_PATTERNS.some((pattern) => {
+	return patterns.some((pattern) => {
 		try {
 			return new RegExp(pattern, "i").test(lower)
 		} catch {
 			return lower.includes(pattern.toLowerCase())
 		}
 	})
+}
+
+/** True when an error `name` is one of the configured streaming-failure names. */
+function isStreamingFailureName(name: string, names: string[]): boolean {
+	return names.some((candidate) => candidate.toLowerCase() === name.toLowerCase())
 }
 
 /** Repeating tool-call patterns: A-A-A or A-B-A-B-A-B etc. */
@@ -458,7 +594,6 @@ function isTaskToolCall(ev: V2Event): boolean {
 	const desc = ev.data?.input?.description ?? ev.data?.input?.subagent_type ?? ev.data?.input?.agent
 	return typeof desc === "string"
 }
-
 // ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
@@ -472,7 +607,9 @@ export default define({
 		const chunkTimeoutMs = opts.chunkTimeoutMs ?? DEFAULT_CHUNK_TIMEOUT_MS
 		const checkIntervalMs = opts.checkIntervalMs ?? DEFAULT_CHECK_INTERVAL_MS
 		const gracePeriodMs = opts.gracePeriodMs ?? DEFAULT_GRACE_PERIOD_MS
-		const maxRetries = opts.maxRetries ?? DEFAULT_MAX_RETRIES
+		// `maxRecoveryRetries` is v1's name for the same knob. Prefer the v2 name,
+		// fall back to the v1 alias so an existing v1 config ports unchanged.
+		const maxRetries = opts.maxRetries ?? opts.maxRecoveryRetries ?? DEFAULT_MAX_RETRIES
 		const baseBackoff = opts.baseBackoffMs ?? DEFAULT_BASE_BACKOFF_MS
 		const maxBackoff = opts.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS
 		const loopMaxContinues = opts.loopMaxContinues ?? DEFAULT_LOOP_MAX_CONTINUES
@@ -480,6 +617,119 @@ export default define({
 		const debug = opts.debug ?? DEFAULT_DEBUG
 		const activeUserWindowMs = opts.activeUserWindowMs ?? DEFAULT_ACTIVE_USER_WINDOW_MS
 		const injectIntervalMs = opts.injectIntervalMs ?? DEFAULT_INJECT_INTERVAL_MS
+
+		// ---- Ported from v1 (Mte90/opencode-auto-resume#33) ----
+		const rawBusyStallStrategy = opts.busyStallStrategy ?? "continue"
+		const busyStallStrategy: "continue" | "abort" | "off" =
+			rawBusyStallStrategy === "abort" || rawBusyStallStrategy === "off" ? rawBusyStallStrategy : "continue"
+		// Feature-gated on v2 (see FEATURE_GATED_OPTIONS): accepted for config
+		// compatibility, not yet acted on. Not bound to locals so they cannot be
+		// mistaken for live behaviour.
+		const resumeOnActionIntent = opts.resumeOnActionIntent !== false
+		const warmupMs = opts.warmupMs ?? DEFAULT_WARMUP_MS
+		const minActivityGapMs = opts.minActivityGapMs ?? DEFAULT_MIN_ACTIVITY_GAP_MS
+		const streamingFailureErrorNames = opts.streamingFailureErrorNames ?? DEFAULT_STREAMING_FAILURE_ERROR_NAMES
+		const streamingFailureMessagePatterns = opts.streamingFailureMessagePatterns ?? DEFAULT_STREAMING_FAILURE_MESSAGE_PATTERNS
+		const doneWithoutDetailsPrompt = opts.doneWithoutDetailsPrompt ?? DONE_WITHOUT_DETAILS_PROMPT
+		const thinkingToolRecoveryPrompt = opts.thinkingToolRecoveryPrompt ?? THINKING_TOOL_RECOVERY_PROMPT
+
+		/** Compile a user-supplied regex-source list, skipping anything invalid. */
+		function compilePatterns(
+			raw: string[] | undefined,
+			fallback: string[],
+			flags: string,
+		): RegExp[] {
+			const sources = Array.isArray(raw) && raw.length > 0 ? raw : fallback
+			const out: RegExp[] = []
+			for (const source of sources) {
+				try {
+					out.push(new RegExp(source, flags))
+				} catch {
+					// An invalid pattern is dropped rather than failing startup.
+				}
+			}
+			return out
+		}
+
+		const doneClaimPatterns = compilePatterns(opts.doneClaimPatterns, DEFAULT_DONE_CLAIM_PATTERNS, "im")
+		const readyToContinuePatterns = compilePatterns(
+			opts.readyToContinuePatterns,
+			DEFAULT_READY_TO_CONTINUE_PATTERNS,
+			"i",
+		)
+		const streamingFailureMessageRegexes = compilePatterns(
+			streamingFailureMessagePatterns,
+			DEFAULT_STREAMING_FAILURE_MESSAGE_PATTERNS,
+			"i",
+		)
+
+		// Options accepted but not yet acted on, because the v2 feature they tune
+		// is not ported. Listed (not warned) so an existing v1 config stays valid
+		// and the gap is documented rather than surprising. See
+		// docs/known-issues-v2.md.
+		const FEATURE_GATED_OPTIONS = [
+			"contextSaturationThreshold",
+			"subagentNativeCompactionEnabled",
+			"silentDeadStreamMinTokens",
+			"subagentWaitMs",
+			"discoveryDelayMs",
+			"toolTextCheckDelayMs",
+			"thinkingToolRecoveryPrompt",
+			"doneWithoutWorkPrompt",
+		] as const
+
+		// Options this build understands. Anything else in the user's config is
+		// reported once at startup so a silent fallback is visible rather than
+		// looking like a bug. (Mte90/opencode-auto-resume#33)
+		const RECOGNISED_OPTIONS = new Set<string>([
+			"chunkTimeoutMs",
+			"checkIntervalMs",
+			"gracePeriodMs",
+			"maxRetries",
+			"maxRecoveryRetries",
+			"baseBackoffMs",
+			"maxBackoffMs",
+			"loopMaxContinues",
+			"loopWindowMs",
+			"debug",
+			"activeUserWindowMs",
+			"injectIntervalMs",
+			"continuePrompt",
+			"toolTextRecoveryPrompt",
+			"actionIntentPrompt",
+			"doneWithoutWorkPrompt",
+			"busyStallStrategy",
+			"contextSaturationThreshold",
+			"subagentNativeCompactionEnabled",
+			"resumeOnActionIntent",
+			"discoveryDelayMs",
+			"warmupMs",
+			"minActivityGapMs",
+			"toolTextCheckDelayMs",
+			"subagentWaitMs",
+			"silentDeadStreamMinTokens",
+			"streamingFailureErrorNames",
+			"streamingFailureMessagePatterns",
+			"doneClaimPatterns",
+			"readyToContinuePatterns",
+			"doneWithoutDetailsPrompt",
+			"thinkingToolRecoveryPrompt",
+			"doneWithoutWorkPrompt",
+		])
+		const unknownOptions = Object.keys(opts).filter((key) => !RECOGNISED_OPTIONS.has(key))
+		if (unknownOptions.length > 0) {
+			log(
+				"warn",
+				`ignoring unrecognised option(s): ${unknownOptions.join(", ")} — ` +
+					`this v2 build does not read them. See docs/known-issues-v2.md.`,
+			)
+		}
+		// Feature-gated options are valid but inert on v2. Reported in the startup
+		// line rather than as a warning — the user cannot act on it, so a per-start
+		// warn would be pure noise. See docs/known-issues-v2.md.
+		const gatedInUse = Object.keys(opts).filter((key) =>
+			(FEATURE_GATED_OPTIONS as readonly string[]).includes(key),
+		)
 
 		const dbg = (...args: unknown[]) => {
 			if (debug) console.log("[auto-resume:debug]", ...args)
@@ -507,6 +757,38 @@ export default define({
 		// ---------------------------------------------------------------------
 
 		const sessions = new Map<string, SessionWatch>()
+
+		/**
+		 * Open shells from the process-registry event family, keyed by shell id
+		 * → `{ sessionID, startedAt }`. Populated by `shell.created`, cleared by
+		 * `shell.exited`. A session with an entry here is running a command and
+		 * must not be treated as a stalled parent.
+		 *
+		 * `shell.created` is the only shell event that carries its session, and it
+		 * nests it at `data.info.metadata.sessionID`; the exit events carry only
+		 * the shell id, so the reverse lookup has to be recorded here.
+		 */
+		const openShells = new Map<string, { sessionID: string; startedAt: number }>()
+
+		/** Number of shells currently open for `sid`, pruning stale entries. */
+		function openShellCount(sid: string, now = Date.now()): number {
+			let n = 0
+			for (const [id, s] of openShells) {
+				if (now - s.startedAt > SHELL_OPEN_MAX_MS) {
+					openShells.delete(id)
+					continue
+				}
+				if (s.sessionID === sid) n++
+			}
+			return n
+		}
+
+		/** Drop every shell entry owned by a session that no longer exists. */
+		function forgetShells(sid: string): void {
+			for (const [id, s] of openShells) {
+				if (s.sessionID === sid) openShells.delete(id)
+			}
+		}
 
 		function ensureWatch(sid: string): SessionWatch {
 			let w = sessions.get(sid)
@@ -551,7 +833,12 @@ export default define({
 
 		function touch(sid: string) {
 			const w = ensureWatch(sid)
-			w.lastActivityAt = Date.now()
+			// `minActivityGapMs` debounces activity: without it, a burst of events
+			// inside one tool call keeps resetting the stall clock and a genuinely
+			// wedged step never trips the watchdog.
+			const now = Date.now()
+			if (now - w.lastActivityAt < minActivityGapMs) return
+			w.lastActivityAt = now
 		}
 
 		function markBusy(sid: string) {
@@ -661,6 +948,40 @@ export default define({
 		}
 
 		/**
+		 * Is this session itself a subagent? Definitive test: ask the server for
+		 * our own record and look at `parentID`.
+		 *
+		 * This plugin is parent-scoped — it exists to recover sessions a human is
+		 * waiting on. A child is not that: it never reads the parent's AGENTS.md,
+		 * so a prompt-level "ignore injected continues" rule in the child agent
+		 * loses to an injection that arrives as a real task turn. Observed in the
+		 * wild: a worker answered an invisible prompt mid-task and never returned.
+		 *
+		 * Deliberately independent of the `lastWasTaskTool` heuristic used for
+		 * parents in `checkActiveSessions` — that one asks "did this session just
+		 * dispatch a child?", this one asks "is this session a child?". A silent
+		 * child gets no protection from the parent-side heuristic, which is
+		 * exactly the gap this closes.
+		 *
+		 * Cached on the watch record. `ctx.client` is optional and any failure
+		 * degrades to `false` — i.e. precisely the pre-guard behavior — so a host
+		 * without a client can neither break recovery nor fail to boot.
+		 */
+		async function isSubAgentSession(sid: string): Promise<boolean> {
+			const w = ensureWatch(sid)
+			if (typeof w.isSubAgent === "boolean") return w.isSubAgent
+			let sub = false
+			try {
+				const res = await ctx.client?.session.get({ path: { id: sid } })
+				sub = !!res?.data?.parentID
+			} catch {
+				sub = false
+			}
+			w.isSubAgent = sub
+			return sub
+		}
+
+		/**
 		 * Single choke point for every recovery injection. Guarantees at most one
 		 * synthetic per `injectIntervalMs` and refuses to talk to a live session,
 		 * because a turn sent to a busy session supersedes its in-flight step
@@ -684,6 +1005,12 @@ export default define({
 			allowDuringSelfAbort = false,
 		): Promise<boolean> {
 			const w = ensureWatch(sid)
+			// A subagent is not ours to recover. Checked first, before every other
+			// guard, so no code path below can reach a child.
+			if (await isSubAgentSession(sid)) {
+				dbg(`${short(sid)} subagent session — injection refused (parent owns recovery)`)
+				return false
+			}
 			if (!allowDuringSelfAbort && selfAbortActive(w)) {
 				dbg(`${short(sid)} injection refused — inside our own abort window`)
 				return false
@@ -726,8 +1053,17 @@ export default define({
 					if (!toDelete.includes(entries[i].sid)) toDelete.push(entries[i].sid)
 				}
 			}
-			for (const sid of toDelete) sessions.delete(sid)
-			if (toDelete.length > 0) dbg(`cleaned ${toDelete.length} idle sessions, total=${sessions.size}`)
+			let cleaned = 0
+			for (const sid of toDelete) {
+				// A session waiting on a long command emits no activity events and
+				// therefore looks idle. Don't drop its watch state out from under
+				// a shell that is still running.
+				if (openShellCount(sid) > 0) continue
+				forgetShells(sid)
+				sessions.delete(sid)
+				cleaned++
+			}
+			if (cleaned > 0) dbg(`cleaned ${cleaned} idle sessions, total=${sessions.size}`)
 		}
 
 		/**
@@ -790,6 +1126,13 @@ export default define({
 		}
 
 		async function tryAbortAndResume(sid: string, w: SessionWatch): Promise<boolean> {
+			// Guarded separately because this path calls `interrupt()` *before*
+			// delegating to injectOnce — guarding only the injection would still
+			// let us interrupt a running child.
+			if (await isSubAgentSession(sid)) {
+				dbg(`${short(sid)} subagent session — abort+resume refused`)
+				return false
+			}
 			if (w.aborting || selfAbortActive(w)) return false
 			if (w.oocLocked) {
 				dbg(`${short(sid)} oocLocked — refusing abort+resume escalation`)
@@ -927,6 +1270,15 @@ export default define({
 				dbg(`${short(sid)} mid-compaction — skipping ${kind} nudge`)
 				return
 			}
+			// A session with a shell still running is working, not idle. A parent
+			// parked on a background job goes idle the moment the tool call returns
+			// — long before the process finishes — so without this it collects a
+			// nudge on the spot and the stall watchdog never even gets a look.
+			const busyShells = openShellCount(sid)
+			if (busyShells > 0) {
+				dbg(`${short(sid)} ${busyShells} shell(s) still running — skipping ${kind} nudge`)
+				return
+			}
 			if (selfAbortActive(w)) {
 				dbg(`${short(sid)} self-abort in flight — skipping ${kind} nudge`)
 				return
@@ -942,16 +1294,23 @@ export default define({
 				dbg(`${short(sid)} ${kind} budget exhausted`)
 				return
 			}
-			w[budgetKey]++
-			log("info", `${short(sid)} ${kind} detected — sending targeted prompt (${w[budgetKey]}/${maxRetries})`)
+			// Port of v1 e1b8374 ("Fix todoNudgeAttempts burning retries on failed
+			// sends"): only count an attempt once the prompt actually landed. A
+			// rejected send costs nothing, so a transient failure no longer eats a
+			// retry and silences the nudge for the rest of the session.
+			const attemptNum = w[budgetKey] + 1
+			log("info", `${short(sid)} ${kind} detected — sending targeted prompt (${attemptNum}/${maxRetries})`)
 			w.recovering = true
 			// injectOnce debounces: this nudge counts once, not alongside a
 			// concurrent stall-watchdog injection.
 			const ok = await injectOnce(sid, prompt, "recovering: " + kind)
 			w.recovering = false
 			if (ok) {
+				w[budgetKey] = attemptNum
 				touch(sid)
 				markBusy(sid)
+			} else {
+				dbg(`${short(sid)} ${kind} nudge not delivered — attempt ${attemptNum} not counted`)
 			}
 		}
 
@@ -1054,19 +1413,19 @@ async function inspectOnIdle(sid: string) {
 				await targetedRecovery(sid, "tool-call-as-text", opts.toolTextRecoveryPrompt ?? TOOL_TEXT_RECOVERY_PROMPT, "toolTextAttempts")
 				return
 			}
-			if (containsReadyToContinuePattern(text)) {
+			if (containsReadyToContinuePattern(text, readyToContinuePatterns)) {
 				await targetedRecovery(sid, "ready-to-continue", opts.continuePrompt ?? CONTINUE_PROMPT, "intentNudgeAttempts")
 				return
 			}
-			if (containsActionIntent(text)) {
+			if (resumeOnActionIntent && containsActionIntent(text)) {
 				await targetedRecovery(sid, "action-intent", opts.actionIntentPrompt ?? opts.continuePrompt ?? CONTINUE_PROMPT, "intentNudgeAttempts")
 				return
 			}
-			if (containsDoneClaimPattern(text) && w.doneClaimAttempts < 1) {
+			if (containsDoneClaimPattern(text, doneClaimPatterns) && w.doneClaimAttempts < 1) {
 				// Single verification nudge for suspiciously terse completions
 				const trimmed = text.trim()
 				if (trimmed.length < 400) {
-					await targetedRecovery(sid, "done-claim-no-details", opts.doneWithoutWorkPrompt ?? DONE_WITHOUT_WORK_PROMPT, "doneClaimAttempts")
+					await targetedRecovery(sid, "done-claim-no-details", doneWithoutDetailsPrompt, "doneClaimAttempts")
 				}
 			}
 		}
@@ -1111,6 +1470,10 @@ async function inspectOnIdle(sid: string) {
 
 			for (const [sid, w] of sessions) {
 				if (w.status !== "busy" || w.userCancelled) continue
+				// Warmup: a session that only just went busy has not had a chance to
+				// emit anything. Without this a freshly-started turn can be declared
+				// stalled while it is still queueing its first model call.
+				if (now - w.createdAt < warmupMs) continue
 				// Stale compaction flag: a compaction that never reports
 				// ended/failed within the TTL is wedged — clear the guard so
 				// recovery can eventually intervene.
@@ -1126,6 +1489,10 @@ async function inspectOnIdle(sid: string) {
 				}
 				const silence = now - w.lastActivityAt
 				if (silence < chunkTimeoutMs + gracePeriodMs) continue
+				if (busyStallStrategy === "off") {
+					dbg(`stall on ${short(sid)} ignored (busyStallStrategy=off)`)
+					continue
+				}
 				// Same stale-guard as the compaction flag: an unanswered `permission.asked`
 				// must not stand this session down forever.
 				clearStalePermissionFlag(sid, w)
@@ -1137,6 +1504,16 @@ async function inspectOnIdle(sid: string) {
 					dbg(`${short(sid)} silent but inside our own abort window — skipping`)
 					continue
 				}
+				// A session with a shell still running is working, not stalled. This
+				// covers the parked-parent case the task-tool heuristic below cannot
+				// see: a backgrounded `shell` spawns no child session, so
+				// `lastWasTaskTool` stays false and `others.length` never gets a
+				// chance to say "this parent is waiting on something".
+				const busyShells = openShellCount(sid)
+				if (busyShells > 0) {
+					dbg(`${short(sid)} silent with ${busyShells} shell(s) still running — waiting`)
+					continue
+				}
 				// If another session is actively running and this one went silent
 				// right after dispatching a task tool, treat it as a parent wait.
 				if (w.lastWasTaskTool) {
@@ -1146,7 +1523,16 @@ async function inspectOnIdle(sid: string) {
 						continue
 					}
 				}
-				await recover(sid, `no activity for ${Math.ceil(silence / 1000)}s`)
+				// busyStallStrategy picks how a stall is answered. "abort" interrupts
+				// the wedged step before continuing, because a stream that went
+				// silent mid-generation will not pick the prompt up on its own.
+				// Mirrors the v1 branch at src/index.ts.
+				if (busyStallStrategy === "abort" && w.resumeAttempts < maxRetries) {
+					log("info", `${short(sid)} stall (busyStallStrategy=abort): aborting before continue`)
+					await tryAbortAndResume(sid, w)
+				} else {
+					await recover(sid, `no activity for ${Math.ceil(silence / 1000)}s`)
+				}
 			}
 			cleanupIdleSessions()
 		}
@@ -1221,6 +1607,7 @@ async function inspectOnIdle(sid: string) {
 				case "session.deleted": {
 					const sid = sidOf(ev)
 					if (!sid) return
+					forgetShells(sid)
 					sessions.delete(sid)
 					return
 				}
@@ -1240,6 +1627,7 @@ async function inspectOnIdle(sid: string) {
 				case "session.revert.committed": {
 					const sid = sidOf(ev)
 					if (!sid) return
+					forgetShells(sid)
 					sessions.delete(sid)
 					return
 				}
@@ -1249,6 +1637,7 @@ async function inspectOnIdle(sid: string) {
 				case "session.reverted": {
 					const sid = sidOf(ev)
 					if (!sid) return
+					forgetShells(sid)
 					sessions.delete(sid)
 					return
 				}
@@ -1359,6 +1748,38 @@ async function inspectOnIdle(sid: string) {
 					touch(sid)
 					return
 				}
+				// --- shell process registry ---
+				// `session.shell.*` above is the session-scoped family. The runtime
+				// also emits a process-registry family, and which one fires depends
+				// on the tool path (the bash/Code Mode shell emits only these). We
+				// need the registry pair because it is the one that reports a
+				// backgrounded job's real completion: `session.tool.success` fires
+				// as soon as the *tool call* returns, which for `background: true`
+				// is a few hundred ms — long before the process finishes.
+				//
+				// `shell.deleted` is deliberately not used: it carries a different
+				// id family than `created`/`exited` (verified against the running
+				// server), so it cannot close an entry. `shell.exited` can.
+				case "shell.created": {
+					const info = ev.data?.info
+					if (!info || typeof info !== "object") return
+					const rec = info as { id?: unknown; metadata?: { sessionID?: unknown } }
+					const id = rec.id
+					const sid = rec.metadata?.sessionID
+					if (typeof id !== "string" || typeof sid !== "string") return
+					openShells.set(id, { sessionID: sid, startedAt: Date.now() })
+					touch(sid)
+					return
+				}
+				case "shell.exited": {
+					const id = ev.data?.id
+					if (typeof id !== "string") return
+					const sid = openShells.get(id)?.sessionID
+					if (sid === undefined) return
+					openShells.delete(id)
+					touch(sid)
+					return
+				}
 				case "session.tool.success": {
 					const sid = sidOf(ev)
 					if (!sid) return
@@ -1405,7 +1826,7 @@ async function inspectOnIdle(sid: string) {
 					const errMsg = String(ev.data?.error?.message ?? "")
 					maybeLockOoc(sid, errMsg)
 					log("info", `${short(sid)} provider retry #${ev.data?.attempt ?? "?"}: ${errType || errMsg}`)
-					if (!isStreamingFailure(errMsg) && errType !== "retryable") return
+					if (!isStreamingFailure(errMsg, streamingFailureMessagePatterns) && !isStreamingFailureName(errType, streamingFailureErrorNames) && errType !== "retryable") return
 					// Let the provider retries play out first; only intervene if it stays quiet
 					if (nowSilenceTooLong(w)) {
 						w.pendingRecoveryArmed = true
@@ -1440,7 +1861,7 @@ async function inspectOnIdle(sid: string) {
 					markIdle(sid)
 					w.pendingRecoveryArmed = true // our delayed recovery must survive this idle transition
 					log("warn", `${short(sid)} ${ev.type}: ${errType || "error"} ${errMsg.slice(0, 160)}`)
-					void recover(sid, `${ev.type}${isStreamingFailure(errMsg) ? " (streaming)" : ""}`)
+					void recover(sid, `${ev.type}${isStreamingFailure(errMsg, streamingFailureMessagePatterns) ? " (streaming)" : ""}`)
 					return
 				}
 
@@ -1479,7 +1900,8 @@ async function inspectOnIdle(sid: string) {
 
 		log(
 			"info",
-			`ready (opencode v2). timeout=${chunkTimeoutMs}ms interval=${checkIntervalMs}ms retries=${maxRetries} loop=${loopMaxContinues}/${loopWindowMs / 1000}s`,
+			`ready (opencode v2). timeout=${chunkTimeoutMs}ms interval=${checkIntervalMs}ms retries=${maxRetries} loop=${loopMaxContinues}/${loopWindowMs / 1000}s warmup=${warmupMs}ms stall=${busyStallStrategy}` +
+				(gatedInUse.length > 0 ? ` accepted-but-inert=${gatedInUse.join(",")}` : ""),
 		)
 
 		// Cleanup: stop timers and the event pump; OpenCode awaits this on disable/reload/shutdown.
