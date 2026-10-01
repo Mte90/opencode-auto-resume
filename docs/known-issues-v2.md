@@ -6,13 +6,19 @@ a config key that this build ignores is never silent.
 
 ## Options that are accepted but not applied
 
-These keys are read without error, and are listed in the plugin's startup line as
-`accepted-but-inert=…`. They stay in `AutoResumeOptions` so an existing v1
-config keeps loading unchanged.
+**None.** Every option this build recognises is now applied, and the startup line
+no longer carries an `accepted-but-inert=…` note.
 
-| Option | Why it is inert on v2 |
-| --- | --- |
-| `toolTextCheckDelayMs` | The delayed raw-tool-call-as-text re-check is v1's polling shape. v2 evaluates the text once, on idle, from the authoritative message history. |
+The machinery is kept rather than deleted. It is the only signal a user gets that
+an option is being ignored, and the next unported feature needs it more than this
+build does. `docs/known-issues-v2.md` and the README inert list are checked
+against `FEATURE_GATED_OPTIONS` in the source, and a test asserts the list is
+empty — so adding an option to the recognised set without implementing it cannot
+pass quietly.
+
+Two gaps closed on this branch, in order: `subagentWaitMs` and
+`discoveryDelayMs` (orphan-parent recovery and session discovery), then
+`toolTextCheckDelayMs` (below).
 
 `doneWithoutDetailsPrompt` and `doneWithoutWorkPrompt` **are** both applied on
 v2, and they are the two halves of v1's done-claim handling: the first asks for a
@@ -168,6 +174,59 @@ busy reset for #26: a model that re-announces completion each turn was otherwise
 handed a fresh budget each time it announced, so the nudge never stopped. v2
 still had that, and now does not. The open-todos nudge is the opposite case and
 does reset per cycle, because an open list is new information each turn.
+
+## The settle delay before a turn is judged
+
+v1 never judges a finished turn on the `session.idle` event. It arms a timer for
+`toolTextCheckDelayMs` and runs the done/tool checks from there, and the option
+is the delay. That is not incidental: `session.idle` can arrive while the
+assistant's closing text is still being written into the message history, so a
+check that reads too early sees a half-finished turn — missing the pattern it
+should have caught, or judging a turn that was not over.
+
+The v2 port judged on the idle event for most of its life, on the strength of the
+live delta buffer: the plugin sees text as it streams, so it usually has the final
+turn before `session.idle` arrives, which is more reliable than waiting. It does
+not remove the race. The buffer is empty when the plugin loads mid-turn, and the
+fallback in that case is precisely the history that may not have flushed.
+
+So the work is split in two, and the option tunes the half that needs it:
+
+| Pass | When | What it decides |
+|---|---|---|
+| structural | on `session.idle` | dead stream, user hand-off, user recently active |
+| pattern | `+` `toolTextCheckDelayMs` | celebration, tool-call-as-text, ready-to-continue, action intent, done-claim |
+
+The structural pass is immediate on purpose. A stream that died before delivering
+any text is exactly the case where every pattern check has nothing to look at, so
+waiting would only delay a recovery that is already certain.
+
+The pattern pass re-reads the history rather than reusing the first read, which
+is the whole point: text that landed after the idle event is what it judges. It
+also **re-runs the structural guards** instead of trusting the first pass's
+verdict, because the wait is long enough for the user to have replied — and a
+synthetic nudge sent over a real reply is the "Step interrupted" bug those guards
+exist to prevent.
+
+Three lifecycle details, all covered by tests:
+
+- A **new turn cancels** a pending pass. `markBusy` clears the timer, and the
+  timer itself re-checks that the session is still idle: a queued callback can
+  outlive the turn that armed it.
+- A **second idle replaces** the first rather than stacking a second judgement on
+  the same text. Two passes on one turn would spend two attempts of one budget on
+  one piece of text, and the second would be a nudge about a nudge.
+- **Stopping the plugin drops** any pending pass. Otherwise a reload leaves a
+  timer pointing at a session this build is no longer watching, and it fires
+  minutes later against a history nobody is reading.
+
+### One difference worth naming
+
+v1's `checkForToolCallAsText` bundles every text-based detector behind this one
+timer. v2's detectors were separate before the option was honoured, so the delay
+applies to the pattern pass as a whole rather than to the tool-call-as-text check
+specifically. Nothing is lost by it — every detector that reads the closing text
+gets the settle window, which is what the delay was for.
 
 ## Orphan parent recovery
 

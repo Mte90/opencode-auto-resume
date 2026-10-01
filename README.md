@@ -436,18 +436,34 @@ Disable via `"-auto-resume.v2"` in `plugins`.
 - **Migration notes (v1 → v2, stable validation):** [docs/v2/migration.md](docs/v2/migration.md)
 - **What the v2 port does and does not yet do:** [docs/known-issues-v2.md](docs/known-issues-v2.md)
 
-The v2 build reads every option in the table below. A handful of them are
-accepted without being applied yet, because the v2 feature they tune is not
-ported — they are listed in the startup line as `accepted-but-inert=…` and
-explained in [docs/known-issues-v2.md](docs/known-issues-v2.md). An option name
-this build does not know at all produces a single warning at startup, so a typo
-or an unported key is never silent.
+### How a finished turn is judged
+
+`session.idle` does not decide anything by itself. The turn is inspected in two
+passes, because `session.idle` can arrive while the assistant's closing text is
+still being written into the message history:
+
+1. **Straight away** — is this a dead stream, is it handing control back to the
+   user, is the user already busy. None of these read the final text.
+2. **After `toolTextCheckDelayMs`** (3s default) — the celebration,
+   tool-call-as-text, ready-to-continue, action-intent and done-claim detectors,
+   re-reading the history. This is the pass the option exists for, and it re-runs
+   the guards from step 1, because three seconds is long enough for the user to
+   have replied and a nudge sent over them interrupts their own step.
+
+A new turn cancels a pending second pass, and a second idle replaces it rather
+than stacking another judgement on the same text. See
+[docs/known-issues-v2.md](docs/known-issues-v2.md).
+
+The v2 build reads and applies every option in the table below — the last of
+the gaps closed with `toolTextCheckDelayMs`. Any option it accepts but does not
+apply is listed in the startup line as `accepted-but-inert=…` and explained in
+[docs/known-issues-v2.md](docs/known-issues-v2.md); that list is currently empty.
+An option name this build does not know at all produces a single warning at
+startup, so a typo or a dropped port is never silent.
 
 ### Configurable options
 
 Defaults are the same on v1 and v2 unless a row says otherwise.
-
-### Configurable options
 
 | Option | Default | Description |
 |---|---|---|
@@ -463,7 +479,7 @@ Defaults are the same on v1 and v2 unless a row says otherwise.
 | `streamingFailureErrorNames` | `["ProviderError","APIError","StreamError","ConnectionError","TimeoutError"]` | Error names that classify as streaming failures (exact match) |
 | `streamingFailureMessagePatterns` | `["streaming response failed","stream.*fail","connection.*reset","connection.*closed"]` | Regex patterns (case-insensitive) in error messages indicating streaming failure |
 | `maxRecoveryRetries` | `2` | Max streaming-failure recovery attempts before abort+resume escalation |
-| `toolTextCheckDelayMs` | `3000` | Delay before scanning an idle session for tool-as-text; also the recovery watchdog delay |
+| `toolTextCheckDelayMs` | `3000` | Settle delay before a finished turn's closing text is judged against the done/tool patterns; also the recovery watchdog delay. On v2 only the pattern half is deferred — dead streams are still caught on the idle event, because a stream that died before delivering any text has nothing for those patterns to read. Set `0` to judge on the idle event |
 | `minActivityGapMs` | `1000` | Skip recovery if the session was active within this gap |
 | `warmupMs` | `15000` | Action-intent detection disabled while a session is younger than this |
 | `debug` | `false` | Enable `[debug]` console diagnostics |
@@ -483,9 +499,6 @@ Defaults are the same on v1 and v2 unless a row says otherwise.
 | `subagentNativeCompactionEnabled` | `false` | Opt-in native `session.summarize()` for saturated subagent sessions (no magic-context detection required) |
 | `injectIntervalMs` | v2 only | Minimum gap between recovery injections for one session. No v1 equivalent |
 | `logFile` | v2 only | Where this build appends its log. v2 removed v1's server log endpoint, so without this the plugin is silent. Defaults to `~/.local/state/opencode-v2/auto-resume.log` |
-
-Accepted but **not applied** on v2: `toolTextCheckDelayMs`. See
-[docs/known-issues-v2.md](docs/known-issues-v2.md) for why.
 
 Message patterns are matched case-insensitively. Error names use exact match.
 

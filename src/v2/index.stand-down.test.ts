@@ -102,6 +102,7 @@ async function replay(opts: { messages: any[]; events: any[] }): Promise<Injecte
 	const ctx: any = {
 		event: stream,
 		app: { log: () => {} },
+		options: { toolTextCheckDelayMs: 0 },
 		session: {
 			// v2 returns a plain ARRAY here, not { messages }. Asserted separately below.
 			context: async () => opts.messages,

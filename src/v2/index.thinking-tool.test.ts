@@ -105,6 +105,7 @@ const TEXT_WITH_TOOL_CALL = [{ type: "text", text: "<function=read><parameter=pa
 
 const OPTIONS = {
 	chunkTimeoutMs: 600_000,
+	toolTextCheckDelayMs: 0,
 	checkIntervalMs: 20,
 	gracePeriodMs: 0,
 	warmupMs: 0,

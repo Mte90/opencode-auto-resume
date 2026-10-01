@@ -102,7 +102,10 @@ async function replay(
 		// The plugin reads its config from `ctx.options`; the second argument to
 		// `setup()` is ignored. Passing options the other way makes every
 		// negative assertion below pass for the wrong reason.
-		options: { ...opts, logFile },
+		// Before the spread, so it applies to every test here unless one asks for a
+		// different value. The deferred pattern pass defaults to 3s, which is not what
+		// these tests measure — the nudge they assert on would land after the wait.
+		options: { toolTextCheckDelayMs: 0, ...opts, logFile },
 		session: {
 			context: async () => [oldUserTurn(), assistantTurn(text)],
 			// Empty: no other session is active, so the `lastWasTaskTool` branch
@@ -290,42 +293,45 @@ describe("v2: option reporting at startup", () => {
 		expect(logs.filter((l) => l.includes("unrecognised"))).toEqual([])
 	})
 
-	test("the startup line names the accepted-but-inert options in use", async () => {
-		const { logs } = await replay([], { chunkTimeoutMs: 5000, toolTextCheckDelayMs: 3000 })
-		const ready = logs.filter((l) => l.includes("ready (opencode v2)"))
-		expect(ready).toHaveLength(1)
-		expect(ready[0]).toContain("accepted-but-inert=")
-		expect(ready[0]).toContain("toolTextCheckDelayMs")
-	})
-
-	test("discoveryDelayMs is live on v2, so it is no longer listed as inert", async () => {
-		// Control: a genuinely inert option, set the same way, IS still listed.
-		// Without this the assertion below would pass for the wrong reason.
-		const { logs } = await replay([], {
-			chunkTimeoutMs: 5000,
-			discoveryDelayMs: 5_000,
-			toolTextCheckDelayMs: 3000,
-		})
-		const ready = logs.filter((l) => l.includes("ready (opencode v2)"))
-		expect(ready).toHaveLength(1)
-		expect(ready[0]).toContain("accepted-but-inert=")
-		expect(ready[0]).toContain("toolTextCheckDelayMs")
-		expect(ready[0]).not.toContain("discoveryDelayMs")
-	})
-
-	test("subagentWaitMs is live on v2, so it is no longer listed as inert", async () => {
-		// The orphan watch reads this option, so a config carrying it must not be told
-		// it is being ignored — that warning is the only way a user finds out.
+	test("the startup line names no inert options, because none are inert", async () => {
+		// Every v1 option this build understands is now applied, so the inert list has
+		// nothing to put in it — including for the three options that were inert when
+		// this branch started. A config carrying them must not be told they are being
+		// ignored: that note is the only way a user finds out.
 		const { logs } = await replay([], {
 			chunkTimeoutMs: 5000,
 			subagentWaitMs: 15_000,
 			toolTextCheckDelayMs: 3000,
+			discoveryDelayMs: 5_000,
 		})
 		const ready = logs.filter((l) => l.includes("ready (opencode v2)"))
 		expect(ready).toHaveLength(1)
-		expect(ready[0]).toContain("accepted-but-inert=")
-		expect(ready[0]).toContain("toolTextCheckDelayMs")
+		expect(ready[0]).not.toContain("accepted-but-inert=")
 		expect(ready[0]).not.toContain("subagentWaitMs")
+		expect(ready[0]).not.toContain("toolTextCheckDelayMs")
+		expect(ready[0]).not.toContain("discoveryDelayMs")
+	})
+
+	test("CONTROL: nothing is listed as feature-gated in the source", async () => {
+		// The structural counterpart to the assertion above, and the one that actually
+		// holds the line: adding an option to RECOGNISED_OPTIONS without implementing it
+		// is exactly how this build went from "several options inert" to "none", and it
+		// is the failure the list exists to make visible. With the list empty there is
+		// no behavioural test left for it — no production path reaches it — so it is
+		// asserted on the source instead.
+		const block = SOURCE.match(/const FEATURE_GATED_OPTIONS = \[([^\]]*)\]/)
+		expect(block).not.toBeNull()
+		const gated = [...(block![1].match(/"([a-zA-Z][a-zA-Z0-9]*)"/g) ?? [])].map((x) => x.replace(/"/g, ""))
+		expect(gated).toEqual([])
+	})
+
+	test("the inert reporting is kept, so the next gap has somewhere to be listed", async () => {
+		// Deliberately not deleted when the last entry left the list. The reporting is
+		// the only signal a user gets that an option is being ignored, and the next
+		// unported feature needs it more than this build does.
+		expect(SOURCE).toContain("FEATURE_GATED_OPTIONS")
+		expect(SOURCE).toContain("accepted-but-inert=")
+		expect(SOURCE).toContain("gatedInUse")
 	})
 
 	test("the startup line carries no accepted-but-inert list when none are set", async () => {
@@ -401,7 +407,7 @@ describe("v2: contract assertions on source", () => {
 		expect(block).not.toBeNull()
 		const recognised = new Set([...(block![1].match(/"([a-zA-Z][a-zA-Z0-9]*)"/g) ?? [])].map((s) => s.replace(/"/g, "")))
 		// Sampled across every category: prompts, timing, pattern lists, the
-		// v1-only alias, and the three that v2 recognises but does not act on.
+		// v1-only alias, and the two that were inert until this branch ported them.
 		for (const key of [
 			"continuePrompt",
 			"actionIntentPrompt",

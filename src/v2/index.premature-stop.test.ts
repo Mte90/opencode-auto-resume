@@ -100,6 +100,7 @@ const OPTIONS = {
 	// Long enough that the stall watchdog never fires: these tests are about the
 	// idle path only, and a stall injection would mask which path produced a nudge.
 	chunkTimeoutMs: 600_000,
+	toolTextCheckDelayMs: 0,
 	checkIntervalMs: 20,
 	gracePeriodMs: 0,
 	warmupMs: 0,

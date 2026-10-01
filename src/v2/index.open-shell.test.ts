@@ -95,6 +95,7 @@ async function replay(events: any[], messages?: any[]): Promise<Injected[]> {
 	const ctx: any = {
 		event: stream,
 		app: { log: () => {} },
+		options: { toolTextCheckDelayMs: 0 },
 		session: {
 			context: async () => messages ?? [oldUserTurn(), assistantTurn(READY_TEXT)],
 			// Empty: no other session is active, so the `lastWasTaskTool` branch

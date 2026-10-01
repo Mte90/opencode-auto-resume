@@ -200,6 +200,10 @@ interface SessionWatch {
 	 * budget the same prompt goes out on every watchdog tick — v1's structure
 	 * assumed the subagent goes busy again, and a dead one never does. */
 	orphanRecoveryTried: boolean
+	/** The pending deferred pattern pass, if any. Held so a new idle can replace
+	 * it rather than stack a second judgement on the same turn, and so a new turn
+	 * can cancel it. */
+	toolTextTimer: ReturnType<typeof setTimeout> | null
 	/** Tool calls started but not finished, tracked from the tool lifecycle events.
 	 * The orphan watch must never abort a session that is legitimately working. */
 	pendingTools: number
@@ -965,6 +969,10 @@ export default define({
 		// How long a parent may sit busy after its last subagent went idle before
 		// the orphan watch acts. v1 default, honoured for the first time here.
 		const subagentWaitMs = opts.subagentWaitMs ?? DEFAULT_SUBAGENT_WAIT_MS
+		// How long to let a finished turn's text settle before judging it against the
+		// done/tool patterns. v1's default, and the reason v1 does not judge on idle
+		// at all — see inspectOnIdle.
+		const toolTextCheckDelayMs = opts.toolTextCheckDelayMs ?? DEFAULT_TOOL_TEXT_CHECK_DELAY_MS
 
 		// ---- Ported from v1 (Mte90/opencode-auto-resume#33) ----
 		const rawBusyStallStrategy = opts.busyStallStrategy ?? "continue"
@@ -1025,7 +1033,13 @@ export default define({
 		// is not ported. Listed (not warned) so an existing v1 config stays valid
 		// and the gap is documented rather than surprising. See
 		// docs/known-issues-v2.md.
-		const FEATURE_GATED_OPTIONS = ["toolTextCheckDelayMs"] as const
+		//
+		// Empty: every v1 option this build understands is now applied. Kept as a
+		// list rather than deleted because the reporting below, and the
+		// accepted-but-inert= note in the startup line, are the only things a user
+		// has to go on when an option is quietly ignored — so the next one that
+		// arrives has somewhere to be listed.
+		const FEATURE_GATED_OPTIONS = [] as const
 
 		// Options this build understands. Anything else in the user's config is
 		// reported once at startup so a silent fallback is visible rather than
@@ -1176,6 +1190,7 @@ export default define({
 					taskCompleteOverrides: 0,
 					orphanWatchStartAt: null,
 					orphanRecoveryTried: false,
+					toolTextTimer: null,
 					lastSubagentCheckAt: 0,
 					pendingTools: 0,
 					unknownToolErrors: new Map(),
@@ -1228,6 +1243,12 @@ export default define({
 				// same thing.
 				w.todoNudgeAttempts = 0
 				w.intentNudgeAttempts = 0
+				// A new turn means the text a pending pattern pass was going to judge is
+				// superseded, and markBusy has just emptied the buffer it would have read.
+				if (w.toolTextTimer) {
+					clearTimeout(w.toolTextTimer)
+					w.toolTextTimer = null
+				}
 				// A new turn re-opens the question of whether the work is finished.
 				w.completionSignaled = false
 				w.gaveUp = false
@@ -1692,6 +1713,32 @@ export default define({
 				dbg(`${short(sid)} todo read failed:`, e instanceof Error ? e.message : String(e))
 				return w.todos
 			}
+		}
+
+		/**
+		 * Arm the deferred pattern pass, replacing any already pending.
+		 *
+		 * Replacement rather than stacking is the point: two idles inside one delay
+		 * window would otherwise judge the same turn twice, and a turn that matches
+		 * would spend two attempts of its budget on one piece of text.
+		 */
+		function schedulePatternPass(sid: string): void {
+			const w = ensureWatch(sid)
+			if (w.toolTextTimer) clearTimeout(w.toolTextTimer)
+			w.toolTextTimer = setTimeout(() => {
+				w.toolTextTimer = null
+				// v1's own guard, and it is doing real work here: a turn that started
+				// during the delay has its own idle, and its own armed pass. Judging
+				// this one now would read the live buffer, which markBusy has already
+				// emptied for the new turn.
+				if (w.status !== "idle") {
+					dbg(`${short(sid)} pattern pass skipped — session is ${w.status}, not idle`)
+					return
+				}
+				if (w.userCancelled) return
+				void inspectOnIdle(sid, "pattern")
+			}, toolTextCheckDelayMs)
+			dbg(`${short(sid)} pattern pass armed for +${toolTextCheckDelayMs}ms`)
 		}
 
 		async function targetedRecovery(
@@ -2213,7 +2260,35 @@ export default define({
 			}
 		}
 
-		async function inspectOnIdle(sid: string) {
+		/**
+		 * Judge a finished turn — in two phases, because the text may not have settled.
+		 *
+		 * v1 evaluates the done/tool patterns from a timer armed on the idle event
+		 * (`toolTextCheckDelayMs`, 3s by default) rather than on the event itself, and
+		 * the delay is the feature: `session.idle` can arrive while the assistant's
+		 * final text is still being written into the message history, and a check that
+		 * reads too early sees a half-finished turn and either misses the pattern or
+		 * judges a turn that was not over.
+		 *
+		 * v2 already avoids most of that race with the live delta buffer, which is
+		 * why this port was able to judge on idle for as long as it did. It does not
+		 * remove it: the buffer is empty when the plugin loaded mid-turn, and the
+		 * fallback is exactly the history that may not have flushed. So the option is
+		 * honoured by splitting the work:
+		 *
+		 * - **structural** (immediately): is this a dead stream, is it handing control
+		 *   to the user, is the user already busy. None of these depend on the final
+		 *   text, and a dead stream must be caught before anything that reads text.
+		 * - **pattern** (after the delay): the celebration, tool-call-as-text, ready-to-
+		 *   continue, action-intent and done-claim detectors. These are exactly the
+		 *   ones that read the last text and so are exactly the ones the settle delay
+		 *   exists for.
+		 *
+		 * The guards above the split run again in the pattern phase, deliberately: three
+		 * seconds is long enough for the user to have replied, and a nudge fired through
+	 *   their reply is the bug the hand-off and stand-down guards exist to prevent.
+		 */
+		async function inspectOnIdle(sid: string, phase: "structural" | "pattern" = "structural") {
 			const w = ensureWatch(sid)
 			const messages = await loadMessages(sid)
 			noteInboundUserMessage(sid, w, messages)
@@ -2240,6 +2315,11 @@ export default define({
 
 			if (await shouldStandDownForUser(sid, messages, activeUserWindowMs)) {
 				dbg(`${short(sid)} user has pending input or was recently active — standing down`)
+				return
+			}
+
+			if (phase === "structural") {
+				schedulePatternPass(sid)
 				return
 			}
 
@@ -3422,6 +3502,12 @@ export default define({
 			clearInterval(watchdog)
 			clearInterval(discoveryTimer)
 			clearTimeout(initialDiscovery)
+			// A pending pattern pass outlives the plugin otherwise, and would judge a
+			// session against a history this build is no longer watching.
+			for (const w of sessions.values()) {
+				if (w.toolTextTimer) clearTimeout(w.toolTextTimer)
+				w.toolTextTimer = null
+			}
 			sessions.clear()
 			log("info", "stopped")
 		}

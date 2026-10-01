@@ -138,6 +138,7 @@ async function replay(h: HarnessOpts) {
 		event: stream,
 		options: {
 			chunkTimeoutMs: 600_000,
+			toolTextCheckDelayMs: 0,
 			checkIntervalMs: 20,
 			gracePeriodMs: 0,
 			warmupMs: 0,
