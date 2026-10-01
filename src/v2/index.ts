@@ -3183,6 +3183,15 @@ export default define({
 					return
 				}
 				// --- reverts ---
+				// v1.18.34 (verified live, 2026-10-01, on an arch LXC with the real
+				// v1 plugin loaded): v1 has NO revert-named event. A revert arrives as
+				// `session.updated` whose `properties.info.revert` is populated with
+				// { messageID, partID?, snapshot?, diff? }, preceded by `session.diff`.
+				// So on v1 a plugin that only switches on the event *name* never sees a
+				// rewind at all — which is exactly why the v1 port never dropped its
+				// watch state on one. (An earlier comment here claimed v1 emitted
+				// `session.reverted`; that was wrong, and the case it defended is gone.)
+				//
 				// v2 emits a three-stage revert family. `staged` is intermediate
 				// (the user can still clear it), while `cleared` and `committed`
 				// are terminal; drop our watch state on the terminal stages so a
@@ -3196,16 +3205,6 @@ export default define({
 				}
 				case "session.revert.cleared":
 				case "session.revert.committed": {
-					const sid = sidOf(ev)
-					if (!sid) return
-					forgetShells(sid)
-					sessions.delete(sid)
-					return
-				}
-				// v1 legacy: not emitted in v2 (reverts now surface as
-				// `session.revert.cleared` / `session.revert.committed`). Kept
-				// defensively so older runtimes still drop their watch state.
-				case "session.reverted": {
 					const sid = sidOf(ev)
 					if (!sid) return
 					forgetShells(sid)
