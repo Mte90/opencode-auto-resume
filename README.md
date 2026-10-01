@@ -219,11 +219,15 @@ _Motivated by:_
 
 ### Explicit completion via `task_complete`
 
-The agent can call the built-in `task_complete` tool to signal that all work is done. When invoked, the plugin stops sending any further `"continue"` prompts, clears all pending timers, and marks the session as complete. This replaces fragile text-based heuristics (emoji patterns, language detection) with a deterministic signal.
+The agent can call the `task_complete` tool to signal that all work is done. When invoked, the plugin stops sending any further `"continue"` prompts, clears all pending timers, and marks the session as complete. This replaces fragile text-based heuristics (emoji patterns, language detection) with a deterministic signal.
+
+On v2 there is no built-in equivalent, so the plugin registers the tool itself through the v2 tool registry (`ctx.tool.transform`). It is registered before the first turn, and a registry that refuses the registration is logged and skipped rather than taking the watchdog down with it.
 
 If `task_complete` is called while open todos remain, the call is rejected (up to `maxRetries` times) with a message asking the agent to finish the remaining work first.
 
-Repeat calls with no new user message in between are guarded: the first acknowledgement carries an explicit stop instruction, the second returns a repeat warning, and the third and subsequent calls are rejected as errors. This breaks the ack self-loop where the acknowledgement tool-result is fed back into the turn and a stuck model re-emits `task_complete` instead of ending with text. The counter resets on a genuine user message, on the block path above, or when any other tool runs in between.
+Repeat calls with no new user message in between are guarded: the first acknowledgement carries an explicit stop instruction, the second returns a repeat warning, and the third and subsequent calls are rejected as errors. This breaks the ack self-loop where the acknowledgement tool-result is fed back into the turn and a stuck model re-emits `task_complete` instead of ending with text — v1 logged 27 consecutive acked calls with zero new user input. The counter resets on a genuine user message, on the block path above, or when any other tool runs in between.
+
+The todo gate is skipped for subagents: a child was never asked to do the parent's open items, so gating its report on them would block it on work outside its scope.
 
 ---
 

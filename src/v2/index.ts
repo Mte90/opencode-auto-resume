@@ -97,6 +97,15 @@ interface AutoResumePluginInput {
 	 * installed todo tool writes, so this only ever calls `get`.
 	 */
 	storage?: { get: (key: string) => Promise<unknown> }
+	/**
+	 * Tool registry (`ctx.tool.transform` / `ctx.tool.list` / `ctx.tool.hook`).
+	 * v2 plugins register their own tools here, which is how `task_complete`
+	 * exists: there is no built-in equivalent in v2, so the plugin provides it.
+	 */
+	tool?: {
+		transform: (cb: (editor: AutoResumeToolEditor) => void) => Promise<unknown>
+		list: () => Promise<readonly unknown[]>
+	}
 	/** Application logger, when the host provides one. */
 	app?: { log?: (level: string, message: string) => unknown }
 }
@@ -115,6 +124,16 @@ interface V2Event {
 	type: string
 	created: number
 	data?: Record<string, any>
+}
+
+/** The tool registry handle passed to `ctx.tool.transform`. */
+interface AutoResumeToolEditor {
+	add(tool: {
+		name: string
+		description: string
+		input: Record<string, unknown>
+		execute: (input: any, context: { sessionID: string }) => Promise<{ content: string }>
+	}): void
 }
 
 interface SessionWatch {
@@ -163,6 +182,15 @@ interface SessionWatch {
 	/** The session's todo list, read from the todo tool's storage key. */
 	todos: Todo[]
 	todosFetchedAt: number
+	/** Consecutive `task_complete` acks with no new user message or other tool
+	 * work between them. Guards the ack self-loop, where the ack tool-result is
+	 * fed back and the model re-emits the tool instead of ending its turn. Persists
+	 * across busy/idle cycles by design. */
+	taskCompleteSignals: number
+	/** How many times a `task_complete` call was overridden because todos were
+	 * still open. Bounded by `maxRetries` — past that the call is honoured, because
+	 * an unbounded block is its own kind of loop. */
+	taskCompleteOverrides: number
 	/** Id of the newest inbound user message already acted on, so a replayed or
 	 * re-delivered message does not re-arm the done-claim budgets. Identity, not
 	 * clock time — see noteInboundUserMessage. */
@@ -479,6 +507,33 @@ const TOOL_STATE_COMPLETED = "completed"
 const AWAITING_USER_TOOLS = new Set(["question", "permission", "ask", "confirm"])
 
 const CONTINUE_PROMPT = "continue"
+
+/**
+ * The `task_complete` acknowledgement texts.
+ *
+ * The ack is fed straight back into the model's turn, so a stuck model re-emits
+ * `task_complete` instead of ending with text. That is not hypothetical: v1
+ * recorded 27 consecutive acked calls with zero new user input. The first ack
+ * therefore carries an explicit stop instruction, the second warns, and the third
+ * throws so the turn is forced to end.
+ */
+const TASK_COMPLETE_ACK =
+	"Task completion acknowledged. No further continuation will be sent. " +
+	"End your turn now with a brief text reply — do not call task_complete or any other tool again " +
+	"unless the user sends a new message."
+
+const TASK_COMPLETE_REPEAT_WARNING =
+	"Task completion acknowledged already on your previous call — completion is recorded. " +
+	"End your turn now with a brief text reply. Do not call task_complete again; " +
+	"further repeat calls are rejected as errors."
+
+const TASK_COMPLETE_REPEAT_ERROR =
+	"task_complete already acknowledged twice with no new user message or tool work since — " +
+	"completion is recorded. End your turn with text and make no further tool calls."
+
+/** v1's wording, kept verbatim — the model has already seen this description. */
+const TASK_COMPLETE_DESCRIPTION =
+	"Signal that all work is complete and stop automatic continuation prompts. Call this ONLY after finishing everything requested. Call exactly once per completed round of work — repeat calls with no new user message in between are rejected."
 
 const TOOL_TEXT_RECOVERY_PROMPT =
 	"Your last message contained a raw tool call printed as text instead of being executed. " +
@@ -1032,6 +1087,8 @@ export default define({
 					completionSignaled: false,
 					todos: [],
 					todosFetchedAt: 0,
+					taskCompleteSignals: 0,
+					taskCompleteOverrides: 0,
 					lastUserMessageSeenAt: 0,
 					lastTokenTotal: 0,
 					contextWrapupAttempts: 0,
@@ -1736,27 +1793,23 @@ export default define({
 			return true
 		}
 
-		async function shouldStandDownForUser(
-			sid: string,
-			messages: unknown[],
-			activeUserWindowMs: number,
-		): Promise<boolean> {
-	try {
-		if (messages.length === 0) return false
-		const newest = messages[messages.length - 1] as {
-			type?: string
-			content?: { type?: string; name?: string; state?: { status?: string } }[]
-			time?: { created?: number }
-			info?: { time?: { created?: number } }
-		}
-		// (a) A tool call still awaiting its result means the model is waiting on the
-		//     user — a synthetic nudge here would be interrupted by their real reply
-		//     ("Step interrupted").
-		//
-		//     This used to test `state.status === "pending"`, which v2 never emits, so
-		//     the branch was unreachable and the nudge fired with an unanswered
-		//     `question` on screen. See TOOL_STATE_* above.
-		if (newest?.type === "assistant") {
+		/**
+		 * True when the session is holding the ball: a tool call whose result is
+		 * still outstanding.
+		 *
+		 * A synthetic nudge in that state starts a step the user's real reply then
+		 * interrupts ("Step interrupted"), so every idle recovery path stands down.
+		 *
+		 * This used to test `state.status === "pending"`, which v2 never emits, so
+		 * the branch was unreachable and the nudge fired with an unanswered
+		 * `question` on screen. See TOOL_STATE_* above.
+		 */
+		function hasPendingUserInput(messages: unknown[]): boolean {
+			const newest = messages[messages.length - 1] as {
+				type?: string
+				content?: { type?: string; name?: string; state?: { status?: string } }[]
+			}
+			if (newest?.type !== "assistant") return false
 			for (const part of newest.content ?? []) {
 				const t = part?.type ?? ""
 				if (!(t === "tool_use" || t === "tool" || t === "tool_call" || t.startsWith("tool"))) continue
@@ -1767,7 +1820,18 @@ export default define({
 				// not that it was answered, so keep standing down.
 				if (status !== TOOL_STATE_COMPLETED && AWAITING_USER_TOOLS.has(part?.name ?? "")) return true
 			}
+			return false
 		}
+
+		async function shouldStandDownForUser(
+			sid: string,
+			messages: unknown[],
+			activeUserWindowMs: number,
+		): Promise<boolean> {
+	try {
+		if (messages.length === 0) return false
+		// (a) A tool call still awaiting its result — see hasPendingUserInput.
+		if (hasPendingUserInput(messages)) return true
 		// (b) The user was recently active — they are mid-conversation, not stuck.
 		//
 		// v1 stamps `lastUserMessageAt` on ANY inbound user message and asks
@@ -1840,6 +1904,102 @@ export default define({
 			}
 			w.doneClaimAttempts = 0
 			w.doneClaimOpenTodosAttempts = 0
+			// A new request is new work: the ack self-loop counter starts clean,
+			// because the model re-announcing completion after the user asked for
+			// more is not the stuck case this counts.
+			w.taskCompleteSignals = 0
+		}
+
+		/**
+		 * `task_complete`: the model's explicit "I am finished".
+		 *
+		 * v2 has no built-in equivalent — `grep -rl task_complete packages` finds
+		 * nothing — so registering it here is the only way it exists at all, and
+		 * this is a real feature rather than a compatibility shim: it is the
+		 * strongest completion signal available, stronger than a trailing 🎉,
+		 * because the model chose to call it.
+		 *
+		 * Ported from v1 with its escalation intact. The ack tool-result is fed
+		 * straight back into the turn, and a stuck model answers it by calling the
+		 * tool again rather than ending with text — v1 logged 27 consecutive acked
+		 * calls with zero new user input. So: first call acks with an explicit stop
+		 * instruction, second warns, third throws and the turn is forced to end.
+		 *
+		 * The counter is reset by a new inbound user message and by any other tool
+		 * call, so the escalation only ever measures a genuinely stuck loop rather
+		 * than several legitimate rounds of work.
+		 */
+		async function registerTaskCompleteTool(): Promise<void> {
+			if (!ctx.tool?.transform) {
+				dbg("tool registry unavailable — task_complete not offered")
+				return
+			}
+			try {
+				await ctx.tool.transform((editor) => {
+					editor.add({
+						name: "task_complete",
+						description: TASK_COMPLETE_DESCRIPTION,
+						// No arguments. v1's `args: {}` is the same thing: the signal
+						// is the call, not a payload.
+						input: { type: "object", properties: {}, additionalProperties: false },
+						execute: async (_input, toolCtx) => {
+							const sid = toolCtx?.sessionID
+							if (!sid) return { content: TASK_COMPLETE_ACK }
+							const w = ensureWatch(sid)
+
+							// A subagent reporting completion is not a parent finishing,
+							// and gating a child's report on the parent's todo list would
+							// block it on work it was never asked to do. v1 skips the
+							// todo gate for subagents for the same reason.
+							if (!(await isSubAgentSession(sid))) {
+								const open = getOpenTodos(await readTodos(sid))
+								if (open.length > 0 && w.taskCompleteOverrides < maxRetries) {
+									w.taskCompleteOverrides++
+									// Work remains, so a later completion is legitimate: reset the
+									// repeat-signal counter rather than letting this override feed
+									// the escalation.
+									w.taskCompleteSignals = 0
+									const reminder = buildOpenTodosReminder(open)
+									const blockMsg = `Mark any finished todos complete and do not redo completed work.\n${reminder}`
+									log(
+										"info",
+										`${short(sid)} task_complete blocked: ${open.length} open todos remain (override ${w.taskCompleteOverrides}/${maxRetries})`,
+									)
+									// Also fire a visible nudge naming the blocking todos, in case
+									// the tool result collapses to an invisible one-liner. Skipped
+									// when the user holds the ball — injecting then would start a
+									// step their real reply interrupts. The tool result already
+									// carries the todo names either way.
+									let awaitingInput = false
+									try {
+										awaitingInput = hasPendingUserInput(await loadMessages(sid))
+									} catch (e) {
+										dbg(`${short(sid)} task_complete block: awaiting-input check failed:`, e instanceof Error ? e.message : String(e))
+									}
+									if (awaitingInput) {
+										log("info", `${short(sid)} task_complete blocked but user input pending — skipping visible nudge`)
+									} else {
+										await injectOnce(sid, blockMsg, "task-complete-blocked")
+									}
+									return { content: blockMsg }
+								}
+							}
+
+							w.completionSignaled = true
+							log("info", `${short(sid)} task_complete called, ${(await isSubAgentSession(sid)) ? "subagent" : "agent"} done`)
+							w.taskCompleteSignals++
+							if (w.taskCompleteSignals === 2) return { content: TASK_COMPLETE_REPEAT_WARNING }
+							if (w.taskCompleteSignals > 2) throw new Error(TASK_COMPLETE_REPEAT_ERROR)
+							return { content: TASK_COMPLETE_ACK }
+						},
+					})
+				})
+				log("info", "registered the task_complete tool")
+			} catch (e) {
+				// A failed registration must not take the watchdog down with it.
+				const msg = e instanceof Error ? e.message : String(e)
+				log("warn", `task_complete registration failed (${msg}) — continuing without it`)
+			}
 		}
 
 		async function inspectOnIdle(sid: string) {
@@ -2082,6 +2242,11 @@ export default define({
 		const initialDiscovery = setTimeout(() => {
 			discoverSessions().catch(() => {})
 		}, discoveryDelayMs)
+
+		// Offered to the model before the first turn, so it can actually be called.
+		// Awaited, but guarded: a registry that refuses the registration must not
+		// stop the watchdog from starting.
+		await registerTaskCompleteTool()
 
 		// ---------------------------------------------------------------------
 		// Context saturation
@@ -2583,6 +2748,14 @@ export default define({
 					const w = ensureWatch(sid)
 					const name = typeof ev.data?.tool === "string" ? ev.data.tool : (ev.data?.id as string | undefined) ?? "tool"
 					w.lastWasTaskTool = isTaskToolCall(ev)
+					// Any real tool work between completions legitimises the next
+					// task_complete — reset the repeat-signal counter. task_complete
+					// itself is excluded; it manages the counter inside its execute.
+					//
+					// Without this, a model that finishes, calls the tool, then does one
+					// more piece of work and finishes again would be counted as a repeat,
+					// and the escalation would fire against a legitimate second round.
+					if (name !== "task_complete") w.taskCompleteSignals = 0
 					if (trackToolCall(w, name)) {
 						void targetedRecovery(sid, "tool-loop", TOOL_LOOP_RECOVERY_PROMPT, "intentNudgeAttempts").catch(() => {})
 					}

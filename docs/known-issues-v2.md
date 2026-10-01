@@ -170,6 +170,45 @@ handed a fresh budget each time it announced, so the nudge never stopped. v2
 still had that, and now does not. The open-todos nudge is the opposite case and
 does reset per cycle, because an open list is new information each turn.
 
+## Explicit completion via `task_complete`
+
+v1 registers a `task_complete` tool and v2 has no built-in equivalent — nothing in
+the v2 source mentions the name — so the plugin provides it through
+`ctx.tool.transform`, the v2 tool registry. This is a feature rather than a
+compatibility shim: it is the strongest completion signal available, stronger than
+a trailing 🎉, because the model chose to call it.
+
+The ack escalation is the part that matters, and it is v1’s unchanged. The ack
+tool-result is fed straight back into the model’s turn, and a stuck model answers
+it by calling the tool again rather than ending with text — v1 logged **27
+consecutive acked calls with zero new user input**. So:
+
+- first call acks, and the ack carries an explicit stop instruction;
+- second consecutive call warns, and says further calls will be rejected;
+- third and beyond throw, which surfaces as a tool error and forces the turn to end.
+
+The counter is reset by a genuinely new inbound user message and by any other tool
+call, so the escalation measures a stuck loop rather than several legitimate rounds
+of work. Resetting it on tool calls rather than only on user messages is the v2
+addition: a model that finishes, reports, does more work and reports again is
+doing its job, not looping.
+
+Two guards worth naming:
+
+- **The todo gate is skipped for subagents.** A child was never asked to do the
+  parent’s open items, so gating its report on them would block it on work outside
+  its scope. Same reasoning as v1.
+- **A blocked call also fires a visible nudge** naming the blocking todos, because
+  the tool result can collapse to an invisible one-liner in the transcript. Skipped
+  when the user holds the ball, since injecting then starts a step their real reply
+  interrupts. The block itself is bounded by `maxRetries`: an unbounded block is its
+  own kind of loop, and a model that keeps saying "done" may know something the todo
+  list does not.
+
+Registration failure — no `ctx.tool`, or a registry that throws — is logged and
+swallowed. It must not take down the session recovery that the rest of the plugin
+exists for, so the watchdog starts either way.
+
 ## Context saturation
 
 A session can fill its context window without ever looking stalled — it just keeps
