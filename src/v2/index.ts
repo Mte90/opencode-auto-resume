@@ -815,7 +815,6 @@ export default define({
 		const FEATURE_GATED_OPTIONS = [
 			"subagentWaitMs",
 			"toolTextCheckDelayMs",
-			"thinkingToolRecoveryPrompt",
 			"doneWithoutWorkPrompt",
 		] as const
 
@@ -1506,6 +1505,34 @@ export default define({
 		}
 
 		/**
+		 * The newest assistant message's reasoning text, joined. "" when none.
+		 *
+		 * A reasoning block is the one place a model writes a tool call that never
+		 * becomes one: the raw markup lands in the reasoning and nothing executes.
+		 * v1 caught that on the same pass as the text variant and answered with a
+		 * different prompt, because the fix is different — the model is not
+		 * forgetting the mechanism, it is writing in the wrong channel.
+		 *
+		 * v2 separates the two cleanly, since `AssistantContent` tags reasoning and
+		 * text distinctly where v1 filtered them together into one string.
+		 */
+		function lastAssistantReasoning(messages: unknown[]): string {
+			for (let i = messages.length - 1; i >= 0; i--) {
+				const msg = messages[i] as {
+					type?: string
+					content?: Array<{ type?: string; text?: string }>
+				}
+				if (!msg || msg.type !== "assistant" || !Array.isArray(msg.content)) continue
+				const reasoning = msg.content
+					.filter((part) => part?.type === "reasoning" && typeof part.text === "string")
+					.map((part) => part.text as string)
+					.join("")
+				if (reasoning) return reasoning
+			}
+			return ""
+		}
+
+		/**
 		 * v1's `getLastSilentDeadStream`, on the v2 message shape.
 		 *
 		 * The model can finish a turn having produced no text at all — reasoning
@@ -1683,6 +1710,15 @@ async function inspectOnIdle(sid: string) {
 				return
 			}
 
+			// A raw tool call written into the reasoning block never executes: no
+			// part is tagged as a tool call, so nothing on the session side ever
+			// runs it. Judged before the text variant because a message can have
+			// both, and the reasoning one is the one that silently does nothing.
+			const reasoning = lastAssistantReasoning(messages)
+			if (reasoning && containsToolCallAsText(reasoning)) {
+				await targetedRecovery(sid, "tool-call-in-reasoning", thinkingToolRecoveryPrompt, "toolTextAttempts")
+				return
+			}
 			if (containsToolCallAsText(text)) {
 				await targetedRecovery(sid, "tool-call-as-text", opts.toolTextRecoveryPrompt ?? TOOL_TEXT_RECOVERY_PROMPT, "toolTextAttempts")
 				return

@@ -14,7 +14,6 @@ config keeps loading unchanged.
 | --- | --- |
 | `subagentWaitMs` | The v1 orphan-watch timer that this delays has no v2 counterpart; the v2 port decides parent-vs-stalled from its own event-derived busy set. |
 | `toolTextCheckDelayMs` | The delayed raw-tool-call-as-text re-check is v1's polling shape. v2 evaluates the text once, on idle, from the authoritative message history. |
-| `thinkingToolRecoveryPrompt` | The thinking-contains-a-tool-call detector is part of the v1 idle-nudge pass and is not ported. |
 | `doneWithoutWorkPrompt` | Both v1 use sites for this prompt are gated on tracked todo state. v2 has no todo state, so the prompt has no trigger. |
 
 `doneWithoutDetailsPrompt` **is** applied on v2, and is the replacement for
@@ -188,6 +187,23 @@ Two things are worth recording about the v2 API:
   quietly retrying looks identical from the event stream, and the recovery event
   may not have arrived by the time the turn ends.
 
-`thinkingToolRecoveryPrompt` is the sibling detector that is still inert: it
-covers a *thinking* block containing a raw tool call, which v1 judged from the
-message parts on the same pass.
+## A tool call written into the reasoning block
+
+When a model writes raw tool-call markup inside its thinking instead of calling
+the tool, nothing executes and nothing raises. No part is tagged as a tool call,
+so no session-side code runs it; the turn completes normally, the prose may read
+fine, and the work silently does not happen.
+
+v1 caught this on the same pass as the text variant and answered with a different
+prompt, because the fix is different — the model is not forgetting the tool
+mechanism, it is writing in the wrong channel. v2 separates the two reads instead
+of filtering them into one joined string, since `AssistantContent` tags reasoning
+and text distinctly:
+
+- reasoning parts are judged first, because a message can carry both and the
+  reasoning one is the one that silently does nothing;
+- both variants share the `toolTextAttempts` budget, because they are one
+  phenomenon with two symptoms — two budgets would let the plugin spend twice the
+  retries on a model that keeps doing it;
+- both use the same code-block stripping, so a fenced example of the format or an
+  inline path in backticks is not mistaken for a real call.
