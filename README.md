@@ -58,13 +58,15 @@ Loop detection runs in two places. At idle, tool names are scanned from recent a
 
 When the model calls a tool that does not exist (a typo, a hallucinated name, or a tool from a different plugin that isn't loaded), OpenCode returns a `tool` part with `state.status = "error"`. If the same wrong tool name appears **2 times** in the session's message history, the plugin:
 
-1. Fetches the list of available tools via `ctx.client.tool.ids()` (cached for 5 minutes).
+1. Fetches the list of available tools — via `ctx.client.tool.ids()` on v1, or `ctx.tool.list()` on v2, cached for 5 minutes. On v2 the names are the registry's *effective* names, so a namespaced tool is quoted back in the form a model would have to call it.
 2. Computes the closest match by Levenshtein distance (case-insensitive, threshold = half the wrong name's length).
 3. Sends a continue prompt that names the wrong tool, states it does not exist, suggests the closest match (if one was found), and lists the first 20 available tools for reference.
 
 The suggestion fires once per busy cycle. A new user message resets the counter so the suggestion can fire again on a fresh cycle. Tool parts that already succeeded (`state.status = "completed"`) and parts for tools that do exist are skipped.
 
 Threshold and cache are compile-time constants (`UNKNOWN_TOOL_THRESHOLD = 2`, `TOOL_IDS_CACHE_MS = 5 min`). The detection runs at idle, alongside the tool-text recovery check.
+
+On v2 the tool list comes from the registry, so the check degrades rather than guesses: no registry, an empty registry, or a registry that throws all mean no suggestion, because with nothing to compare against every name would look invented.
 
 _Motivated by:_
 - [#22142](https://github.com/anomalyco/opencode/issues/22142) — Repetitive tool-call loops with alibaba-coding-plan-cn/qwen3.6-plus

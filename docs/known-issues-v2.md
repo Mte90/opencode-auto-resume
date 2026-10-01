@@ -170,6 +170,57 @@ handed a fresh budget each time it announced, so the nudge never stopped. v2
 still had that, and now does not. The open-todos nudge is the opposite case and
 does reset per cycle, because an open list is new information each turn.
 
+## Unknown tool names
+
+v1 asks `ctx.client.tool.ids()` for the registered tool names. v2 has no such
+route, so the port uses `ctx.tool.list()`, which returns the same set of
+definitions. Only the effective names are needed — nothing else in the record is
+read — and the effective name is the namespaced form when a tool sits in a
+namespace, which is exactly the string a model would have to call. That is what
+the suggestion quotes back.
+
+The tool parts come from the message history, not from events, and that is not a
+workaround: the thing being looked for is a part that already **errored**, and by
+the time the error lands the `session.tool.called` event for that part is long
+gone. This code only runs on idle anyway.
+
+Two shape differences from v1, both of which would have made the check inert
+rather than wrong — worth naming because an inert detector is the failure mode
+that does not announce itself:
+
+- v1 reads the tool name from `part.tool`. v2 has no such field; the name is in
+  `part.name`. A port that kept v1's read would compare against `""`, never
+  match, and silently never fire.
+- v1 keys the "already examined" set on `part.id ?? part.callID`. v2's tool part
+  carries `id` (the call id) and `name`, and no `callID`.
+
+v2 tool-state statuses are `streaming`, `running`, `completed`, `error`, so the
+`state.status === "error"` test v1 uses is correct on v2 unchanged. (The
+`"pending"` status v1 also tests, elsewhere, does not exist in v2 — see the
+TOOL_STATE_* note in the source.)
+
+Two behaviours are inherited from v1 rather than fixed here, and the second is
+worth a decision:
+
+- **A re-armed turn re-names the oldest typo.** The per-request reset clears the
+  "already examined" set, so the walk restarts from the top of the history and
+  the oldest name still above threshold wins — a turn that introduced a *new*
+  invented name is told about the *previous* one. Suppressing a name once it has
+  been suggested is a behaviour change rather than a port, so it is documented
+  instead of made.
+- **No registry, no check.** With no tool list every name looks invented, so the
+  check is skipped rather than accusing the model of tools that plainly exist.
+  Same for an empty registry and for a registry that throws, which is logged and
+  ignored: a check that guesses is worse than a check that abstains.
+
+One ordering fix the port needed. The per-request re-arm is derived from the
+message history, so it cannot be applied before the history is read — but the
+"already suggested" guard used to run before that read, and the check runs
+alongside `inspectOnIdle`, whose ordering is not defined. On a re-armed turn the
+guard could therefore see the previous turn's latch still standing and skip the
+check that was supposed to re-arm it. The guard now runs after the read.
+
+
 ## Explicit completion via `task_complete`
 
 v1 registers a `task_complete` tool and v2 has no built-in equivalent — nothing in

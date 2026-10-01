@@ -187,6 +187,15 @@ interface SessionWatch {
 	 * fed back and the model re-emits the tool instead of ending its turn. Persists
 	 * across busy/idle cycles by design. */
 	taskCompleteSignals: number
+	/** Failed tool calls by name, for the unknown-tool suggestion. Counted, not
+	 * latched: one bad call is a typo, two is a model that will not self-correct. */
+	unknownToolErrors: Map<string, number>
+	/** Set once a suggestion has been injected, so it is sent at most once per
+	 * user message rather than on every idle. */
+	unknownToolSuggestionSent: boolean
+	/** Tool parts already examined. The history is re-walked on every idle, so
+	 * without this the same error would be counted again each time. */
+	checkedToolPartIDs: Set<string>
 	/** How many times a `task_complete` call was overridden because todos were
 	 * still open. Bounded by `maxRetries` — past that the call is honoured, because
 	 * an unbounded block is its own kind of loop. */
@@ -531,6 +540,16 @@ const TASK_COMPLETE_REPEAT_ERROR =
 	"task_complete already acknowledged twice with no new user message or tool work since — " +
 	"completion is recorded. End your turn with text and make no further tool calls."
 
+/** How many times a model must call a tool that does not exist before we name a
+ * replacement. One is a typo; two is a model that will not correct itself. */
+const UNKNOWN_TOOL_THRESHOLD = 2
+/** The tool list changes only when a plugin reloads, so a short cache is enough
+ * and it keeps the check off the registry on every idle. */
+const TOOL_IDS_CACHE_MS = 5 * 60_000
+/** Cap on the tool list quoted back to the model. A full dump of every tool on
+ * the box is itself a way to fill the context. */
+const UNKNOWN_TOOL_LIST_LIMIT = 20
+
 /** v1's wording, kept verbatim — the model has already seen this description. */
 const TASK_COMPLETE_DESCRIPTION =
 	"Signal that all work is complete and stop automatic continuation prompts. Call this ONLY after finishing everything requested. Call exactly once per completed round of work — repeat calls with no new user message in between are rejected."
@@ -822,6 +841,52 @@ function detectPatternLoop(recentTools: string[]): boolean {
 	return false
 }
 
+/** Edit distance, v1's implementation. Kept byte-for-byte in behaviour: the
+ * suggestion is only useful if it picks the same tool v1 would have. */
+function levenshtein(a: string, b: string): number {
+	const m = a.length
+	const n = b.length
+	if (m === 0) return n
+	if (n === 0) return m
+	let prev = new Array<number>(n + 1)
+	let curr = new Array<number>(n + 1)
+	for (let j = 0; j <= n; j++) prev[j] = j
+	for (let i = 1; i <= m; i++) {
+		curr[0] = i
+		for (let j = 1; j <= n; j++) {
+			const cost = a[i - 1] === b[j - 1] ? 0 : 1
+			curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
+		}
+		const tmp = prev
+		prev = curr
+		curr = tmp
+	}
+	return prev[n]
+}
+
+/**
+ * The closest registered tool name to one the model invented, or null.
+ *
+ * The threshold scales with the length of the wrong name — `max(2, len/2)` — so a
+ * short name is held to a near-exact match while a long one is allowed to be
+ * sloppy. Without that, a two-letter name would match almost anything and the
+ * suggestion would be noise.
+ */
+function suggestClosestTool(wrongName: string, available: string[]): string | null {
+	const lower = wrongName.toLowerCase()
+	let best: string | null = null
+	let bestDist = Infinity
+	for (const id of available) {
+		const dist = levenshtein(lower, id.toLowerCase())
+		const threshold = Math.max(2, Math.floor(lower.length / 2))
+		if (dist < bestDist && dist <= threshold) {
+			bestDist = dist
+			best = id
+		}
+	}
+	return best
+}
+
 function trackToolCall(w: SessionWatch, toolName: string): boolean {
 	const now = Date.now()
 	w.recentToolCalls = w.recentToolCalls.filter((c) => now - c.at < 120_000)
@@ -1089,6 +1154,9 @@ export default define({
 					todosFetchedAt: 0,
 					taskCompleteSignals: 0,
 					taskCompleteOverrides: 0,
+					unknownToolErrors: new Map(),
+					unknownToolSuggestionSent: false,
+					checkedToolPartIDs: new Set(),
 					lastUserMessageSeenAt: 0,
 					lastTokenTotal: 0,
 					contextWrapupAttempts: 0,
@@ -1908,6 +1976,113 @@ export default define({
 			// because the model re-announcing completion after the user asked for
 			// more is not the stuck case this counts.
 			w.taskCompleteSignals = 0
+			// The unknown-tool budget is scoped to one request for the same reason:
+			// a model told to do something new gets a fresh tool list, and one
+			// invented name in the previous round says nothing about this one.
+			if (w.unknownToolErrors.size > 0 || w.unknownToolSuggestionSent) {
+				dbg(`${short(sid)} new user message — re-arming the unknown-tool budget`)
+			}
+			w.unknownToolErrors.clear()
+			w.unknownToolSuggestionSent = false
+			w.checkedToolPartIDs.clear()
+		}
+
+		/** Registered tool names, cached briefly — the registry only changes when a
+		 * plugin reloads, and this runs on every idle. */
+		let cachedToolIds: string[] | null = null
+		let cachedToolIdsAt = 0
+
+		async function getAvailableToolIds(): Promise<string[]> {
+			if (cachedToolIds && Date.now() - cachedToolIdsAt < TOOL_IDS_CACHE_MS) return cachedToolIds
+			if (!ctx.tool?.list) return cachedToolIds ?? []
+			try {
+				const listed = await ctx.tool.list()
+				// `id` is the effective name — the namespaced form when the tool sits
+				// in a namespace — which is exactly the string a model would have to
+				// call, so it is what the suggestion has to quote back.
+				const ids = (listed as Array<{ id?: string; name?: string }>)
+					.map((t) => (typeof t?.id === "string" && t.id ? t.id : typeof t?.name === "string" ? t.name : ""))
+					.filter((n) => n.length > 0)
+				cachedToolIds = ids
+				cachedToolIdsAt = Date.now()
+				return ids
+			} catch (e) {
+				log("warn", `failed to list tools: ${e instanceof Error ? e.message : String(e)}`)
+				// Stale names are better than none for a "does this exist" check: a
+				// tool added since the cache would be wrongly called unknown, but
+				// that costs one extra suggestion, while an empty list skips the
+				// check entirely and loses the feature.
+				return cachedToolIds ?? []
+			}
+		}
+
+		/**
+		 * Name a replacement when a model keeps calling a tool that does not exist.
+		 *
+		 * v1 asks `ctx.client.tool.ids()`. v2 has no such route; `ctx.tool.list()`
+		 * returns the same set of effective names, which is all this needs.
+		 *
+		 * The tool parts come from the message history rather than from events,
+		 * because the whole point is a part that already *errored* — by the time the
+		 * error lands, the `session.tool.called` event for that part is long gone,
+		 * and this code only runs on idle anyway.
+		 */
+		async function checkForUnknownToolCalls(sid: string, w: SessionWatch): Promise<boolean> {
+			if (w.userCancelled || w.completionSignaled) return false
+			try {
+				const messages = await loadMessages(sid)
+				// The history is read before the "already suggested" guard, and the
+				// per-request reset rides on that read. The guard used to come first,
+				// and since this runs alongside inspectOnIdle the ordering was undefined
+				// — on a re-armed turn the guard could see the previous turn's latch
+				// still standing and skip the check that was supposed to re-arm it.
+				noteInboundUserMessage(sid, w, messages)
+				if (w.unknownToolSuggestionSent) return false
+				const available = await getAvailableToolIds()
+				// No registry, or nothing registered: every name would look unknown.
+				if (available.length === 0) return false
+				for (const msg of messages) {
+					const content = (msg as { content?: unknown })?.content
+					if (!Array.isArray(content)) continue
+					for (const part of content as Array<Record<string, unknown>>) {
+						if (part?.type !== "tool") continue
+						// v2's tool part identifies itself by `id` and names the tool in
+						// `name` — v1 read `part.tool`, which v2 never emits, so the
+						// comparison there would have been against "" and never matched.
+						const partId = typeof part.id === "string" ? part.id : ""
+						if (!partId || w.checkedToolPartIDs.has(partId)) continue
+						w.checkedToolPartIDs.add(partId)
+						const state = part.state as { status?: string } | undefined
+						if (state?.status !== "error") continue
+						const toolName = typeof part.name === "string" ? part.name : ""
+						if (!toolName || available.includes(toolName)) continue
+						const count = (w.unknownToolErrors.get(toolName) ?? 0) + 1
+						w.unknownToolErrors.set(toolName, count)
+						if (count < UNKNOWN_TOOL_THRESHOLD) continue
+						const suggestion = suggestClosestTool(toolName, available)
+						const toolList = available.slice(0, UNKNOWN_TOOL_LIST_LIMIT).join(", ")
+						const prompt = suggestion
+							? `You tried to use the tool "${toolName}" ${count} times, but it does not exist. ` +
+								`The closest matching tool is "${suggestion}". ` +
+								`Please use "${suggestion}" instead and adjust your arguments accordingly. ` +
+								`Available tools include: ${toolList}.`
+							: `You tried to use the tool "${toolName}" ${count} times, but it does not exist. ` +
+								`Please check the available tools and use the correct one. ` +
+								`Available tools include: ${toolList}.`
+						w.unknownToolSuggestionSent = true
+						log(
+							"warn",
+							`${short(sid)} unknown tool "${toolName}" called ${count}x, suggesting "${suggestion ?? "(none)"}"`,
+						)
+						await injectOnce(sid, prompt, "unknown-tool")
+						return true
+					}
+				}
+				return false
+			} catch (e) {
+				log("warn", `${short(sid)} unknown-tool check failed: ${e instanceof Error ? e.message : String(e)}`)
+				return false
+			}
 		}
 
 		/**
@@ -2585,6 +2760,14 @@ export default define({
 						return
 					}
 					void inspectOnIdle(sid)
+					// Independent of the idle heuristics above: this looks at tool parts
+					// that already errored, which none of those read. Fire-and-forget
+					// so it cannot delay them. The latch check lives inside the function
+					// rather than here, because the per-request re-arm is derived from the
+					// history and only happens once the history has been read.
+					if (!w.completionSignaled && !w.userCancelled) {
+						void checkForUnknownToolCalls(sid, w)
+					}
 					return
 				}
 				case "session.execution.interrupted": {
