@@ -79,7 +79,7 @@ _Motivated by:_
 
 ### Orphan parent
 
-A subagent finishes but the parent session stays stuck as "busy" forever. The plugin detects when `busyCount` drops from >1 to 1, waits `subagentWaitMs` + `gracePeriodMs` (18s default), probes the subagent (recovering a crashed child first if possible), then aborts and resumes the parent.
+A subagent finishes but the parent session stays stuck as "busy" forever. The plugin detects when `busyCount` drops from >1 to 1, confirms the survivor really has subagents, waits `subagentWaitMs` + `gracePeriodMs` (18s default), probes the subagent (nudging a crashed child once, then waiting a further `subagentWaitMs` before giving up on it), and aborts and resumes the parent if it is still stuck. The parent is never interrupted while it has a tool in flight or is waiting on the user.
 
 _Motivated by:_
 - [#35066](https://github.com/anomalyco/opencode/issues/35066) — notify parent when subagent sessions finish
@@ -484,7 +484,7 @@ Defaults are the same on v1 and v2 unless a row says otherwise.
 | `injectIntervalMs` | v2 only | Minimum gap between recovery injections for one session. No v1 equivalent |
 | `logFile` | v2 only | Where this build appends its log. v2 removed v1's server log endpoint, so without this the plugin is silent. Defaults to `~/.local/state/opencode-v2/auto-resume.log` |
 
-Accepted but **not applied** on v2: `subagentWaitMs`, `toolTextCheckDelayMs`. See
+Accepted but **not applied** on v2: `toolTextCheckDelayMs`. See
 [docs/known-issues-v2.md](docs/known-issues-v2.md) for why.
 
 Message patterns are matched case-insensitively. Error names use exact match.

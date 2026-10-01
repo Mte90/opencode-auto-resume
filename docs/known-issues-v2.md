@@ -12,7 +12,6 @@ config keeps loading unchanged.
 
 | Option | Why it is inert on v2 |
 | --- | --- |
-| `subagentWaitMs` | The v1 orphan-watch timer that this delays has no v2 counterpart; the v2 port decides parent-vs-stalled from its own event-derived busy set. |
 | `toolTextCheckDelayMs` | The delayed raw-tool-call-as-text re-check is v1's polling shape. v2 evaluates the text once, on idle, from the authoritative message history. |
 
 `doneWithoutDetailsPrompt` and `doneWithoutWorkPrompt` **are** both applied on
@@ -169,6 +168,72 @@ busy reset for #26: a model that re-announces completion each turn was otherwise
 handed a fresh budget each time it announced, so the nudge never stopped. v2
 still had that, and now does not. The open-todos nudge is the opposite case and
 does reset per cycle, because an open list is new information each turn.
+
+## Orphan parent recovery
+
+v1 detects the busy-count drop from more than one session to exactly one and
+treats the survivor as a parent whose subagent died. That is the right
+*signal* and the wrong *conclusion* on a busy box, and v2 can do better because
+v2 records the parent link.
+
+**The port asks whether the survivor actually has children before arming.** One
+`session.list({ parentID })` call at arm time turns a guess into a fact. v1 has no
+way to ask — it treats *any other busy session* as a subagent of the one in hand
+— so on a box with two conversations open it aborts one of them when the other
+finishes. The `parentID` filter is requested *and* the returned rows are checked
+against it client-side, because the only consequence of the filter being quietly
+ignored would be aborting real sessions.
+
+**A child is judged on what it last did, not on whether the server still lists
+it.** v1's `checkSubagentStatus` scans the global status map for a *busy*
+session and reports "idle" when it finds none. That reading cannot work here:
+this function is only ever reached *after* a child went idle, so a child being
+absent from the active set is the premise rather than the finding. Read that way,
+every crashed subagent looks healthy, the child is never woken, and the parent is
+aborted on the first tick. So the three cases are:
+
+- **recent** — whatever the server thinks, the child said something inside the
+  window, so believe it. If it is also active, keep waiting.
+- **silent past the threshold, tool call outstanding** — a long build, not a
+  dead model. The window is tripled, and the parent is left alone. Killing the
+  parent there loses the work.
+- **silent past the threshold, or an errored message** — it stopped without
+  reporting. Worth one attempt to wake it.
+
+**Waking the child is tried once per episode.** v1's structure assumes the subagent
+goes busy again after the prompt; a dead one never does, so an unbudgeted
+retry sends the same nudge on every watchdog tick. The sequence is: nudge once,
+wait a further `subagentWaitMs`, and abort the parent only if the child is still
+dead. v1 sends the prompt through the client route; v2 uses the plugin-scoped
+`synthetic` endpoint, which takes an explicit `sessionID` and so needs no
+cross-session route the plugin API does not expose.
+
+**In-flight tools are tracked from the tool lifecycle events** — `tool.called`
+increments, `tool.success` and `tool.failed` decrement — rather than from a
+`tool.execute.before` hook, because v2 emits all three and the hooks would be a
+second source of truth for the same fact. Both terminal events matter: a *failed*
+tool is finished work, and holding the slot on failure would make the watch defer
+on every session that has ever seen an error. A session that goes idle has its
+slots cleared, since a slot still held there belongs to a tool that will never
+report.
+
+### What still bounds the risk
+
+`subagentWaitMs` is the guard. Between a child finishing and the parent being
+aborted, the parent is given this long to consume the child's result — the
+default is 15s. v1's logic aborts as soon as no subagent is active, and so does
+this; the option is what makes that survivable, and its name is the warning. Set
+it small and the watch becomes a blunt instrument. Lower it only if you have
+watched a parent wait minutes on a dead child.
+
+Two further guards, both checked before anything is interrupted: a parent with a
+tool in flight is never aborted, and neither is one whose newest message is
+waiting on the user.
+
+A give-up path bounds the whole thing: after `maxRetries` episodes the watch
+disarms and logs it, rather than retrying a parent that has already survived
+several aborts.
+
 
 ## Unknown tool names
 

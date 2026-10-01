@@ -291,11 +291,11 @@ describe("v2: option reporting at startup", () => {
 	})
 
 	test("the startup line names the accepted-but-inert options in use", async () => {
-		const { logs } = await replay([], { chunkTimeoutMs: 5000, subagentWaitMs: 15_000 })
+		const { logs } = await replay([], { chunkTimeoutMs: 5000, toolTextCheckDelayMs: 3000 })
 		const ready = logs.filter((l) => l.includes("ready (opencode v2)"))
 		expect(ready).toHaveLength(1)
 		expect(ready[0]).toContain("accepted-but-inert=")
-		expect(ready[0]).toContain("subagentWaitMs")
+		expect(ready[0]).toContain("toolTextCheckDelayMs")
 	})
 
 	test("discoveryDelayMs is live on v2, so it is no longer listed as inert", async () => {
@@ -304,13 +304,28 @@ describe("v2: option reporting at startup", () => {
 		const { logs } = await replay([], {
 			chunkTimeoutMs: 5000,
 			discoveryDelayMs: 5_000,
-			subagentWaitMs: 15_000,
+			toolTextCheckDelayMs: 3000,
 		})
 		const ready = logs.filter((l) => l.includes("ready (opencode v2)"))
 		expect(ready).toHaveLength(1)
 		expect(ready[0]).toContain("accepted-but-inert=")
-		expect(ready[0]).toContain("subagentWaitMs")
+		expect(ready[0]).toContain("toolTextCheckDelayMs")
 		expect(ready[0]).not.toContain("discoveryDelayMs")
+	})
+
+	test("subagentWaitMs is live on v2, so it is no longer listed as inert", async () => {
+		// The orphan watch reads this option, so a config carrying it must not be told
+		// it is being ignored — that warning is the only way a user finds out.
+		const { logs } = await replay([], {
+			chunkTimeoutMs: 5000,
+			subagentWaitMs: 15_000,
+			toolTextCheckDelayMs: 3000,
+		})
+		const ready = logs.filter((l) => l.includes("ready (opencode v2)"))
+		expect(ready).toHaveLength(1)
+		expect(ready[0]).toContain("accepted-but-inert=")
+		expect(ready[0]).toContain("toolTextCheckDelayMs")
+		expect(ready[0]).not.toContain("subagentWaitMs")
 	})
 
 	test("the startup line carries no accepted-but-inert list when none are set", async () => {

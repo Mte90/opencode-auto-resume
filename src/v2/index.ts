@@ -189,6 +189,20 @@ interface SessionWatch {
 	taskCompleteSignals: number
 	/** Failed tool calls by name, for the unknown-tool suggestion. Counted, not
 	 * latched: one bad call is a typo, two is a model that will not self-correct. */
+	/** When the orphan watch was armed: the moment the last busy subagent of this
+	 * session went idle. A parent still busy after that is the case this exists for.
+	 * null means not armed. */
+	orphanWatchStartAt: number | null
+	/** Last time the subagents of this session were polled, so the watchdog does not
+	 * ask the server on every tick. */
+	lastSubagentCheckAt: number
+	/** Whether this orphan episode has already tried waking its subagent. Without a
+	 * budget the same prompt goes out on every watchdog tick — v1's structure
+	 * assumed the subagent goes busy again, and a dead one never does. */
+	orphanRecoveryTried: boolean
+	/** Tool calls started but not finished, tracked from the tool lifecycle events.
+	 * The orphan watch must never abort a session that is legitimately working. */
+	pendingTools: number
 	unknownToolErrors: Map<string, number>
 	/** Set once a suggestion has been injected, so it is sent at most once per
 	 * user message rather than on every idle. */
@@ -387,6 +401,12 @@ const DEFAULT_WARMUP_MS = 15_000
 const DEFAULT_MIN_ACTIVITY_GAP_MS = 1_000
 const DEFAULT_TOOL_TEXT_CHECK_DELAY_MS = 3_000
 const DEFAULT_SUBAGENT_WAIT_MS = 15_000
+/** How long a busy subagent may go without producing anything before it counts
+ * as stuck. v1 used the same number, and a tool call still outstanding triples
+ * it, because a long tool is not a hung model. */
+const SUBAGENT_STUCK_MS = 60_000
+const SUBAGENT_RECOVERY_PROMPT =
+	"It looks like you may have stalled or timed out. Please retry the last operation or continue with the task."
 const DEFAULT_SILENT_DEAD_STREAM_MIN_TOKENS = 200
 const DEFAULT_CONTEXT_SATURATION_THRESHOLD = 0.85
 /** How long a fetched todo list is trusted before being re-read. */
@@ -942,6 +962,9 @@ export default define({
 		const activeUserWindowMs = opts.activeUserWindowMs ?? DEFAULT_ACTIVE_USER_WINDOW_MS
 		const injectIntervalMs = opts.injectIntervalMs ?? DEFAULT_INJECT_INTERVAL_MS
 		const logFile = opts.logFile ?? process.env.AUTO_RESUME_LOG_FILE ?? DEFAULT_LOG_FILE
+		// How long a parent may sit busy after its last subagent went idle before
+		// the orphan watch acts. v1 default, honoured for the first time here.
+		const subagentWaitMs = opts.subagentWaitMs ?? DEFAULT_SUBAGENT_WAIT_MS
 
 		// ---- Ported from v1 (Mte90/opencode-auto-resume#33) ----
 		const rawBusyStallStrategy = opts.busyStallStrategy ?? "continue"
@@ -1002,10 +1025,7 @@ export default define({
 		// is not ported. Listed (not warned) so an existing v1 config stays valid
 		// and the gap is documented rather than surprising. See
 		// docs/known-issues-v2.md.
-		const FEATURE_GATED_OPTIONS = [
-			"subagentWaitMs",
-			"toolTextCheckDelayMs",
-		] as const
+		const FEATURE_GATED_OPTIONS = ["toolTextCheckDelayMs"] as const
 
 		// Options this build understands. Anything else in the user's config is
 		// reported once at startup so a silent fallback is visible rather than
@@ -1154,6 +1174,10 @@ export default define({
 					todosFetchedAt: 0,
 					taskCompleteSignals: 0,
 					taskCompleteOverrides: 0,
+					orphanWatchStartAt: null,
+					orphanRecoveryTried: false,
+					lastSubagentCheckAt: 0,
+					pendingTools: 0,
 					unknownToolErrors: new Map(),
 					unknownToolSuggestionSent: false,
 					checkedToolPartIDs: new Set(),
@@ -1207,6 +1231,10 @@ export default define({
 				// A new turn re-opens the question of whether the work is finished.
 				w.completionSignaled = false
 				w.gaveUp = false
+				// A new turn means the parent moved on, so whatever the previous orphan
+				// watch was about is no longer the question. Left armed, it would fire
+				// mid-turn and abort a session that is doing exactly what it should.
+				w.orphanWatchStartAt = null
 				w.recentToolCalls = []
 				w.textParts.clear()
 				w.lastAssistantText = ""
@@ -1222,6 +1250,14 @@ export default define({
 				dbg(`${short(sid)} ${w.status} -> idle`)
 				w.status = "idle"
 				w.idleSince = Date.now()
+				// Idle means nothing is in flight. Any slot still held belongs to a tool
+				// that will never report — a subagent killed mid-call, for instance —
+				// and keeping it would make the orphan watch defer on this session
+				// forever.
+				w.pendingTools = 0
+				// This session is not the parent the watch is about: the watch is armed on
+				// the session that *stays* busy, so an idle session's own watch is void.
+				w.orphanWatchStartAt = null
 			}
 			// NOTE: this used to clear `permissionPending`. The `session.idle` handler
 			// calls markIdle() and then inspectOnIdle(), so the flag was always false by
@@ -2318,6 +2354,245 @@ export default define({
 			}
 		}
 
+		/** Busy sessions we are tracking, excluding cancelled ones. The orphan watch
+		 * keys on this count: a subagent finishing is only interesting because it
+		 * leaves exactly one session busy. */
+		function busySessionsForOrphanWatch(): string[] {
+			const out: string[] = []
+			for (const [sid, w] of sessions) {
+				if (w.status === "busy" && !w.userCancelled) out.push(sid)
+			}
+			return out
+		}
+
+		/**
+		 * The subagents of `parentSid`, by v2's own parent link.
+		 *
+		 * v1 had no way to ask, so it treated *any other busy session* as a subagent of
+		 * the one in hand. That works on a single-project box and misfires on a busy
+		 * one: a second unrelated session looks like a child, and the parent gets
+		 * aborted for someone else's work. v2 stores `parent_id` on the session row, so
+		 * the question can simply be asked.
+		 *
+		 * The filter is requested *and* verified client-side. `parentID` is part of
+		 * the list input, but the only consequence of it being quietly ignored would be
+		 * aborting real sessions, so the returned rows are checked rather than trusted.
+		 */
+		async function listSubagentIds(parentSid: string): Promise<string[]> {
+			const listed = unwrapList(await callSessionApi<unknown>("list", { parentID: parentSid }))
+			const out: string[] = []
+			for (const row of listed) {
+				const sid = row?.id
+				if (typeof sid !== "string" || !sid.startsWith("ses_")) continue
+				if (sid === parentSid) continue
+				if ((row as { parentID?: unknown }).parentID !== parentSid) continue
+				out.push(sid)
+			}
+			return out
+		}
+
+		type SubagentVerdict = { status: "crashed" | "idle" | "busy"; stuckSid?: string }
+
+		/**
+		 * What a parent's subagents are doing, in v1's three-way shape.
+		 *
+		 * v1 scans the global status map for any other *busy* session and treats a
+		 * quiet one as "idle" — the parent is stuck with nothing to wait for. That
+		 * reading cannot work on v2, and the reason is worth stating: this function is
+		 * only ever reached *after* a child went idle, so a child being absent from
+		 * the active set is the premise, not the finding. Reading that absence as
+		 * "idle" would make every crashed subagent look like a healthy one, and the
+		 * whole feature would abort the parent without ever trying to wake the child.
+		 *
+		 * So a child is judged on what it last did, not on whether the server still
+		 * lists it:
+		 *
+		 * - **active, and recent** — running. Wait.
+		 * - **active, and silent past the threshold** — hung. The fuse is tripled while
+		 *   a tool call is still outstanding, because a five-minute build is not a
+		 *   dead model and killing the parent there loses the work.
+		 * - **not active, recent** — it finished. Nothing to wait for.
+		 * - **not active, silent past the threshold** — it stopped without ever
+		 *   reporting. Waking it is worth one attempt.
+		 */
+		async function subagentVerdict(parentSid: string, activeIDs: Set<string>): Promise<SubagentVerdict> {
+			try {
+				const children = await listSubagentIds(parentSid)
+				if (children.length === 0) return { status: "idle" }
+				const now = Date.now()
+				let sawBusy = false
+				for (const child of children) {
+					const messages = await loadMessages(child)
+					const last = messages[messages.length - 1] as
+						| {
+							type?: string
+							error?: unknown
+							time?: { created?: number }
+							content?: Array<{ type?: string; state?: { status?: string } }>
+						}
+						| undefined
+					if (last?.type === "assistant" && last.error !== undefined) {
+						dbg(`subagent ${short(child)} reported an error`)
+						return { status: "crashed" }
+					}
+					const msgTime = last?.time?.created
+					const silentFor = typeof msgTime === "number" ? now - msgTime : Infinity
+					// An unanswered tool part is the "still working, slowly" case.
+					const hasToolCall = (last?.content ?? []).some(
+						(p) => p?.type === "tool" && p.state?.status !== "completed" && p.state?.status !== "error",
+					)
+					const limit = hasToolCall ? SUBAGENT_STUCK_MS * 3 : SUBAGENT_STUCK_MS
+					if (silentFor <= limit) {
+						// Recent enough to be believed, whatever the server thinks.
+						if (activeIDs.has(child)) sawBusy = true
+						continue
+					}
+					dbg(
+						`subagent ${short(child)} silent for ${Math.round(silentFor / 1000)}s (active=${activeIDs.has(child)})`,
+					)
+					return { status: "crashed", stuckSid: child }
+				}
+				return sawBusy ? { status: "busy" } : { status: "idle" }
+			} catch (e) {
+				dbg(`subagent check failed for ${short(parentSid)}:`, e instanceof Error ? e.message : String(e))
+				// Unknown is treated as busy: the cost of waiting is a later abort, and
+				// the cost of guessing wrong is a killed session.
+				return { status: "busy" }
+			}
+		}
+
+		/**
+		 * Nudge a stuck subagent directly.
+		 *
+		 * v1 uses the client prompt route. v2's plugin-scoped `session.synthetic`
+		 * takes an explicit sessionID and appends the message to that session, which is
+		 * the same effect without needing a cross-session route the plugin API does
+		 * not expose.
+		 *
+		 * The general `injectOnce` refuses subagents, and correctly so: a child is
+		 * not ours to recover. This is the one exception, and it is deliberate — the
+		 * parent is stuck *because* the child is, so waking the child is cheaper than
+		 * killing the parent and its whole turn.
+		 */
+		async function recoverStuckSubagent(sid: string): Promise<boolean> {
+			try {
+				await callSessionApi("synthetic", { sessionID: sid, text: SUBAGENT_RECOVERY_PROMPT })
+				log("info", `${short(sid)} recovery prompt sent to stuck subagent`)
+				return true
+			} catch (e) {
+				log("warn", `failed to recover subagent ${short(sid)}: ${e instanceof Error ? e.message : String(e)}`)
+				return false
+			}
+		}
+
+		/**
+		 * The orphan watch.
+		 *
+		 * The failure it exists for: a parent dispatches a subagent, the subagent dies
+		 * without a terminal event, and the parent waits forever on a result that is
+		 * never coming. Nothing is busy, nothing is idle-from-the-runtime's-point-of-view,
+		 * and every ordinary watchdog path declines to act because the silence is shorter
+		 * than `chunkTimeoutMs`.
+		 *
+		 * Armed from `session.idle`: when the busy count drops from more than one to
+		 * exactly one, the survivor is a parent whose children have all gone quiet.
+		 * After `subagentWaitMs` the watchdog asks what the children are doing and, if
+		 * there is no live work left, aborts and resumes the parent.
+		 */
+		/**
+		 * Arm the watch on a session that just outlived its subagents — but only if it
+		 * really had some.
+		 *
+		 * The busy-count drop alone is not evidence. Two unrelated conversations open
+		 * at once, one of them finishes, and the survivor looks identical to a parent
+		 * whose child died: one session left, busy. v1 has no way to tell them apart
+		 * and aborts the survivor either way, which on a busy box means killing
+		 * somebody's conversation for a colleague's finishing turn.
+		 *
+		 * v2 can tell them apart, so it does: one listing call at arm time turns a
+		 * guess into a fact. The cost is one query per 2-to-1 transition, and the
+		 * alternative is an abort that cannot be undone.
+		 */
+		async function armOrphanWatch(sid: string): Promise<void> {
+			const w = sessions.get(sid)
+			if (!w || w.orphanWatchStartAt !== null) return
+			if (w.status !== "busy" || w.userCancelled || w.completionSignaled) return
+			try {
+				if (await isSubAgentSession(sid)) return
+				const children = await listSubagentIds(sid)
+				// Re-checked after the await: the session may have gone idle, been
+				// cancelled, or been picked up by another arming while we were listing.
+				if (w.orphanWatchStartAt !== null || w.status !== "busy" || w.userCancelled) return
+				if (children.length === 0) {
+					dbg(`${short(sid)} outlived a busy session but has no subagents — not an orphan parent`)
+					return
+				}
+				w.orphanWatchStartAt = Date.now()
+				w.orphanRecoveryTried = false
+				log(
+					"info",
+					`subagents of ${short(sid)} fell quiet while it stayed busy. orphan watch (${subagentWaitMs / 1000}s, ${children.length} subagent(s))`,
+				)
+			} catch (e) {
+				dbg(`orphan arming check failed for ${short(sid)}:`, e instanceof Error ? e.message : String(e))
+			}
+		}
+
+		async function runOrphanWatch(sid: string, w: SessionWatch, now: number, activeIDs: Set<string>): Promise<void> {
+			if (now - w.orphanWatchStartAt! < subagentWaitMs + gracePeriodMs) return
+			if (w.resumeAttempts >= maxRetries) {
+				if (!w.gaveUp) {
+					w.gaveUp = true
+					w.orphanWatchStartAt = null
+					log("warn", `${short(sid)} orphan watch gave up after ${w.resumeAttempts} attempts`)
+				}
+				return
+			}
+			// Never abort a parent that is running a tool. Two independent sources,
+			// because the counter can miss a tool that started before the plugin loaded:
+			// our own event-derived count, and the tool parts in the message history.
+			if (w.pendingTools > 0) {
+				dbg(`${short(sid)} parent has ${w.pendingTools} tool(s) in flight — deferring orphan abort`)
+				w.orphanWatchStartAt = now
+				return
+			}
+			if (hasPendingUserInput(await loadMessages(sid))) {
+				dbg(`${short(sid)} parent is waiting on the user — deferring orphan abort`)
+				w.orphanWatchStartAt = now
+				return
+			}
+
+			const verdict = await subagentVerdict(sid, activeIDs)
+			if (verdict.status === "crashed") {
+				// Waking the child is cheaper than killing the parent, so it is tried
+				// first — but exactly once. If the child does not come back, the parent
+				// is the only thing left to save and the watch stops asking.
+				if (verdict.stuckSid && !w.orphanRecoveryTried) {
+					w.orphanRecoveryTried = true
+					if (await recoverStuckSubagent(verdict.stuckSid)) {
+						w.orphanWatchStartAt = now
+						return
+					}
+				}
+				log("info", `${short(sid)} subagent crashed and did not recover — aborting and resuming the parent`)
+				tryAbortAndResume(sid, w)
+				return
+			}
+			if (verdict.status === "busy") {
+				dbg(`${short(sid)} subagents still working — waiting`)
+				w.orphanWatchStartAt = now
+				return
+			}
+			// No subagent is active and none is stuck enough to name. v1 aborts here,
+			// and so does this — the thing standing between that and a wrong kill is
+			// subagentWaitMs, which is how long the parent was given to consume a
+			// finished child's result before this runs at all. Set it to something
+			// small and this becomes a blunt instrument; the option's own default is
+			// 15s, and its name is the warning.
+			log("info", `${short(sid)} stuck with no live subagents — aborting and resuming`)
+			tryAbortAndResume(sid, w)
+		}
+
 		async function checkActiveSessions() {
 			const now = Date.now()
 
@@ -2328,6 +2603,7 @@ export default define({
 				const w = ensureWatch(sid)
 				if (w.status !== "busy") markBusy(sid)
 			}
+			const activeSet = new Set(activeIDs)
 
 			for (const [sid, w] of sessions) {
 				if (w.status !== "busy" || w.userCancelled) continue
@@ -2335,6 +2611,16 @@ export default define({
 				// emit anything. Without this a freshly-started turn can be declared
 				// stalled while it is still queueing its first model call.
 				if (now - w.createdAt < warmupMs) continue
+				// The orphan watch comes first, ahead of the silence check below,
+				// because that is the whole point of it: a parent waiting on a dead
+				// subagent has been quiet for less than chunkTimeoutMs, so every
+				// ordinary path would decline to act.
+				if (w.orphanWatchStartAt !== null) {
+					if (!w.aborting && !w.gaveUp && !w.completionSignaled) {
+						await runOrphanWatch(sid, w, now, activeSet)
+					}
+					continue
+				}
 				// Stale compaction flag: a compaction that never reports
 				// ended/failed within the TTL is wedged — clear the guard so
 				// recovery can eventually intervene.
@@ -2748,6 +3034,11 @@ export default define({
 				case "session.idle": {
 					const sid = sidOf(ev)
 					if (!sid) return
+					// Counted across every tracked session, and read *before* this one goes
+					// idle, because the transition is the signal: a session leaving a crowd
+					// of busy sessions behind it. Sampling after markIdle would make every
+					// idle look like a drop to zero and the arming condition unreachable.
+					const busyBefore = busySessionsForOrphanWatch().length
 					markIdle(sid)
 					const w = ensureWatch(sid)
 					w.pendingRecoveryArmed = false
@@ -2759,6 +3050,18 @@ export default define({
 						dbg(`${short(sid)} idle after plugin-initiated abort — skipping targeted recovery`)
 						return
 					}
+					// Arm the orphan watch. A subagent going idle is only interesting because
+					// of what it leaves behind: when the busy count drops from more than one
+					// to exactly one, the survivor is a parent whose children have all gone
+					// quiet, and it may be waiting for a result that is never coming.
+					//
+					// Re-arming is guarded: an already-armed watch keeps its start time, or a
+					// stream of child idles would keep pushing the deadline out.
+					const busyNow = busySessionsForOrphanWatch()
+					if (busyBefore > 1 && busyNow.length === 1) {
+						void armOrphanWatch(busyNow[0])
+					}
+
 					void inspectOnIdle(sid)
 					// Independent of the idle heuristics above: this looks at tool parts
 					// that already errored, which none of those read. Fire-and-forget
@@ -2931,6 +3234,7 @@ export default define({
 					const w = ensureWatch(sid)
 					const name = typeof ev.data?.tool === "string" ? ev.data.tool : (ev.data?.id as string | undefined) ?? "tool"
 					w.lastWasTaskTool = isTaskToolCall(ev)
+					w.pendingTools++
 					// Any real tool work between completions legitimises the next
 					// task_complete — reset the repeat-signal counter. task_complete
 					// itself is excluded; it manages the counter inside its execute.
@@ -2990,6 +3294,7 @@ export default define({
 					if (!sid) return
 					const w = ensureWatch(sid)
 					w.lastWasTaskTool = false
+					w.pendingTools = Math.max(0, w.pendingTools - 1)
 					touch(sid)
 					return
 				}
@@ -2998,6 +3303,7 @@ export default define({
 					if (!sid) return
 					const w = ensureWatch(sid)
 					w.lastWasTaskTool = false
+					w.pendingTools = Math.max(0, w.pendingTools - 1)
 					touch(sid)
 					return
 				}
