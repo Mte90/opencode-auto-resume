@@ -26,6 +26,8 @@ export interface SessionWatch {
     resumeAttempts: number
     lastRetryAt: number
     gaveUp: boolean
+    oocLocked: boolean
+    oocLockReason: string | null
     orphanWatchStartAt: number | null
     aborting: boolean
     pluginAbortInFlight: boolean
@@ -71,11 +73,12 @@ export interface SessionWatch {
     checkedToolPartIDs: Set<string>
 }
 
-const DEFAULT_CHUNK_TIMEOUT_MS = 45_000
+const DEFAULT_CHUNK_TIMEOUT_MS = 180_000
 const DEFAULT_CHECK_INTERVAL_MS = 5_000
+const DEFAULT_DISCOVERY_DELAY_MS = 5_000
 // Active-user window: an inbound user message this recent means the user is
 // engaged (likely composing) — idle open-todos nudges stand down.
-const DEFAULT_ACTIVE_USER_WINDOW_MS = 15 * 60_000
+const DEFAULT_ACTIVE_USER_WINDOW_MS = 5 * 60_000
 const DEFAULT_GRACE_PERIOD_MS = 3_000
 const DEFAULT_MAX_RETRIES = 3
 const DEFAULT_MAX_BACKOFF_MS = 8_000
@@ -90,6 +93,11 @@ const DEFAULT_MIN_ACTIVITY_GAP_MS = 1_000
 const DEFAULT_WARMUP_MS = 15_000
 const DEFAULT_SILENT_DEAD_STREAM_MIN_TOKENS = 200
 const DEFAULT_DEBUG = false
+// Context-overflow (OOC) errors that a "continue" prompt can never clear: the
+// request simply exceeds the model's context window. Latching on these stops
+// the recovery loop that would otherwise retry forever (incident
+// ses_f239075d3ffeRK43uZ: 193 auto-resume continuations, session unusable).
+const OOC_ERROR_RE = /exceeds the available context size|context size \(\d+\)|too large to compact|too many tokens|prompt is too long/i
 
 const DEFAULT_STREAMING_FAILURE_ERROR_NAMES = [
     "ProviderError",
@@ -509,6 +517,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     (options?.minActivityGapMs as number) ?? DEFAULT_MIN_ACTIVITY_GAP_MS
     const warmupMs: number =
     (options?.warmupMs as number) ?? DEFAULT_WARMUP_MS
+    const discoveryDelayMs: number =
+    (options?.discoveryDelayMs as number) ?? DEFAULT_DISCOVERY_DELAY_MS
     const debug: boolean =
     (options?.debug as boolean) ?? DEFAULT_DEBUG
     const streamingFailureErrorNames: string[] =
@@ -623,6 +633,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 resumeAttempts: 0,
                 lastRetryAt: 0,
                 gaveUp: false,
+                oocLocked: false,
+                oocLockReason: null,
                 orphanWatchStartAt: null,
                 aborting: false,
                 pluginAbortInFlight: false,
@@ -835,6 +847,10 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         // (resetSessionFlags / resetBusyFlags clear gaveUp).
         if (w.gaveUp) {
             await log("debug", `${short(sid)} - gaveUp latched, refusing further continue prompts`)
+            return
+        }
+        if (w.oocLocked) {
+            await log("debug", `${short(sid)} - oocLocked latched, refusing further continue prompts (reason: ${w.oocLockReason ?? "n/a"})`)
             return
         }
         if (!w.continuing) dbg(`State transition on ${short(sid)}: continuing=false -> true`)
@@ -1848,7 +1864,6 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     await log("info", `${short(sid)} - max open-todos nudges (${maxRetries}) reached, waiting for activity`)
                     return
                 }
-                w.todoNudgeAttempts++
             } else if (isDoneClaimNoTodos) {
                 w.doneClaimNoTodosAttempts++
             } else {
@@ -1856,7 +1871,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 w.toolTextAttempts++
             }
 
-            const attemptNum = isOpenTodosReminder ? w.todoNudgeAttempts : isDoneClaimNoTodos ? w.doneClaimNoTodosAttempts : w.toolTextAttempts
+            const attemptNum = isOpenTodosReminder ? w.todoNudgeAttempts + 1 : isDoneClaimNoTodos ? w.doneClaimNoTodosAttempts : w.toolTextAttempts
             await log(
                 "info",
                 `${bestCandidate.source} detected on ${short(sid)}! ` +
@@ -1912,6 +1927,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         }
         if (w.userCancelled || w.completionSignaled) return false
         if (w.aborting) return false
+        if (w.oocLocked) return false
 
         const idleSec = Math.round((Date.now() - (w.orphanWatchStartAt ?? w.lastActivityAt)) / 1000)
         await log("info", `Abort+Resume on ${short(sid)} (${idleSec}s idle). Aborting...`)
@@ -2012,13 +2028,17 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         try {
             const response = await ctx.client.session.list()
             const list = extractMessages(response as Record<string, unknown>)
+            // session.list() never carries a status field (SDK contract) —
+            // fetch real statuses once so discovered already-idle sessions
+            // become eligible for the periodic nudge after a plugin restart.
+            const statusMap = await getSessionStatusMap()
 
             for (const s of list) {
                 const sid = s.id as string
                 if (sid && typeof sid === "string" && sid.startsWith("ses_")) {
                     const isNew = !sessions.has(sid)
                     ensureWatch(sid)
-                    const status = s.status as string | undefined
+                    const status = (s.status as string | undefined) ?? statusMap[sid]
                     if (status) {
                         const w = sessions.get(sid)!
                         w.status = status as SessionWatch["status"]
@@ -2300,7 +2320,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         if (discoveryTimer.unref) discoveryTimer.unref()
 
         // Run initial discovery after a short delay
-        setTimeout(discoverSessions, 5_000)
+        setTimeout(discoverSessions, discoveryDelayMs)
     }
 
     startTimer()
@@ -2330,7 +2350,17 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     if (w.pendingRecovery) {
                         dbg(`Pending recovery cleared on ${short(sid)}: reason=session-busy`)
                     }
-                    resetBusyFlags(w)
+                    // A recovery "continue" prompt accepted by the server flips the
+                    // session to busy while w.continuing is latched. Resetting the
+                    // resume counter here (old behavior) zeroed resumeAttempts on
+                    // every recovery, so a session that kept failing (e.g. an
+                    // unfixable OOC 400) recovered forever. Preserve the counter
+                    // when this busy transition is caused by our own recovery prompt.
+                    if (w.continuing) {
+                        dbg(`busy on ${short(sid)} via recovery prompt - preserving resumeAttempts=${w.resumeAttempts} gaveUp=${w.gaveUp}`)
+                    } else {
+                        resetBusyFlags(w)
+                    }
                     prevBusyCount = busyCount()
                     log("debug", `${short(sid)} -> busy (${prevBusyCount})`)
                 } else if (statusType === "interrupted") {
@@ -2576,12 +2606,12 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                                 // 🎉 with open todos is a FALSE POSITIVE - don't latch completionSignaled, send nudge
                                 await log("info", `${short(sid)} - 🎉 detected but ${open.length} open todos remain, sending nudge`)
                                 const reminder = buildOpenTodosReminder(todos)
-                                await tryResume(sid, w, "Idle with open todos (celebration false positive)", reminder)
-                                w.todoNudgeAttempts++
+                                const sent = await tryResume(sid, w, "Idle with open todos (celebration false positive)", reminder)
+                                if (sent) w.todoNudgeAttempts++
                             } else {
                                 const reminder = buildOpenTodosReminder(todos)
-                                await tryResume(sid, w, "Idle with open todos", reminder)
-                                w.todoNudgeAttempts++
+                                const sent = await tryResume(sid, w, "Idle with open todos", reminder)
+                                if (sent) w.todoNudgeAttempts++
                             }
                         }
                     }
@@ -2837,7 +2867,18 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
                 if (sid) {
                     const w = sessions.get(sid)
-                    if (w) { w.pendingTools = 0; w.pendingCommands = 0 }
+                    if (w) {
+                        w.pendingTools = 0
+                        w.pendingCommands = 0
+                        // Latch on context-overflow errors: a "continue" prompt can
+                        // never clear these (the request exceeds the model's context
+                        // window), so retrying forever is wasted work.
+                        if (!w.oocLocked && OOC_ERROR_RE.test(errorMessage ?? "")) {
+                            w.oocLocked = true
+                            w.oocLockReason = (errorMessage ?? "").slice(0, 200)
+                            await log("warn", `${short(sid)} - OOC error latched, halting recovery (reason: ${w.oocLockReason})`)
+                        }
+                    }
                 }
                 break
             }
@@ -2849,7 +2890,11 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     if (w.pendingRecovery) {
                         dbg(`Pending recovery cleared on ${short(sid)}: reason=user-command`)
                     }
-                    resetBusyFlags(w)
+                    if (w.continuing) {
+                        dbg(`command on ${short(sid)} via recovery prompt - preserving resumeAttempts=${w.resumeAttempts} gaveUp=${w.gaveUp}`)
+                    } else {
+                        resetBusyFlags(w)
+                    }
                     w.pendingCommands = Math.max(0, w.pendingCommands - 1)
                     w.lastActivityAt = Date.now()
                 }
@@ -2964,6 +3009,11 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             // of work, so lift the ESC back-off and the task_complete latch.
             // Busy-state resets must still preserve both flags (issue #16).
             if (w.continuing) return
+            if (w.oocLocked) {
+                w.oocLocked = false
+                w.oocLockReason = null
+                await log("info", `${short(sid)} - genuine user message, clearing oocLocked`)
+            }
             if (w.userCancelled || w.completionSignaled) {
                 w.userCancelled = false
                 w.completionSignaled = false

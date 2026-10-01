@@ -16,7 +16,7 @@ LLM sessions fail in predictable ways. This plugin monitors all sessions and aut
 
 ### Stall recovery
 
-The stream goes silent but the session stays "busy". The UI shows a blinking cursor with no progress. If no events arrive for 48 seconds (`chunkTimeoutMs` + `gracePeriodMs`), the plugin sends `"continue"` with exponential backoff. After 3 failed attempts it gives up.
+The stream goes silent but the session stays "busy". The UI shows a blinking cursor with no progress. If no events arrive for ~3 minutes (`chunkTimeoutMs` + `gracePeriodMs`), the plugin sends `"continue"` with exponential backoff. After 3 failed attempts it gives up.
 
 The `busyStallStrategy` option controls this path: `"continue"` (default), `"abort"` (abort-first), or `"off"` — see [Recovery model](#recovery-model) for what a busy prompt can and cannot do while the runner is live.
 
@@ -264,7 +264,7 @@ If the assistant claims the task is done ("task done", "finished", "all complete
 The session is not stalled while the ball is in the user's court. Two gates stand down idle nudges:
 
 - **Awaiting input**: the newest assistant message holds a `tool_use` part with `state.status: "pending"` (e.g. an open `question` tool call). All idle checks, the periodic recheck, delayed action-intent callbacks, and the tool-text scan skip prompting until a newer user message clears the gate. Completed tool calls never engage it.
-- **Recently active user**: any inbound user message within `activeUserWindowMs` (default 15 minutes) means the user is engaged — likely composing a reply, which leaves no pending tool call behind. Open-todos nudges (idle + periodic), the tool-text reminder fallback, and action-intent callbacks stand down until the window expires.
+- **Recently active user**: any inbound user message within `activeUserWindowMs` (default 5 minutes) means the user is engaged — likely composing a reply, which leaves no pending tool call behind. Open-todos nudges (idle + periodic), the tool-text reminder fallback, and action-intent callbacks stand down until the window expires.
 
 ---
 
@@ -389,7 +389,7 @@ With options:
 {
   "plugin": [
     ["opencode-auto-resume", {
-      "chunkTimeoutMs": 45000,
+      "chunkTimeoutMs": 180000,
       "gracePeriodMs": 3000,
       "maxRetries": 3
     }]
@@ -404,7 +404,7 @@ With options:
   "plugin": [
     [
       "file:///home/YOURUSER/.config/opencode/plugins/opencode-auto-resume/dist/index.js",
-      { "chunkTimeoutMs": 45000, "maxRetries": 3 }
+      { "chunkTimeoutMs": 180000, "maxRetries": 3 }
     ]
   ]
 }
@@ -420,7 +420,7 @@ The v2 plugin uses the `Plugin.define` API with `ctx.event.subscribe()` (AsyncIt
     {
       "package": "./plugins/auto-resume-v2.ts",
       "options": {
-        "chunkTimeoutMs": 45000,
+        "chunkTimeoutMs": 180000,
         "maxRetries": 3
       }
     }
@@ -467,7 +467,7 @@ Defaults are the same on v1 and v2 unless a row says otherwise.
 
 | Option | Default | Description |
 |---|---|---|
-| `chunkTimeoutMs` | `45000` | Inactivity timeout before considering stream stalled |
+| `chunkTimeoutMs` | `180000` | Inactivity timeout before considering stream stalled |
 | `gracePeriodMs` | `3000` | Extra wait before acting (lets ESC/status events arrive) |
 | `checkIntervalMs` | `5000` | Timer poll interval |
 | `maxRetries` | `3` | Max auto-resume attempts before giving up |
@@ -482,6 +482,7 @@ Defaults are the same on v1 and v2 unless a row says otherwise.
 | `toolTextCheckDelayMs` | `3000` | Settle delay before a finished turn's closing text is judged against the done/tool patterns; also the recovery watchdog delay. On v2 only the pattern half is deferred — dead streams are still caught on the idle event, because a stream that died before delivering any text has nothing for those patterns to read. Set `0` to judge on the idle event |
 | `minActivityGapMs` | `1000` | Skip recovery if the session was active within this gap |
 | `warmupMs` | `15000` | Action-intent detection disabled while a session is younger than this |
+| `discoveryDelayMs` | `5000` | Delay before the initial session discovery run after plugin attach |
 | `debug` | `false` | Enable `[debug]` console diagnostics |
 | `resumeOnActionIntent` | `true` | Enable action-intent (`:`-terminated line) nudges |
 | `continuePrompt` | `"continue"` | Prompt text for stall/streaming/dead-stream recovery |
@@ -495,7 +496,7 @@ Defaults are the same on v1 and v2 unless a row says otherwise.
 | `silentDeadStreamMinTokens` | `200` | Min output tokens to treat a textless `finish:"unknown"` message as a dead stream |
 | `busyStallStrategy` | `"continue"` | Busy-stall response: `"continue"`, `"abort"` (abort-first), or `"off"` (disabled) |
 | `contextSaturationThreshold` | `0.85` | Ratio of used/usable context that routes a saturated session to reclamation: a parent to magic-context `ctx-wrapup` (only when magic-context is installed), a subagent to native compaction (only when `subagentNativeCompactionEnabled`) |
-| `activeUserWindowMs` | `300000` on v2, `900000` on v1 | Inbound-user-message recency window during which idle nudges stand down (user likely composing). v1 is stale at 15 min on this branch; upstream `e1b8374` already moved it to 5 min and the v2 build matches that |
+| `activeUserWindowMs` | `300000` | Inbound-user-message recency window during which idle nudges stand down (user likely composing) |
 | `subagentNativeCompactionEnabled` | `false` | Opt-in native `session.summarize()` for saturated subagent sessions (no magic-context detection required) |
 | `injectIntervalMs` | v2 only | Minimum gap between recovery injections for one session. No v1 equivalent |
 | `logFile` | v2 only | Where this build appends its log. v2 removed v1's server log endpoint, so without this the plugin is silent. Defaults to `~/.local/state/opencode-v2/auto-resume.log` |
@@ -522,7 +523,7 @@ The plugin handles all recovery automatically — no manual intervention needed.
 | Problem | Solution |
 |---|---|
 | Resumes after ESC | Increase `gracePeriodMs` to `5000` |
-| Too aggressive | Increase `chunkTimeoutMs` to `60000` |
+| Stall recovery too aggressive | Decrease `chunkTimeoutMs` (e.g. `45000`) |
 | Too slow to react | Decrease `checkIntervalMs` to `2000` |
 | Orphan parent not detected | Increase `subagentWaitMs` to `20000` |
 | Hallucination loop not caught | Decrease `loopMaxContinues` to `2` |
