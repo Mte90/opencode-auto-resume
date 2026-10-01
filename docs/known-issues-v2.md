@@ -52,6 +52,13 @@ the fix is mte090's `e1b8374`, applied to the v2 code path. The stall path
   branch still reads `900000` because it predates `e1b8374`; the PR does not
   touch v1, and master already carries the fix.
 
+  Lowering the default was not enough on its own: the v2 implementation asked
+  "is the newest message a user message?" rather than v1's "was any inbound user
+  message inside the window?". At idle time the newest message is the assistant
+  turn that just finished, so the window never applied and the nudge fired
+  straight over a user who was mid-conversation. The check now walks back for
+  the most recent user message, which is what the option describes.
+
 ## v2-only options
 
 - `injectIntervalMs` — minimum gap between recovery injections for one session.
@@ -103,3 +110,26 @@ Both calls are read defensively — off the plugin `session` domain first, then
 off the raw client — because v2 hands plugins a narrowed `Pick` that omits both.
 A host that supplies neither degrades to the event-derived busy set rather than
 failing.
+
+## Premature stop — the case the stall watchdog cannot see
+
+A session can end its turn cleanly while the work is not done: no stall, no
+error, no streaming failure, just a short "Task done." and then idle. The stall
+watchdog only looks at *busy* sessions, so this is invisible to it by
+construction. Two detectors run on the idle path instead, both ported from v1:
+
+- **A done-claim with no work report in it.** v2 used to gate the details prompt
+  on a 400-character threshold, which cannot tell "Task done." from a real
+  two-line summary — it both over-nudged terse reports and let short real ones
+  pass. It now uses v1's `containsWorkDescription`: a backticked or bare path
+  with a dotted extension, or a report header (`Changed`, `Verification`,
+  `Tests run`, `Results`, `Commands run`). Asking again after a genuine report
+  loops forever, which is issue #26.
+- **A trailing 🎉.** That is the model's own "I finished" signal, so the plugin
+  latches completion and stops nudging rather than talking over a deliberate
+  stop. The latch is per-turn: a new turn re-opens the question, and a later
+  idle with no new text does not re-derive it forever.
+
+v1 cross-checks both against tracked todo state before latching. v2 has no todo
+state yet, so the emoji latches on its own — see `doneWithoutWorkPrompt` in the
+inert table above for what that costs.

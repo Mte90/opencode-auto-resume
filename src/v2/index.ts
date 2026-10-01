@@ -132,6 +132,9 @@ interface SessionWatch {
 	continueTimestamps: number[]
 	doneClaimAttempts: number
 	intentNudgeAttempts: number
+	/** Set when the model's own completion signal was seen (a trailing 🎉).
+	 * Latches so a finished session stops being nudged. */
+	completionSignaled: boolean
 	/** Set when a failure-triggered recovery is pending, so the delayed prompt isn't cancelled by the failure's own idle transition. */
 	pendingRecoveryArmed: boolean
 
@@ -551,6 +554,48 @@ function containsDoneClaimPattern(text: string, patterns: RegExp[] = DONE_CLAIM_
 	return patterns.some((pat) => pat.test(lastLines))
 }
 
+/**
+ * True when a done-claim already carries a concrete work report.
+ *
+ * v1 asks for details once per done-claim and then trusts the answer. A length
+ * check cannot tell the difference between "Task done." (nothing was done) and
+ * a two-line summary, so v2 replaces the 400-char threshold with the same
+ * structural test v1 uses. Prompting again after a real report would loop
+ * forever (#26).
+ *
+ * Three signals, in order of specificity:
+ *   - a backticked span naming a dotted file: `src/index.ts`
+ *   - a bare path with a slash and a dotted extension: /a/b.py
+ *   - a report header: changed / verification / results / commands run
+ */
+function containsWorkDescription(text: string): boolean {
+	// Backticked span mentioning a dotted filename.
+	if (/`[^`\n]*\.[a-zA-Z0-9]{1,8}[^`\n]*`/.test(text)) return true
+	// Bare path with a slash and a dotted extension.
+	if (/[\w\-~.][\w\-.~\/]*\/[\w\-.~]*\.[a-zA-Z]{1,8}\b/.test(text)) return true
+	// Report section headers.
+	if (
+		/^(changed|modified|deleted|created|updated|renamed|moved|files?\s+changed|verification|verified|tests?(?:\s+run|\s+passing|\s+pass)?|results?|outcome|commands?\s+(?:run|executed))/im.test(
+			text,
+		)
+	)
+		return true
+	return false
+}
+
+/**
+ * True when the last assistant turn closes with a celebration emoji.
+ *
+ * A 🎉 is the model's own "I finished" signal. v1 uses it to latch completion
+ * rather than keep nudging — but only when no work is left, otherwise a
+ * premature 🎉 would be treated as a real finish. Ported without the todo
+ * cross-check, so on v2 it latches on the emoji alone.
+ */
+function endsWithCelebration(text: string): boolean {
+	const normalized = text.trim().replace(/[.!?]+$/, "")
+	return normalized.endsWith("🎉")
+}
+
 /** Model ends with ":" announcing intent without executing. */
 function containsActionIntent(text: string): boolean {
 	if (text.length <= 15) return false
@@ -800,8 +845,13 @@ export default define({
 			(FEATURE_GATED_OPTIONS as readonly string[]).includes(key),
 		)
 
+		// Debug output goes to the same file as everything else. Console-only debug
+		// is invisible in v2 for the same reason the rest of the logging was, and
+		// debug is exactly when you are trying to work out what the plugin did.
 		const dbg = (...args: unknown[]) => {
-			if (debug) console.log("[auto-resume:debug]", ...args)
+			if (!debug) return
+			appendLogFile(logFile, "debug", `[auto-resume:debug] ${args.map((a) => String(a)).join(" ")}`)
+			console.log("[auto-resume:debug]", ...args)
 		}
 
 		function log(level: "info" | "warn" | "error", msg: string) {
@@ -881,6 +931,7 @@ export default define({
 					continueTimestamps: [],
 					doneClaimAttempts: 0,
 					intentNudgeAttempts: 0,
+					completionSignaled: false,
 					pendingRecoveryArmed: false,
 					permissionPending: false,
 					permissionPendingAt: null,
@@ -916,6 +967,8 @@ export default define({
 				w.toolTextAttempts = 0
 				w.doneClaimAttempts = 0
 				w.intentNudgeAttempts = 0
+				// A new turn re-opens the question of whether the work is finished.
+				w.completionSignaled = false
 				w.gaveUp = false
 				w.recentToolCalls = []
 				w.textParts.clear()
@@ -1441,10 +1494,27 @@ export default define({
 			}
 		}
 		// (b) The user was recently active — they are mid-conversation, not stuck.
-		if (newest?.type === "user") {
-			const ts = newest.time?.created ?? newest.info?.time?.created
-			if (typeof ts === "number" && Date.now() - ts < activeUserWindowMs) return true
+		//
+		// v1 stamps `lastUserMessageAt` on ANY inbound user message and asks
+		// "was there one inside activeUserWindowMs?". This used to ask "is the
+		// newest message a user message?", which at idle time is essentially never
+		// true — the newest message is the assistant turn that just finished — so
+		// the whole window was dead. Walk back for the most recent user message.
+		let lastUserAt: number | undefined
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const m = messages[i] as {
+				type?: string
+				role?: string
+				time?: { created?: number }
+				info?: { time?: { created?: number }; role?: string }
+			}
+			const isUser = m?.type === "user" || m?.role === "user" || m?.info?.role === "user"
+			if (!isUser) continue
+			const ts = m.time?.created ?? m.info?.time?.created
+			if (typeof ts === "number") lastUserAt = ts
+			break
 		}
+		if (lastUserAt !== undefined && Date.now() - lastUserAt < activeUserWindowMs) return true
 		return false
 	} catch {
 		return false
@@ -1473,6 +1543,20 @@ async function inspectOnIdle(sid: string) {
 				return
 			}
 
+			// The model's own completion signal. A trailing 🎉 means it considers the
+			// work finished, so nudging here would talk over a deliberate stop.
+			// Latched rather than re-derived, because the next idle with no new text
+			// would otherwise re-check the same turn forever.
+			if (endsWithCelebration(text)) {
+				if (!w.completionSignaled) {
+					w.completionSignaled = true
+					log("info", `${short(sid)} turn ends with a celebration — latching completion, not nudging`)
+				} else {
+					dbg(`${short(sid)} completion already latched — skipping`)
+				}
+				return
+			}
+
 			if (containsToolCallAsText(text)) {
 				await targetedRecovery(sid, "tool-call-as-text", opts.toolTextRecoveryPrompt ?? TOOL_TEXT_RECOVERY_PROMPT, "toolTextAttempts")
 				return
@@ -1485,11 +1569,16 @@ async function inspectOnIdle(sid: string) {
 				await targetedRecovery(sid, "action-intent", opts.actionIntentPrompt ?? opts.continuePrompt ?? CONTINUE_PROMPT, "intentNudgeAttempts")
 				return
 			}
-			if (containsDoneClaimPattern(text, doneClaimPatterns) && w.doneClaimAttempts < 1) {
-				// Single verification nudge for suspiciously terse completions
-				const trimmed = text.trim()
-				if (trimmed.length < 400) {
+			if (containsDoneClaimPattern(text, doneClaimPatterns) && w.doneClaimAttempts < maxRetries) {
+				// Ask once for the work report. v2 used to gate this on a 400-char
+				// length, which cannot tell "Task done." from a real summary and so
+				// both over-nudged terse reports and let short-but-real ones pass.
+				// containsWorkDescription is the same structural test v1 uses, and
+				// prompting again after a real report loops forever (#26).
+				if (!containsWorkDescription(text)) {
 					await targetedRecovery(sid, "done-claim-no-details", doneWithoutDetailsPrompt, "doneClaimAttempts")
+				} else {
+					dbg(`${short(sid)} done-claim carries a work description — skipping details prompt`)
 				}
 			}
 		}
