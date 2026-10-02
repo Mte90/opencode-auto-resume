@@ -2684,7 +2684,30 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             }
 
             case "session.updated": {
-                if (sid) ensureWatch(sid)
+                if (!sid) break
+                // A revert arrives as `session.updated` with `properties.info.revert`
+                // set (verified on v1.18.34); there is no revert-named event, so a
+                // plugin that switches on the event name alone never sees the rewind.
+                // Dropping the watch is what makes a rewound turn start clean: the
+                // stale counters (resumeAttempts, recoveryAttempts, gaveUp) AND the
+                // stand-down latch (userCancelled, completionSignaled) all go with it.
+                // The latch matters most — an ESC on a runaway turn, then a rewind and
+                // a re-ask, used to leave the session muted for good. Unreverting
+                // brings the messages back but not these flags, which is the
+                // conservative direction: a live session gets a fresh budget rather
+                // than an exhausted one.
+                const updatedInfo = (ev.properties as Record<string, unknown> | undefined)?.info as
+                    | Record<string, unknown>
+                    | undefined
+                if (updatedInfo?.revert) {
+                    const was = sessions.get(sid)
+                    dbg(
+                        `Revert on ${short(sid)}: dropping watch state (resumeAttempts=${was?.resumeAttempts ?? 0} recoveryAttempts=${was?.recoveryAttempts ?? 0} gaveUp=${was?.gaveUp ?? false})`,
+                    )
+                    sessions.delete(sid)
+                    break
+                }
+                ensureWatch(sid)
                 break
             }
 
