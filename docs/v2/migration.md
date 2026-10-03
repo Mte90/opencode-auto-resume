@@ -16,7 +16,7 @@ object) to the v2 promise-plugin API (`Plugin.define({ id, setup })` +
 `ctx.event.subscribe()`). All detection/recovery features are preserved.
 Strict-mode typechecked against the real `@opencode/plugin@2.0.5` types, and
 covered by 188 tests across 13 files driven through the real event stream — one
-file per feature area, 774 passing repo-wide including v1.
+file per feature area, 780 passing repo-wide including v1.
 
 ## 1. Config key renamed: `plugin` → `plugins`
 

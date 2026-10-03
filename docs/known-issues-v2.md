@@ -142,17 +142,26 @@ API. v2 has neither: the `todo` table is created in the v2 database (migration
 `20260127222353_familiar_lady_ursula.ts`) but no route reaches it and nothing
 emits an event for it, so there is no way to observe the list changing.
 
-What v2 does have is the storage domain, and the installed todo tool already
-writes the list there under a stable per-session key —
-`ctx.storage.set("todos/<sessionID>", { todos, updatedAt })`. auto-resume reads
-that key instead of owning a list of its own.
+What v2 does have is the **session message log**: every `todowrite` call is
+persisted as a tool part whose input carries the whole list, so the newest
+completed call *is* the current list. auto-resume reads that, instead of owning a
+list of its own.
+
+`ctx.storage` looks like the obvious store and is not one. It is namespaced per
+plugin: a key resolves to `storage/plugin/<PLUGIN-ID>/<key>.json`, and the route is
+`/api/plugin/storage/<PLUGIN-ID>/<key>`. A todo plugin writing
+`todos/<sessionID>` therefore lands in its own directory, so this plugin reading
+the same key is reading a key nothing wrote — regardless of who writes what. A
+storage-first reader concludes "no todos" while the list sits in the message log,
+and fires false done-claim nudges at a session that still has work listed.
 
 The consequence worth stating: auto-resume is a **consumer**, not a second owner.
 It works with whichever todo tool is installed rather than requiring its own, and
-there is no copy to drift. It only ever calls `get`. With no `ctx.storage` at all,
-or with a record it cannot parse, it falls back to "no list" — which means the
-older behaviour (latch on the emoji, ask for details on a bare done-claim), never
-a nudge on the strength of a list it failed to read.
+there is no copy to drift. It calls `get` on storage only after the message log has
+come up empty. With no `ctx.storage` at all, or with a record it cannot parse, it
+falls back to "no list" — which means the older behaviour (latch on the emoji, ask
+for details on a bare done-claim), never a nudge on the strength of a list it failed
+to read.
 
 Three places consume it:
 
