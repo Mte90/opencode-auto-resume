@@ -85,6 +85,15 @@ async function replay(
 	events: any[],
 	opts: Record<string, unknown> = {},
 	harnessOpts: { sendFails?: boolean; text?: string } = {},
+	/** Index of an event that must wait for the first nudge to land before it
+	 * is pushed. Back-to-back idles with a 0ms pattern delay rely on the first
+	 * 0ms timer firing inside the 10ms inter-event gap; under parallel-suite
+	 * load it does not, and the second idle's schedulePatternPass then
+	 * *replaces* the first pass (by design — see schedulePatternPass) instead
+	 * of following it, so only one nudge is ever logged. Gating on the observed
+	 * line removes the wall-clock race. Times out silently after 10s: the
+	 * test's own assertion then reports the miss with the natural evidence. */
+	waitForNudgeBeforeEvent?: number,
 ): Promise<Harness> {
 	const injected: Harness["injected"] = []
 	const interrupts: string[] = []
@@ -128,10 +137,24 @@ async function replay(
 		},
 	}
 
+/** Poll the scratch log until `needle` appears (see `waitForNudgeBeforeEvent`). */
+async function waitForLogLine(path: string, needle: string, timeoutMs: number): Promise<void> {
+	const start = Date.now()
+	while (Date.now() - start < timeoutMs) {
+		try {
+			if (readFileSync(path, "utf8").includes(needle)) return
+		} catch {
+			// Not written yet — the plugin creates it on first log line.
+		}
+		await wait(20)
+	}
+}
+
 	const cleanup = await (plugin as any).setup(ctx)
-	for (const e of events) {
-		stream.push(e)
-		await wait(10)
+	for (let i = 0; i < events.length; i++) {
+		stream.push(events[i])
+		if (i === waitForNudgeBeforeEvent) await waitForLogLine(logFile, "ready-to-continue detected", 10_000)
+		else await wait(10)
 	}
 	await wait(600) // handleEvent is sync; its work is async
 	;(cleanup as (() => void) | undefined)?.()
@@ -359,7 +382,7 @@ describe("v2: a nudge that was never delivered does not consume a retry", () => 
 	]
 
 	test("CONTROL: both sends succeed -> each nudge is 1/3, because markBusy resets the per-turn budget", async () => {
-		const { logs } = await replay(twoIdles, { maxRetries: 3, loopMaxContinues: 99, injectIntervalMs: 0 })
+		const { logs } = await replay(twoIdles, { maxRetries: 3, loopMaxContinues: 99, injectIntervalMs: 0 }, {}, 3)
 		const nudges = logs.filter((l) => l.includes("ready-to-continue detected"))
 		expect(nudges.length).toBeGreaterThanOrEqual(2)
 		// This is what makes the test below meaningful: on the success path the
@@ -373,6 +396,7 @@ describe("v2: a nudge that was never delivered does not consume a retry", () => 
 			twoIdles,
 			{ maxRetries: 3, loopMaxContinues: 99, injectIntervalMs: 0 },
 			{ sendFails: true },
+			3,
 		)
 		expect(injected).toEqual([])
 		const nudges = logs.filter((l) => l.includes("ready-to-continue detected"))
