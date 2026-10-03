@@ -856,10 +856,20 @@ function normalizeTodoList(input: unknown): Todo[] | undefined {
 	return out.length > 0 ? out : undefined
 }
 /**
- * Canonical parser, mirroring opencode-todo-fork's `latestTodosFromMessages`: walk
- * the messages, and for every COMPLETED `todowrite` tool part keep its normalized
- * input. `todowrite` REPLACES the whole list, so the newest such call IS the
- * current list.
+ * Canonical parser, mirroring opencode-todo-fork's `todosFromMessages` (the same
+ * routine is called `latestTodosFromMessages` in that repo's `src/tui-data.ts`):
+ * walk the messages, and for every COMPLETED `todowrite` tool part keep its
+ * normalized input. `todowrite` REPLACES the whole list, so the newest such call
+ * IS the current list.
+ *
+ * This is a deliberate copy rather than an import, and the reason is worth
+ * stating because it looks like an oversight otherwise. Plugins are loaded
+ * independently and there is no cross-plugin import contract: reaching into a
+ * sibling plugin's directory would tie auto-resume's ability to read a todo
+ * list to that plugin being installed at that exact path, and auto-resume has to
+ * work without it. The cost is that a fix to one copy is not automatically a fix
+ * to the other - so both copies carry the ordering note below, and both repos
+ * test the ranking rather than trusting it to stay in step.
  *
  * Order note: `/api/session/{id}/message` returns NEWEST FIRST, so a
  * last-match-wins loop selects the OLDEST list - that bug shipped in two places
