@@ -349,6 +349,11 @@ answers `{ data, cursor }`, never a bare array, and orders results newest first)
 `ctx.storage` survives only as a last-resort fallback, for a host that writes the
 list itself.
 
+Confirmed working setup: `opencode-todo-fork` — verified live (list resolved
+from the log, `/todo` round-trip green). Other todo plugins are unconfirmed:
+anything that persists `todowrite` calls to the message log should read, but
+only the fork has been tested.
+
 ```
 Any SSE Event
   ├─ has sessionID? → touchSession(sid) — reset only that session's timer

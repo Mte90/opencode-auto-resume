@@ -156,8 +156,9 @@ storage-first reader concludes "no todos" while the list sits in the message log
 and fires false done-claim nudges at a session that still has work listed.
 
 The consequence worth stating: auto-resume is a **consumer**, not a second owner.
-It works with whichever todo tool is installed rather than requiring its own, and
-there is no copy to drift. It calls `get` on storage only after the message log has
+It works with whichever todo tool is installed rather than requiring its own.
+Confirmed against `opencode-todo-fork`; other todo plugins are unconfirmed.
+There is no copy to drift. It calls `get` on storage only after the message log has
 come up empty. With no `ctx.storage` at all, or with a record it cannot parse, it
 falls back to "no list" — which means the older behaviour (latch on the emoji, ask
 for details on a bare done-claim), never a nudge on the strength of a list it failed
