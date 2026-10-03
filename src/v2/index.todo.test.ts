@@ -10,10 +10,16 @@ const SID = "ses_todo"
 /**
  * The todo list as the plugin under test reads it.
  *
- * auto-resume does not own a todo list — it reads the one the installed todo tool
- * writes, under the key `todos/<sessionID>`. So these tests supply that key and
- * nothing else, which is the point: they would pass unchanged against a real
- * `todowrite` tool, and they assert the plugin never writes there itself.
+ * auto-resume does not own a todo list — it reads one. In v2 the real store is the
+ * SESSION MESSAGE LOG: every `todowrite` call is persisted as a tool part whose
+ * input carries the whole list, so the newest completed call IS the current list.
+ * The v1-shaped `todos/<sessionID>` storage key is kept as a last-resort fallback
+ * (nothing in v2 writes it, so it always misses).
+ *
+ * The `replay` harness therefore takes both: `todos` populates the storage
+ * fallback, `messages` supplies the message log. Left undefined, `messages`
+ * resolves to an empty page so the storage cases keep testing storage — which is
+ * the point, because the fallback must stay alive.
  *
  * Three things are under test:
  *
@@ -126,6 +132,7 @@ async function replay(
 	todos: unknown[] | undefined,
 	opts: Record<string, unknown> = {},
 	storageShape: { omitStorage?: boolean } = {},
+	messages: unknown[] | undefined = undefined,
 ): Promise<Harness> {
 	const injected: Harness["injected"] = []
 	const storageWrites: string[] = []
@@ -147,7 +154,16 @@ async function replay(
 			synthetic: async (a: any) => (injected.push({ text: a?.text }), {}),
 			prompt: async (a: any) => (injected.push({ text: a?.text }), {}),
 		},
-		client: { session: { get: async () => ({ data: {} }) } },
+		client: {
+			session: {
+				get: async () => ({ data: {} }),
+				// The message list endpoint answers with a `{ data, cursor }` envelope,
+				// never a bare array — handing the envelope straight to the parser trips
+				// its Array.isArray guard and silently resolves nothing. Reproduced here
+				// so that trap is exercised by every test in the group below.
+				message: { list: async () => ({ data: messages ?? [], cursor: null }) },
+			},
+		},
 	}
 	if (!storageShape.omitStorage) {
 		ctx.storage = {
@@ -330,5 +346,127 @@ describe("v2: the todo list, read from the tool that owns it", () => {
 		})
 		expect(injected).toHaveLength(1)
 		expect(injected[0].text).toBe("Your todo list still has open items.")
+	})
+})
+
+
+describe("v2: the todo list is read from the session message log", () => {
+	/** A completed `todowrite` tool part, stamped so ordering is unambiguous. */
+	const part = (todos: unknown[], at: number) => ({
+		type: "tool",
+		name: "todowrite",
+		state: { status: "completed", input: { todos }, time: { start: at, end: at } },
+	})
+	const msg = (parts: unknown[]) => ({ role: "user", content: parts })
+	/** A `todowrite` part whose `input` is `input` verbatim, for malformed shapes. */
+	const rawPart = (input: unknown, at: number) => ({
+		type: "tool",
+		name: "todowrite",
+		state: { status: "completed", input, time: { start: at, end: at } },
+	})
+
+	/** Distinct from OPEN/CLOSED so an assertion cannot pass on the wrong list. */
+	const NEWEST = [{ content: "newest open item", status: "pending", priority: "high" }]
+	const OLDER = [{ content: "older open item", status: "pending", priority: "low" }]
+
+	test("CONTROL: a todowrite in the log is enough, with the storage key left empty", async () => {
+		// The bug this group exists for. A storage-only reader finds an empty key,
+		// concludes "no todos", and fires a false done-claim nudge on a session with
+		// work still listed — which is how /todo printed [0/0] beside 14 todos.
+		const { injected, logs, storageReads } = await replay(
+			[{ text: CELEBRATED }],
+			[],
+			{},
+			{},
+			[msg([part(OPEN, Date.now())])],
+		)
+		expect(injected).toHaveLength(1)
+		expect(injected[0].text).toContain("Write the migration guide")
+		// Not read at all: the log answered, so the dead key is never consulted.
+		expect(storageReads).not.toContain(`todos/${SID}`)
+		expect(logs.some((l) => l.includes("todos via ctx.client.session.message.list"))).toBe(true)
+	})
+
+	test("the NEWEST completed todowrite wins, not the oldest", async () => {
+		// `/api/session/{id}/message` returns NEWEST FIRST, so a last-match-wins loop
+		// selects the OLDEST list. This shipped in two places before it was caught,
+		// and it is silent: an older list is a plausible-looking list.
+		const now = Date.now()
+		const { injected } = await replay(
+			[{ text: CELEBRATED }],
+			[],
+			{},
+			{},
+			// Newest first, exactly as the endpoint orders it.
+			[msg([part(NEWEST, now)]), msg([part(OLDER, now - 60_000)])],
+		)
+		expect(injected).toHaveLength(1)
+		expect(injected[0].text).toContain("newest open item")
+		expect(injected[0].text).not.toContain("older open item")
+	})
+
+	test("an unfinished todowrite is ignored, not half-read", async () => {
+		// Only a COMPLETED call replaced the list. A pending or failed one carries a
+		// partial input, and treating that as the list is how a half-written todo
+		// becomes "everything is done".
+		const { injected, logs } = await replay(
+			[{ text: CELEBRATED }],
+			[],
+			{},
+			{},
+			[
+				msg([
+					{
+						type: "tool",
+						name: "todowrite",
+						state: { status: "error", input: { todos: NEWEST }, time: { end: Date.now() } },
+					},
+				]),
+			],
+		)
+		expect(injected).toEqual([])
+		expect(logs.some((l) => l.includes("no open todos — latching completion"))).toBe(true)
+	})
+
+	test("a malformed list yields 'cannot conclude', never an empty list", async () => {
+		// The dangerous direction is "unreadable" becoming "nothing is open". An
+		// unreadable list must fall through to the fallback, exactly like no list.
+		for (const bad of [{ todos: "nope" }, { todos: [null, 7] }, {}]) {
+			const { injected } = await replay(
+				[{ text: CELEBRATED }],
+				[],
+				{},
+				{},
+				[msg([rawPart(bad, Date.now())])],
+			)
+			expect(injected).toEqual([])
+		}
+	})
+
+	test("the storage fallback still answers when the log has no todowrite", async () => {
+		// The fallback is not dead code we can drop: it is the only source on a host
+		// whose log the plugin cannot read.
+		const { injected, storageReads } = await replay(
+			[{ text: CELEBRATED }],
+			OPEN,
+			{},
+			{},
+			[msg([{ type: "text", text: "no tool calls here" }])],
+		)
+		expect(storageReads).toContain(`todos/${SID}`)
+		expect(injected).toHaveLength(1)
+		expect(injected[0].text).toContain("Write the migration guide")
+	})
+
+	test("a host with neither source degrades instead of crashing", async () => {
+		const { injected, logs } = await replay(
+			[{ text: CELEBRATED }],
+			[],
+			{},
+			{ omitStorage: true },
+			[],
+		)
+		expect(injected).toEqual([])
+		expect(logs.some((l) => l.includes("latching completion"))).toBe(true)
 	})
 })

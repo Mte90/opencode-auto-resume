@@ -126,6 +126,25 @@ Two shape details the port relies on:
 - Recovery notifications use `ctx.session.synthetic({ sessionID, text,
   description, resume })` so the intervention is visible in the TUI, falling
   back to `session.prompt({ sessionID, text })`.
+- **The todo list is read from the session message log, not from storage.** v2
+  emits no `todo.updated` event and exposes no todo route, and the v1-shaped
+  `ctx.storage` key `todos/<sessionID>` is never written — so a storage-first
+  reader concludes "no todos" and fires false done-claim nudges. Every `todowrite`
+  call is persisted as a tool part whose input carries the whole list, so the
+  newest **completed** call is the current list. It is read via
+  `ctx.client.session.message.list`, falling back to a loopback
+  `GET /api/session/{id}/message?limit=200` (that endpoint answers
+  `{ data, cursor }`, never a bare array; 200 is its ceiling; results are ordered
+  newest first, so a last-match-wins parser would select the OLDEST list).
+  `ctx.storage` is now only a last-resort fallback.
+- **New host access beyond the plugin context.** `readFileSync` on
+  `/proc/self/cmdline` to discover the local server's `--port`, plus a loopback
+  HTTP GET. Env vars alone are not enough: under OpenChamber the server is spawned
+  as `opencode serve --hostname 127.0.0.1 --port <n>` and exports no port variable,
+  so an env-only candidate list comes back empty and the HTTP source is never
+  attempted at all. Every one of these is best-effort — a host that refuses them
+  degrades to "cannot read todos", never a crash — and where `/proc` is
+  unavailable the plugin falls back to env-var discovery.
 - `ctx.client.app.log(...)` → prefixed console logging.
 - Status polling demoted: session state comes primarily from lifecycle
   events; a low-frequency interval cross-checks active sessions for silence

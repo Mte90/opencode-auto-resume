@@ -54,7 +54,7 @@ type AutoResumePlugin = {
 
 const define = <T>(plugin: T): T => plugin
 
-import { appendFileSync, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs"
+import { appendFileSync, readFileSync, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 
@@ -785,6 +785,119 @@ function buildOpenTodosReminder(todos: Todo[]): string {
 	const taskWord = open.length > 1 ? "tasks" : "task"
 	const thisWord = open.length > 1 ? "these" : "this"
 	return `You have ${open.length} unfinished task${plural}:\n${list}\n\nPlease continue working on ${thisWord} ${taskWord}.`
+}
+
+
+/** Candidate local server base URLs: env vars first, then /proc/self/cmdline.
+ *  `cmdline` is injectable so the port parsing is unit-testable without spawning
+ *  a process whose argv looks like a server invocation.
+ *
+ *  The /proc read is not belt-and-braces: under OpenChamber the server is spawned
+ *  as `opencode serve --hostname 127.0.0.1 --port <n>` and exports NO port env
+ *  var, so an env-only list comes back EMPTY and the HTTP source is never
+ *  attempted at all. Same mechanism the prompt-polisher uses, which is why its
+ *  HTTP DELETE reaches this same server.
+ */
+function serverBaseUrls(cmdline?: string): string[] {
+	const out: string[] = []
+	const push = (v: string | undefined) => {
+	if (typeof v !== "string" || !v) return
+	const url = v.startsWith("http") ? v : `http://127.0.0.1:${v.replace(/^:/, "")}`
+	if (!out.includes(url)) out.push(url.replace(/\/$/, ""))
+	}
+	const env = process.env
+	push(env.OPENCODE_SERVER_URL)
+	push(env.OPENCODE_URL)
+	push(env.OPENCODE_SERVER_PORT)
+	push(env.OPENCODE_PORT)
+	push(env.PORT)
+	try {
+		const raw = cmdline ?? readFileSync("/proc/self/cmdline", "utf8")
+		const argv = raw.split("\0")
+		const portFlag = argv.indexOf("--port")
+		if (portFlag !== -1 && argv[portFlag + 1]) {
+			const hostFlag = argv.indexOf("--hostname")
+			const host = hostFlag !== -1 && argv[hostFlag + 1] ? argv[hostFlag + 1] : "127.0.0.1"
+			push(`http://${host}:${argv[portFlag + 1]}`)
+		}
+	} catch {
+	// /proc unavailable (non-Linux): env vars only
+	}
+	return out
+}
+/** HTTP Basic for the local server, same derivation the prompt-polisher uses. */
+function serverHeaders(): Record<string, string> {
+	const pw = process.env.OPENCODE_SERVER_PASSWORD || process.env.OPENCODE_PASSWORD
+	if (!pw) return {}
+	return { Authorization: `Basic ${Buffer.from(`opencode:${pw}`).toString("base64")}` }
+}
+/**
+ * Normalize a `todowrite` tool input into a todo list, or `undefined` when it is
+ * not a usable list.
+ *
+ * An entry with an unrecognized status is KEPT (cast, not dropped): `isOpenTodo`
+ * treats only `pending`/`in_progress` as open, so an unknown status reads as
+ * closed. Dropping it would shrink the list, and a shrunken list is the
+ * dangerous direction - it makes real open work look finished.
+ */
+function normalizeTodoList(input: unknown): Todo[] | undefined {
+	if (input === null || typeof input !== "object") return undefined
+	const todos = (input as { todos?: unknown }).todos
+	if (!Array.isArray(todos)) return undefined
+	const out: Todo[] = []
+	for (const entry of todos) {
+	if (entry === null || typeof entry !== "object") continue
+	const e = entry as { content?: unknown; status?: unknown; priority?: unknown }
+	if (typeof e.content !== "string" || typeof e.status !== "string") continue
+	const todo: Todo = { content: e.content, status: e.status as Todo["status"], priority: "medium" }
+	if (typeof e.priority === "string") todo.priority = e.priority as Todo["priority"]
+	out.push(todo)
+	}
+	return out.length > 0 ? out : undefined
+}
+/**
+ * Canonical parser, mirroring opencode-todo-fork's `latestTodosFromMessages`: walk
+ * the messages, and for every COMPLETED `todowrite` tool part keep its normalized
+ * input. `todowrite` REPLACES the whole list, so the newest such call IS the
+ * current list.
+ *
+ * Order note: `/api/session/{id}/message` returns NEWEST FIRST, so a
+ * last-match-wins loop selects the OLDEST list - that bug shipped in two places
+ * before it was caught. Rank by timestamp instead, falling back to encounter
+ * order, and skip a malformed historical call while keeping the previous valid
+ * list.
+ *
+ * Returns `undefined`, never `[]`, so "no todos exist" stays distinguishable from
+ * "we could not look" - that distinction is what keeps this diagnosable instead of
+ * silently degrading.
+ */
+function todosFromMessages(messages: unknown): Todo[] | undefined {
+	if (!Array.isArray(messages)) return undefined
+	const candidates: { list: Todo[]; at: number | null; order: number }[] = []
+	let order = 0
+	for (const message of messages) {
+	if (message === null || typeof message !== "object") continue
+	const content = (message as { content?: unknown }).content
+	if (!Array.isArray(content)) continue
+	for (const part of content) {
+	if (part === null || typeof part !== "object") continue
+	const p = part as { type?: unknown; name?: unknown; state?: Record<string, any>; time?: any }
+	if (p.type !== "tool" || p.name !== "todowrite") continue
+	if (p.state?.status !== "completed") continue
+	const list = normalizeTodoList(p.state.input)
+	if (!list) continue
+	const t = p.state?.time ?? p.time ?? (message as { time?: any }).time ?? {}
+	const at = [t?.end, t?.start, t?.created].find((v: unknown) => typeof v === "number")
+	candidates.push({ list, at: typeof at === "number" ? at : null, order: order++ })
+	}
+	}
+	if (candidates.length === 0) return undefined
+	candidates.sort((a, b) => {
+	if (a.at !== null && b.at !== null && a.at !== b.at) return b.at - a.at
+	if ((a.at === null) !== (b.at === null)) return a.at === null ? 1 : -1
+	return a.order - b.order
+	})
+	return candidates[0]?.list
 }
 
 /** Model ends with ":" announcing intent without executing. */
@@ -1674,46 +1787,108 @@ export default define({
 		}
 
 		/** Targeted recovery prompts (tool-as-text, done-claims, intent nudges). */
+
 		/**
 		 * Read the session's todo list.
 		 *
-		 * v1 tracked todos from a `todo.updated` event and a server API. v2 has
-		 * neither: the todo table exists in the v2 database but no route reaches
-		 * it and nothing emits an event for it. What v2 does have is the storage
-		 * domain, and the installed todo tool already writes the list there under
-		 * a stable, per-session key.
+		 * v1 tracked todos from a `todo.updated` event and a server API. v2 has neither:
+		 * nothing emits a todo event and no route reaches the todo table.
 		 *
-		 * So this reads the key rather than owning a list. That is the difference
-		 * between a second copy that can drift and the real one — and it means
-		 * auto-resume works with whichever todo tool is installed instead of
-		 * requiring its own.
+		 * What v2 DOES have is the session message log. Every `todowrite` call is
+		 * persisted as a tool part whose input carries the entire list, so the newest
+		 * completed call IS the current list. That is the real store, so it is read first
+		 * - reading anything else first is what made auto-resume conclude "no todos"
+		 * while the list was sitting in the log.
 		 *
-		 * Cached for a short TTL: this is read on every idle inspection, and the
-		 * list can only change while the model is working, which is not when we
-		 * ask. Returns `[]` on any failure — every caller treats "no list" as
-		 * "cannot conclude", never as "nothing is open".
+		 * `ctx.storage.get("todos/<sid>")` is kept LAST, as a fallback only. It is a
+		 * v1-shaped key that nothing in v2 writes, so it always misses; do not promote it
+		 * back to primary. In v2 the key is empty, not authoritative.
+		 *
+		 * Cached for a short TTL: this is read on every idle inspection, and the list can
+		 * only change while the model is working, which is not when we ask. Returns `[]` on
+		 * any failure - every caller treats "no list" as "cannot conclude", never as
+		 * "nothing is open".
 		 */
 		async function readTodos(sid: string): Promise<Todo[]> {
 			const w = ensureWatch(sid)
 			const now = Date.now()
 			if (w.todosFetchedAt && now - w.todosFetchedAt < TODO_CACHE_TTL_MS) return w.todos
+			const fromMessages = await todosFromMessageSources(sid)
+			if (fromMessages) {
+			w.todos = fromMessages
+			w.todosFetchedAt = now
+			return w.todos
+			}
 			if (!ctx.storage) return w.todos
 			try {
-				const raw = await ctx.storage.get(`todos/${sid}`)
-				const record = raw as { todos?: unknown; updatedAt?: unknown } | null | undefined
-				const list = Array.isArray(record?.todos) ? record.todos : []
-				w.todos = list.filter(
-					(t): t is Todo =>
-						!!t && typeof t === "object" && typeof (t as Todo).content === "string" &&
-						typeof (t as Todo).status === "string",
-				)
-				w.todosFetchedAt = now
-				return w.todos
+			const raw = await ctx.storage.get(`todos/${sid}`)
+			const record = raw as { todos?: unknown; updatedAt?: unknown } | null | undefined
+			const list = Array.isArray(record?.todos) ? record.todos : []
+			w.todos = list.filter(
+			(t): t is Todo =>
+			!!t && typeof t === "object" && typeof (t as Todo).content === "string" &&
+			typeof (t as Todo).status === "string",
+			)
+			w.todosFetchedAt = now
+			return w.todos
 			} catch (e) {
-				dbg(`${short(sid)} todo read failed:`, e instanceof Error ? e.message : String(e))
-				return w.todos
+			dbg(`${short(sid)} todo read failed:`, e instanceof Error ? e.message : String(e))
+			return w.todos
 			}
 		}
+		/**
+		 * Try every plausible source of a session's messages, in order, returning the
+		 * parsed todo list from the first that yields a `todowrite` tool part.
+		 *
+		 * Requires host access beyond the plugin ctx: `readFileSync` on
+		 * `/proc/self/cmdline`, and a loopback HTTP GET. Both are best-effort - a host
+		 * that refuses either degrades to the storage fallback rather than throwing.
+		 */
+		async function todosFromMessageSources(sid: string): Promise<Todo[] | undefined> {
+			// 1. The SDK client, if this plugin ctx was given one. Unwrap the `{data,cursor}`
+			// envelope: handing it straight to the parser trips its Array.isArray guard and
+			// silently resolves nothing.
+			try {
+			const message = (ctx.client as any)?.session?.message
+			if (typeof message?.list === "function") {
+			const res = await message.list.call(message, { path: { id: sid } })
+			const got = todosFromMessages(res?.data ?? res)
+			if (got) {
+			dbg(`${short(sid)} todos via ctx.client.session.message.list (${got.length})`)
+			return got
+			}
+			}
+			} catch (e) {
+			dbg(`${short(sid)} client message.list failed:`, e instanceof Error ? e.message : String(e))
+			}
+			// 2. The local HTTP server. Same shape the prompt-polisher already uses, so the
+			// auth and base-URL derivation are proven rather than guessed.
+			for (const base of serverBaseUrls()) {
+			try {
+			// `limit` matters: the default page is 50 messages and 200 is the server's
+			// ceiling (probed - 250 returns 400). Newest first, so a recent `todowrite` is
+			// always inside the page.
+			const res = await fetch(`${base}/api/session/${encodeURIComponent(sid)}/message?limit=200`, {
+			headers: serverHeaders(),
+			})
+			if (!res.ok) {
+			dbg(`${short(sid)} HTTP message read ${res.status} from ${base}`)
+			continue
+			}
+			// Same envelope trap as source 1: `{data, cursor}`, never a bare array.
+			const body = await res.json()
+			const got = todosFromMessages(body?.data ?? body)
+			if (got) {
+			dbg(`${short(sid)} todos via HTTP ${base} (${got.length})`)
+			return got
+			}
+			} catch (e) {
+			dbg(`${short(sid)} HTTP message read failed:`, e instanceof Error ? e.message : String(e))
+			}
+			}
+			return undefined
+		}
+
 
 		/**
 		 * Arm the deferred pattern pass, replacing any already pending.

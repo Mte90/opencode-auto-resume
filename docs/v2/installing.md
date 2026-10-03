@@ -14,6 +14,14 @@ plugin API (`@opencode/plugin` 2.0.5, shipped with `opencode` v2.0.5).
   than importing one, so the built file is self-contained. `@opencode/plugin` is
   not needed to *run* the plugin — only to typecheck the source against the
   official types (see [Development](#development)).
+- **Host access beyond the plugin context.** Reading the todo list needs the
+  local server's address, and that is not exposed as an environment variable under
+  OpenChamber. The plugin reads `/proc/self/cmdline` for the `--port` flag (Linux)
+  and may issue a loopback `GET` to `127.0.0.1`; where `/proc` is unavailable it
+  falls back to `OPENCODE_SERVER_URL` / `OPENCODE_SERVER_PORT` /
+  `OPENCODE_PORT` / `PORT`. If `OPENCODE_SERVER_PASSWORD` (or `OPENCODE_PASSWORD`)
+  is set, it is sent as HTTP Basic on that request. All of it is best-effort: a
+  host that refuses any of it degrades to "cannot read todos", never a crash.
 - The plugin source: [`src/v2/index.ts`](../../src/v2/index.ts) from this repo, or
   the built `dist/v2/index.js`.
 

@@ -328,9 +328,19 @@ The diagram below is v1's: it is drawn against the v1 SSE event stream, the v1
 `todo.updated` event and the v1 `session.todo()` API. The v2 build reads the same
 information through different doors — `session.usage.updated` for tokens,
 `ctx.model.get()` for the window, `ctx.plugin.list()` to detect magic-context,
-`ctx.session.context()` for message history, and `ctx.storage` for the todo list
-(the v2 `todo` table has no route and emits no event). See
-[docs/known-issues-v2.md](docs/known-issues-v2.md) for each substitution.
+and `ctx.session.context()` for message history.
+
+The todo list is the substitution with teeth. The v2 `todo` table has no route and
+emits no event, and the v1-shaped `ctx.storage` key `todos/<sessionID>` is never
+written in v2 — so a reader that trusts storage concludes "no todos" and fires
+false done-claim nudges at a session with work still listed. The real store is the
+**session message log**: every `todowrite` call is persisted as a tool part whose
+input carries the entire list, so the newest *completed* call is the current list.
+It is read through `ctx.client.session.message.list` when the host offers it, and
+otherwise over loopback HTTP (`GET /api/session/{id}/message`, page capped at 200
+— the endpoint answers `{ data, cursor }`, never a bare array, and orders results
+newest first). `ctx.storage` survives only as a last-resort fallback: in v2 that
+key is empty, not authoritative.
 
 ```
 Any SSE Event
