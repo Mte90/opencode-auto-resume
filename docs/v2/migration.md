@@ -127,16 +127,29 @@ Two shape details the port relies on:
   description, resume })` so the intervention is visible in the TUI, falling
   back to `session.prompt({ sessionID, text })`.
 - **The todo list is read from the session message log, not from storage.** v2
-  emits no `todo.updated` event and exposes no todo route, and the v1-shaped
-  `ctx.storage` key `todos/<sessionID>` is never written — so a storage-first
-  reader concludes "no todos" and fires false done-claim nudges. Every `todowrite`
-  call is persisted as a tool part whose input carries the whole list, so the
-  newest **completed** call is the current list. It is read via
+  emits no `todo.updated` event and exposes no todo route — and, decisively,
+  **`ctx.storage` is namespaced per plugin**, so it cannot read another plugin's
+  todo list at all. `ctx.storage.get("todos/<id>")` resolves to
+  `storage/plugin/auto-resume.v2/todos/<id>.json`; a todo plugin writing that key
+  lands under its own plugin id. Verified live: the route is
+  `/api/plugin/storage/<PLUGIN-ID>/<key>` and the on-disk tree is
+  `storage/plugin/<PLUGIN-ID>/<key>.json`. A storage-first reader therefore
+  concludes "no todos" regardless of who writes, and fires false done-claim
+  nudges.
+
+  Every `todowrite` call is persisted as a tool part whose input carries the whole
+  list, so the newest **completed** call is the current list. It is read via
   `ctx.client.session.message.list`, falling back to a loopback
   `GET /api/session/{id}/message?limit=200` (that endpoint answers
   `{ data, cursor }`, never a bare array; 200 is its ceiling; results are ordered
-  newest first, so a last-match-wins parser would select the OLDEST list).
-  `ctx.storage` is now only a last-resort fallback.
+  newest first, so a last-match-wins parser would select the OLDEST list). One
+  measured detail worth keeping: the tool parts carry no `state.time`, so ranking
+  must fall back to the enclosing message's `time.created` — under newest-first
+  ordering that fallback is load-bearing, not cosmetic.
+
+  `ctx.storage` remains only as a last-resort fallback. Do not "fix" the namespace
+  mismatch by having auto-resume write the key: a reader cannot surface another
+  plugin's data, and a second writer would race the first.
 - **New host access beyond the plugin context.** `readFileSync` on
   `/proc/self/cmdline` to discover the local server's `--port`, plus a loopback
   HTTP GET. Env vars alone are not enough: under OpenChamber the server is spawned

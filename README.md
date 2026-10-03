@@ -331,16 +331,23 @@ information through different doors — `session.usage.updated` for tokens,
 and `ctx.session.context()` for message history.
 
 The todo list is the substitution with teeth. The v2 `todo` table has no route and
-emits no event, and the v1-shaped `ctx.storage` key `todos/<sessionID>` is never
-written in v2 — so a reader that trusts storage concludes "no todos" and fires
-false done-claim nudges at a session with work still listed. The real store is the
-**session message log**: every `todowrite` call is persisted as a tool part whose
-input carries the entire list, so the newest *completed* call is the current list.
-It is read through `ctx.client.session.message.list` when the host offers it, and
-otherwise over loopback HTTP (`GET /api/session/{id}/message`, page capped at 200
-— the endpoint answers `{ data, cursor }`, never a bare array, and orders results
-newest first). `ctx.storage` survives only as a last-resort fallback: in v2 that
-key is empty, not authoritative.
+emits no event, and **`ctx.storage` cannot be used to read another plugin's todo
+list** — it is namespaced per plugin. `ctx.storage.get("todos/" + id)` from this
+plugin resolves to `storage/plugin/auto-resume.v2/todos/<id>.json`; a todo plugin
+writing that same key lands in its own directory. Verified against a live server:
+the route is `/api/plugin/storage/<PLUGIN-ID>/<key>` and the on-disk tree is
+`storage/plugin/<PLUGIN-ID>/<key>.json`. So a storage-first reader concludes "no
+todos" no matter who is writing, and fires false done-claim nudges at a session
+with work still listed.
+
+The store both plugins can agree on is the **session message log**: every
+`todowrite` call is persisted as a tool part whose input carries the entire list,
+so the newest *completed* call is the current list. It is read through
+`ctx.client.session.message.list` when the host offers it, and otherwise over
+loopback HTTP (`GET /api/session/{id}/message`, page capped at 200 — the endpoint
+answers `{ data, cursor }`, never a bare array, and orders results newest first).
+`ctx.storage` survives only as a last-resort fallback, for a host that writes the
+list itself.
 
 ```
 Any SSE Event

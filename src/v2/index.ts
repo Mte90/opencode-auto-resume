@@ -1800,9 +1800,19 @@ export default define({
 		 * - reading anything else first is what made auto-resume conclude "no todos"
 		 * while the list was sitting in the log.
 		 *
-		 * `ctx.storage.get("todos/<sid>")` is kept LAST, as a fallback only. It is a
-		 * v1-shaped key that nothing in v2 writes, so it always misses; do not promote it
-		 * back to primary. In v2 the key is empty, not authoritative.
+		 * `ctx.storage.get("todos/<sid>")` is kept LAST, and it is NOT a source of
+		 * another plugin's todos. `ctx.storage` is namespaced per plugin: the key
+		 * resolves to `storage/plugin/auto-resume.v2/todos/<sid>.json`, while a todo
+		 * plugin writing the same key lands in its OWN directory
+		 * (`storage/plugin/<its-id>/todos/<sid>.json`). Verified against the live
+		 * server: `/api/plugin/storage/<PLUGIN-ID>/<key>` carries the plugin id as a
+		 * path segment, and the on-disk tree is `storage/plugin/<PLUGIN-ID>/<key>.json`.
+		 * So no key auto-resume does not write itself can ever hold a todo list here.
+		 *
+		 * Do not promote it back to primary, and do not "fix" the mismatch by writing
+		 * the key: a reader cannot make another plugin's data appear in its namespace,
+		 * and duplicating that data would create a second writer racing the first. The
+		 * message log above is the only store both plugins can agree on.
 		 *
 		 * Cached for a short TTL: this is read on every idle inspection, and the list can
 		 * only change while the model is working, which is not when we ask. Returns `[]` on
