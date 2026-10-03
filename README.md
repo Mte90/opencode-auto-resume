@@ -2,6 +2,12 @@
 
 **Plugin for [OpenCode](https://github.com/anomalyco/opencode) that automatically detects and recovers from LLM session failures — stalls, broken tool calls, hallucination loops, stuck subagent parents, and more. Fully silent, zero UI pollution.**
 
+> **OpenCode v2 is here (stable).** This repo ships both the v1 plugin
+> (`src/index.ts`) and a complete v2 port (`src/v2/index.ts`) targeting the
+> stable `@opencode/plugin` 2.0.5 API. Install it with the
+> [v2 install guide](docs/v2/installing.md); see
+> [docs/v2/migration.md](docs/v2/migration.md) for the full migration notes.
+
 ## What it does
 
 LLM sessions fail in predictable ways. This plugin monitors all sessions and automatically recovers without user intervention. Each recovery path below references the upstream OpenCode issues that motivated it — these are problems not yet resolved in the official project.
@@ -52,13 +58,15 @@ Loop detection runs in two places. At idle, tool names are scanned from recent a
 
 When the model calls a tool that does not exist (a typo, a hallucinated name, or a tool from a different plugin that isn't loaded), OpenCode returns a `tool` part with `state.status = "error"`. If the same wrong tool name appears **2 times** in the session's message history, the plugin:
 
-1. Fetches the list of available tools via `ctx.client.tool.ids()` (cached for 5 minutes).
+1. Fetches the list of available tools — via `ctx.client.tool.ids()` on v1, or `ctx.tool.list()` on v2, cached for 5 minutes. On v2 the names are the registry's *effective* names, so a namespaced tool is quoted back in the form a model would have to call it.
 2. Computes the closest match by Levenshtein distance (case-insensitive, threshold = half the wrong name's length).
 3. Sends a continue prompt that names the wrong tool, states it does not exist, suggests the closest match (if one was found), and lists the first 20 available tools for reference.
 
 The suggestion fires once per busy cycle. A new user message resets the counter so the suggestion can fire again on a fresh cycle. Tool parts that already succeeded (`state.status = "completed"`) and parts for tools that do exist are skipped.
 
 Threshold and cache are compile-time constants (`UNKNOWN_TOOL_THRESHOLD = 2`, `TOOL_IDS_CACHE_MS = 5 min`). The detection runs at idle, alongside the tool-text recovery check.
+
+On v2 the tool list comes from the registry, so the check degrades rather than guesses: no registry, an empty registry, or a registry that throws all mean no suggestion, because with nothing to compare against every name would look invented.
 
 _Motivated by:_
 - [#22142](https://github.com/anomalyco/opencode/issues/22142) — Repetitive tool-call loops with alibaba-coding-plan-cn/qwen3.6-plus
@@ -71,7 +79,7 @@ _Motivated by:_
 
 ### Orphan parent
 
-A subagent finishes but the parent session stays stuck as "busy" forever. The plugin detects when `busyCount` drops from >1 to 1, waits `subagentWaitMs` + `gracePeriodMs` (18s default), probes the subagent (recovering a crashed child first if possible), then aborts and resumes the parent.
+A subagent finishes but the parent session stays stuck as "busy" forever. The plugin detects when `busyCount` drops from >1 to 1, confirms the survivor really has subagents, waits `subagentWaitMs` + `gracePeriodMs` (18s default), probes the subagent (nudging a crashed child once, then waiting a further `subagentWaitMs` before giving up on it), and aborts and resumes the parent if it is still stuck. The parent is never interrupted while it has a tool in flight or is waiting on the user.
 
 _Motivated by:_
 - [#35066](https://github.com/anomalyco/opencode/issues/35066) — notify parent when subagent sessions finish
@@ -213,17 +221,23 @@ _Motivated by:_
 
 ### Explicit completion via `task_complete`
 
-The agent can call the built-in `task_complete` tool to signal that all work is done. When invoked, the plugin stops sending any further `"continue"` prompts, clears all pending timers, and marks the session as complete. This replaces fragile text-based heuristics (emoji patterns, language detection) with a deterministic signal.
+The agent can call the `task_complete` tool to signal that all work is done. When invoked, the plugin stops sending any further `"continue"` prompts, clears all pending timers, and marks the session as complete. This replaces fragile text-based heuristics (emoji patterns, language detection) with a deterministic signal.
+
+On v2 there is no built-in equivalent, so the plugin registers the tool itself through the v2 tool registry (`ctx.tool.transform`). It is registered before the first turn, and a registry that refuses the registration is logged and skipped rather than taking the watchdog down with it.
 
 If `task_complete` is called while open todos remain, the call is rejected (up to `maxRetries` times) with a message asking the agent to finish the remaining work first.
 
-Repeat calls with no new user message in between are guarded: the first acknowledgement carries an explicit stop instruction, the second returns a repeat warning, and the third and subsequent calls are rejected as errors. This breaks the ack self-loop where the acknowledgement tool-result is fed back into the turn and a stuck model re-emits `task_complete` instead of ending with text. The counter resets on a genuine user message, on the block path above, or when any other tool runs in between.
+Repeat calls with no new user message in between are guarded: the first acknowledgement carries an explicit stop instruction, the second returns a repeat warning, and the third and subsequent calls are rejected as errors. This breaks the ack self-loop where the acknowledgement tool-result is fed back into the turn and a stuck model re-emits `task_complete` instead of ending with text — v1 logged 27 consecutive acked calls with zero new user input. The counter resets on a genuine user message, on the block path above, or when any other tool runs in between.
+
+The todo gate is skipped for subagents: a child was never asked to do the parent's open items, so gating its report on them would block it on work outside its scope.
 
 ---
 
 ### 🎉 emoji completion
 
 An assistant message ending with 🎉 resets the tool-text timer and prevents a trigger — the emoji signals the agent considers the task complete.
+
+The emoji alone is not trusted: a model that finishes early celebrates early, and latching on that turns a false positive into silence. Both builds cross-check the session's todo list first, and with items still open the 🎉 is treated as a false positive — the reminder names what is unfinished instead. See [The todo list](docs/known-issues-v2.md#the-todo-list) for how v2 reads that list.
 
 ---
 
@@ -310,6 +324,36 @@ Paths: orphan parent, subagent stuck (parent side), hallucination loop, streamin
 
 ## Architecture
 
+The diagram below is v1's: it is drawn against the v1 SSE event stream, the v1
+`todo.updated` event and the v1 `session.todo()` API. The v2 build reads the same
+information through different doors — `session.usage.updated` for tokens,
+`ctx.model.get()` for the window, `ctx.plugin.list()` to detect magic-context,
+and `ctx.session.context()` for message history.
+
+The todo list is the substitution with teeth. The v2 `todo` table has no route and
+emits no event, and **`ctx.storage` cannot be used to read another plugin's todo
+list** — it is namespaced per plugin. `ctx.storage.get("todos/" + id)` from this
+plugin resolves to `storage/plugin/auto-resume.v2/todos/<id>.json`; a todo plugin
+writing that same key lands in its own directory. Verified against a live server:
+the route is `/api/plugin/storage/<PLUGIN-ID>/<key>` and the on-disk tree is
+`storage/plugin/<PLUGIN-ID>/<key>.json`. So a storage-first reader concludes "no
+todos" no matter who is writing, and fires false done-claim nudges at a session
+with work still listed.
+
+The store both plugins can agree on is the **session message log**: every
+`todowrite` call is persisted as a tool part whose input carries the entire list,
+so the newest *completed* call is the current list. It is read through
+`ctx.client.session.message.list` when the host offers it, and otherwise over
+loopback HTTP (`GET /api/session/{id}/message`, page capped at 200 — the endpoint
+answers `{ data, cursor }`, never a bare array, and orders results newest first).
+`ctx.storage` survives only as a last-resort fallback, for a host that writes the
+list itself.
+
+Confirmed working setup: `opencode-todo-fork` — verified live (list resolved
+from the log, `/todo` round-trip green). Other todo plugins are unconfirmed:
+anything that persists `todowrite` calls to the message log should read, but
+only the fork has been tested.
+
 ```
 Any SSE Event
   ├─ has sessionID? → touchSession(sid) — reset only that session's timer
@@ -388,7 +432,60 @@ With options:
 }
 ```
 
+### OpenCode v2 (stable)
+
+The v2 plugin uses the `{ id, setup }` plugin shape with `ctx.event.subscribe()` (AsyncIterable) instead of the v1 hooks-object pattern, and is written against the stable v2 API (opencode 2.0.5+). It has **no runtime dependencies** — it defines the plugin helper locally and imports only `node:fs`, `node:os` and `node:path` — so there is nothing to `bun add`. Add it to your `opencode.json`:
+
+```jsonc
+{
+  "plugins": [
+    {
+      "package": "./plugins/auto-resume-v2.ts",
+      "options": {
+        "chunkTimeoutMs": 180000,
+        "maxRetries": 3
+      }
+    }
+  ]
+}
+```
+
+Or place `src/v2/index.ts` directly in `~/.config/opencode/plugins/` for auto-discovery (no config entry needed).
+
+Disable via `"-auto-resume.v2"` in `plugins`.
+
+- **Step-by-step install guide:** [docs/v2/installing.md](docs/v2/installing.md)
+- **Migration notes (v1 → v2, stable validation):** [docs/v2/migration.md](docs/v2/migration.md)
+- **What the v2 port does and does not yet do:** [docs/known-issues-v2.md](docs/known-issues-v2.md)
+
+### How a finished turn is judged
+
+`session.idle` does not decide anything by itself. The turn is inspected in two
+passes, because `session.idle` can arrive while the assistant's closing text is
+still being written into the message history:
+
+1. **Straight away** — is this a dead stream, is it handing control back to the
+   user, is the user already busy. None of these read the final text.
+2. **After `toolTextCheckDelayMs`** (3s default) — the celebration,
+   tool-call-as-text, ready-to-continue, action-intent and done-claim detectors,
+   re-reading the history. This is the pass the option exists for, and it re-runs
+   the guards from step 1, because three seconds is long enough for the user to
+   have replied and a nudge sent over them interrupts their own step.
+
+A new turn cancels a pending second pass, and a second idle replaces it rather
+than stacking another judgement on the same text. See
+[docs/known-issues-v2.md](docs/known-issues-v2.md).
+
+The v2 build reads and applies every option in the table below — the last of
+the gaps closed with `toolTextCheckDelayMs`. Any option it accepts but does not
+apply is listed in the startup line as `accepted-but-inert=…` and explained in
+[docs/known-issues-v2.md](docs/known-issues-v2.md); that list is currently empty.
+An option name this build does not know at all produces a single warning at
+startup, so a typo or a dropped port is never silent.
+
 ### Configurable options
+
+Defaults are the same on v1 and v2 unless a row says otherwise.
 
 | Option | Default | Description |
 |---|---|---|
@@ -404,7 +501,7 @@ With options:
 | `streamingFailureErrorNames` | `["ProviderError","APIError","StreamError","ConnectionError","TimeoutError"]` | Error names that classify as streaming failures (exact match) |
 | `streamingFailureMessagePatterns` | `["streaming response failed","stream.*fail","connection.*reset","connection.*closed"]` | Regex patterns (case-insensitive) in error messages indicating streaming failure |
 | `maxRecoveryRetries` | `2` | Max streaming-failure recovery attempts before abort+resume escalation |
-| `toolTextCheckDelayMs` | `3000` | Delay before scanning an idle session for tool-as-text; also the recovery watchdog delay |
+| `toolTextCheckDelayMs` | `3000` | Settle delay before a finished turn's closing text is judged against the done/tool patterns; also the recovery watchdog delay. On v2 only the pattern half is deferred — dead streams are still caught on the idle event, because a stream that died before delivering any text has nothing for those patterns to read. Set `0` to judge on the idle event |
 | `minActivityGapMs` | `1000` | Skip recovery if the session was active within this gap |
 | `warmupMs` | `15000` | Action-intent detection disabled while a session is younger than this |
 | `discoveryDelayMs` | `5000` | Delay before the initial session discovery run after plugin attach |
@@ -414,15 +511,17 @@ With options:
 | `actionIntentPrompt` | same as `continuePrompt` | Prompt sent on action-intent detection |
 | `toolTextRecoveryPrompt` | `TOOL_TEXT_RECOVERY_PROMPT` | Override the tool-call-as-text recovery prompt |
 | `thinkingToolRecoveryPrompt` | `THINKING_TOOL_RECOVERY_PROMPT` | Override the thinking-tool recovery prompt |
-| `doneWithoutWorkPrompt` | `DONE_WITHOUT_WORK_PROMPT` | Override the done-claim-with-open-todos prompt |
+| `doneWithoutWorkPrompt` | `DONE_WITHOUT_WORK_PROMPT` | Override the done-claim-with-open-todos prompt. Needs a todo tool writing `todos/<sessionID>` into storage; without one it never fires |
 | `doneWithoutDetailsPrompt` | `DONE_WITHOUT_DETAILS_PROMPT` | Override the done-claim-with-no-todos report prompt |
 | `doneClaimPatterns` | `DONE_CLAIM_PATTERNS` | Array of regex strings overriding the default done-claim detection patterns (case-insensitive, multiline). Invalid regexes are skipped. Empty array falls back to defaults. |
 | `readyToContinuePatterns` | `READY_TO_CONTINUE_PATTERNS` | Array of regex strings overriding the default ready-to-continue detection patterns (case-insensitive). Invalid regexes are skipped. Empty array falls back to defaults. |
 | `silentDeadStreamMinTokens` | `200` | Min output tokens to treat a textless `finish:"unknown"` message as a dead stream |
 | `busyStallStrategy` | `"continue"` | Busy-stall response: `"continue"`, `"abort"` (abort-first), or `"off"` (disabled) |
-| `contextSaturationThreshold` | `0.85` | Ratio of used/usable context that routes a saturated parent to magic-context `ctx-wrapup` (only when magic-context is installed) |
-| `activeUserWindowMs` | `300000` | Inbound-user-message recency window (5 min) during which idle nudges stand down (user likely composing) |
+| `contextSaturationThreshold` | `0.85` | Ratio of used/usable context that routes a saturated session to reclamation: a parent to magic-context `ctx-wrapup` (only when magic-context is installed), a subagent to native compaction (only when `subagentNativeCompactionEnabled`) |
+| `activeUserWindowMs` | `300000` | Inbound-user-message recency window during which idle nudges stand down (user likely composing) |
 | `subagentNativeCompactionEnabled` | `false` | Opt-in native `session.summarize()` for saturated subagent sessions (no magic-context detection required) |
+| `injectIntervalMs` | v2 only | Minimum gap between recovery injections for one session. No v1 equivalent |
+| `logFile` | v2 only | Where this build appends its log. v2 removed v1's server log endpoint, so without this the plugin is silent. Defaults to `~/.local/state/opencode-v2/auto-resume.log` |
 
 Message patterns are matched case-insensitively. Error names use exact match.
 
@@ -433,7 +532,7 @@ Message patterns are matched case-insensitively. Error names use exact match.
 | `ABORT_CONTINUE_DELAY_MS` | `2000` | Delay between abort and continue |
 | `MAX_IDLE_SESSIONS` | `50` | Idle session map cap before cleanup |
 | `IDLE_CLEANUP_MS` | `600000` | Idle session age before cleanup (10 min) |
-| `SESSION_DISCOVERY_INTERVAL_MS` | `60000` | `session.list()` poll interval (60s) |
+| `SESSION_DISCOVERY_INTERVAL_MS` | `60000` | Session discovery sweep interval (60s). Same on both builds; v2 reads the busy set from `session.active()` rather than a `status` field per row |
 
 ## Verification
 
