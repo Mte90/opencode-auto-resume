@@ -2104,6 +2104,13 @@ export default define({
 						dbg(`${short(sid)} still busy and live at inject time (${Math.round((Date.now() - w.lastActivityAt) / 1000)}s since last event) — not interrupting`)
 						return
 					}
+					// Re-check the parent-wait guard: a child may have gone live
+					// between detection and this delayed inject. Interrupting a
+					// parent that is waiting on a subagent kills real work.
+					if (await parentWaitingOnSubagents(sid, new Set(await getActiveSessions()))) {
+						dbg(`${short(sid)} waiting on subagents at inject time — not interrupting`)
+						return
+					}
 					const ok = await injectOnce(sid, opts.continuePrompt ?? CONTINUE_PROMPT, "stalled — retrying")
 					w.pendingRecoveryArmed = false
 					if (ok) {
@@ -3238,6 +3245,29 @@ export default define({
 			tryAbortAndResume(sid, w)
 		}
 
+		/**
+		 * Parent-wait guard for the busy-stall path. A parent blocked on a live
+		 * subagent is quiet on its own sessionID by construction — the child's
+		 * events belong to the child — so "no activity for Ns" must not by itself
+		 * trigger recovery. Deliberately independent of the `lastWasTaskTool`
+		 * heuristic below: native dispatches may never emit `session.tool.called`,
+		 * and the server active set may lag the parentID link.
+		 *
+		 * Waits when the verdict confirms a live child, or when the parent still
+		 * holds tools in flight against children that are neither confirmed live
+		 * nor proven dead. A crashed verdict, or tools held with no children on
+		 * the link at all (wedged bare tool), falls through to normal recovery.
+		 */
+		async function parentWaitingOnSubagents(sid: string, activeIDs: Set<string>): Promise<boolean> {
+			const verdict = await subagentVerdict(sid, activeIDs)
+			if (verdict.status === "busy") return true
+			if (verdict.status !== "idle") return false
+			const w = ensureWatch(sid)
+			if (w.pendingTools <= 0) return false
+			const children = await listSubagentIds(sid)
+			return children.length > 0
+		}
+
 		async function checkActiveSessions() {
 			const now = Date.now()
 
@@ -3314,6 +3344,14 @@ export default define({
 						dbg(`${short(sid)} silent after task tool with ${others.length} active child(ren) — waiting`)
 						continue
 					}
+				}
+				// A parent waiting on a live subagent is working, not stalled. The
+				// heuristic above misses native dispatches (no tool.called event)
+				// and active-set lag; the parentID link does not (see
+				// parentWaitingOnSubagents, ses_ef73a206 2026-10-04).
+				if (await parentWaitingOnSubagents(sid, activeSet)) {
+					dbg(`${short(sid)} waiting on subagents — skipping stall detection`)
+					continue
 				}
 				// busyStallStrategy picks how a stall is answered. "abort" interrupts
 				// the wedged step before continuing, because a stream that went
