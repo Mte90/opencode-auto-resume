@@ -2209,6 +2209,12 @@ export default define({
 						dbg(`${short(sid)} waiting on subagents at inject time — not interrupting`)
 						return
 					}
+					// Same re-check for user input: a question asked between
+					// detection and this delayed inject parks the turn.
+					if (isWaitingOnUser(await loadMessages(sid))) {
+						dbg(`${short(sid)} waiting on user input at inject time — not interrupting`)
+						return
+					}
 					const stallText = await buildStallContinueText(sid, reason, attempt)
 					const ok = await injectOnce(sid, stallText, "stalled — retrying", false, true)
 					w.pendingRecoveryArmed = false
@@ -2613,6 +2619,32 @@ export default define({
 				// actually answered. "error" here means the question was interrupted,
 				// not that it was answered, so keep standing down.
 				if (status !== TOOL_STATE_COMPLETED && AWAITING_USER_TOOLS.has(part?.name ?? "")) return true
+			}
+			return false
+		}
+
+		/**
+		 * Narrow user-wait check for the busy-stall path. Unlike
+		 * `hasPendingUserInput` (any unfinished tool means the idle turn
+		 * isn't over), a busy session with a wedged bare tool and zero events
+		 * IS a stall — so only tools whose completion is the user answering
+		 * (`question`, `permission`, `ask`, `confirm`) count. A turn parked
+		 * on one of those is waiting, not stalled (ses_ef72c5f3 2026-10-05: a
+		 * stall continue fired into a session parked on a `question`).
+		 */
+		function isWaitingOnUser(messages: unknown[]): boolean {
+			const newest = messages[messages.length - 1] as {
+				type?: string
+				content?: { type?: string; name?: string; state?: { status?: string } }[]
+			}
+			if (newest?.type !== "assistant") return false
+			for (const part of newest.content ?? []) {
+				const t = part?.type ?? ""
+				if (!(t === "tool_use" || t === "tool" || t === "tool_call" || t.startsWith("tool"))) continue
+				if (!AWAITING_USER_TOOLS.has(part?.name ?? "")) continue
+				// As in `hasPendingUserInput`: "error" means interrupted, not
+				// answered — only a completed user-awaiting tool ends the wait.
+				if (part?.state?.status !== TOOL_STATE_COMPLETED) return true
 			}
 			return false
 		}
@@ -3450,6 +3482,14 @@ export default define({
 				// parentWaitingOnSubagents, ses_ef73a206 2026-10-04).
 				if (await parentWaitingOnSubagents(sid, activeSet)) {
 					dbg(`${short(sid)} waiting on subagents — skipping stall detection`)
+					continue
+				}
+				// A turn parked on user input (a `question` awaiting an answer,
+				// an unanswered permission beyond the event flow) is waiting,
+				// not stalled. Narrower than the idle-path check on purpose: a
+				// wedged bare tool with zero events is still a stall.
+				if (isWaitingOnUser(await loadMessages(sid))) {
+					dbg(`${short(sid)} waiting on user input — skipping stall detection`)
 					continue
 				}
 				// busyStallStrategy picks how a stall is answered. "abort" interrupts
