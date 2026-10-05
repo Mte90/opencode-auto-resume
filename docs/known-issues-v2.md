@@ -433,6 +433,12 @@ failure fires, and the stall watchdog — which only looks at *busy* sessions �
 never sees it. v1's rule is unchanged on v2: walk back to the newest assistant
 message that **has** a finish reason; if it carried no text and generated at least
 `silentDeadStreamMinTokens` output tokens, the stream died mid-response.
+Two 2026-10-04 amendments narrow "no text": a finished message carrying
+**tool-call parts** is a working turn, not a dead stream (thinking models end
+tool-working turns with no chatter), and recovery is refused while tool calls
+are still in flight — read from a snapshot taken at the idle transition,
+because `markIdle` zeroes the live `pendingTools` counter and idle fires
+while tools run.
 
 The walk skips messages with no finish reason on purpose. An intermediate
 tool-call step has none, and stopping at it would report a dead stream for every
