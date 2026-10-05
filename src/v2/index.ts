@@ -153,6 +153,9 @@ interface SessionWatch {
 	interruptWindowStart: number
 	/** Timestamp of the last recovery injection, for `injectIntervalMs` debouncing. */
 	lastInjectAt: number
+	/** Last injected prod text + assistant snapshot at prod time, for duplicate suppression. */
+	lastProdText: string
+	prodAssistantSnapshot: string
 	recovering: boolean
 	/** Latched when a failure carries an OOC error that `continue` can never clear; recovery (continue + abort+resume) is refused until a genuine user/agent turn. */
 	oocLocked: boolean
@@ -1293,6 +1296,8 @@ export default define({
 					interruptsThisWindow: 0,
 					interruptWindowStart: 0,
 					lastInjectAt: 0,
+					lastProdText: "",
+					prodAssistantSnapshot: "",
 					recovering: false,
 					oocLocked: false,
 					oocLockReason: null,
@@ -1532,6 +1537,75 @@ export default define({
 		 *    nothing to restart it, which is the failure this whole fix targets.
 		 * It stays rate-limited by `w.aborting` and `MAX_INTERRUPTS_PER_WINDOW`.
 		 */
+		/**
+		 * Cross-instance duplicate check: is our exact text already the latest
+		 * user message in the session log, posted within RECENT_PROD_WINDOW_MS?
+		 * Stacked watchdogs (reload churn) each hold private counters, so the
+		 * in-memory soft skip cannot see a sibling's prod — the log can.
+		 * Fail-open: any fetch problem means "no info", never "duplicate".
+		 */
+		const RECENT_PROD_WINDOW_MS = 60_000
+		async function recentOwnProdInLog(sid: string, text: string): Promise<boolean> {
+			const pages: unknown[] = []
+			try {
+				const message = (ctx.client as any)?.session?.message
+				if (typeof message?.list === "function") {
+					const res = await message.list.call(message, { path: { id: sid } })
+					const data = (res as { data?: unknown } | undefined)?.data ?? res
+					if (Array.isArray(data)) pages.push(...data)
+				}
+			} catch {
+				// Fall through to HTTP below.
+			}
+			if (pages.length === 0) {
+				for (const base of serverBaseUrls()) {
+					try {
+						const res = await fetch(
+							`${base}/api/session/${encodeURIComponent(sid)}/message?limit=20`,
+							{ headers: serverHeaders() },
+						)
+						if (!res.ok) continue
+						const body = ((await res.json()) as { data?: unknown } | undefined)?.data
+						if (Array.isArray(body)) {
+							pages.push(...body)
+							break
+						}
+					} catch {
+						// Next candidate base.
+					}
+				}
+			}
+			if (pages.length === 0) return false
+			const now = Date.now()
+			for (const m of pages) {
+				if (m === null || typeof m !== "object") continue
+				const msg = m as { role?: unknown; text?: unknown; content?: unknown; time?: unknown }
+				if (msg.role !== "user") continue
+				let t = ""
+				if (typeof msg.text === "string") {
+					t = msg.text
+				} else if (Array.isArray(msg.content)) {
+					t = (msg.content as unknown[])
+						.filter(
+							(p): p is { type: string; text: string } =>
+								!!p &&
+								typeof p === "object" &&
+								(p as { type?: unknown }).type === "text" &&
+								typeof (p as { text?: unknown }).text === "string",
+						)
+						.map((p) => p.text)
+						.join("")
+				}
+				// Newest-first: the first user message decides. Anything newer
+				// than our prod (user typed after it) is progress, not a dupe.
+				if (t !== text) return false
+				const created = (msg.time as { created?: unknown } | undefined)?.created
+				if (typeof created === "number" && now - created > RECENT_PROD_WINDOW_MS) return false
+				return true
+			}
+			return false
+		}
+
 		async function injectOnce(
 			sid: string,
 			text: string,
@@ -1559,7 +1633,20 @@ export default define({
 				return false
 			}
 			w.lastInjectAt = Date.now()
-			return notifyAndPrompt(sid, text, notification)
+			// Cross-instance backstop for the in-memory skip above: stacked
+			// watchdogs cannot see each other's counters, but they share the
+			// log. Applies to every caller except the abort+resume escalation,
+			// which must go through by construction.
+			if (!allowDuringSelfAbort && (await recentOwnProdInLog(sid, text))) {
+				dbg(`${short(sid)} duplicate continue suppressed — identical prod already in session log`)
+				return false
+			}
+			const sent = await notifyAndPrompt(sid, text, notification)
+			if (sent) {
+				w.lastProdText = text
+				w.prodAssistantSnapshot = w.lastAssistantText
+			}
+			return sent
 		}
 
 		function cleanupIdleSessions() {
