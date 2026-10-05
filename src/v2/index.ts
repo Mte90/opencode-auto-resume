@@ -548,6 +548,12 @@ const INTERRUPT_WINDOW_MS = 10 * 60_000
  * injection per interval.
  */
 const DEFAULT_INJECT_INTERVAL_MS = 15_000
+/** A user message landing within this of our last inject is treated as our
+ * own prompt for budget re-arm purposes (see noteInboundUserMessage). Same
+ * box, same clock; our prompt lands in about a second. A genuine user message
+ * coincidentally inside the window costs one request's worth of stale
+ * budgets — no loop — versus the recount loop this prevents. */
+const OWN_PROMPT_TIME_MS = 30_000
 
 const MAX_IDLE_SESSIONS = 50
 const IDLE_CLEANUP_MS = 10 * 60_000
@@ -2590,8 +2596,18 @@ export default define({
 			// them clears the budgets just spent and the same errors refire on
 			// the next idle (ses_ef81e8561ffeXyx3jAzKl5lltv, 2026-10-04 — four
 			// identical unknown-tool prompts, each "2x"). Tracking above stays
-			// truthful; only the clearing is skipped.
-			if (typeof latest.text === "string" && latest.text.length > 0 && w.ownPromptTexts.includes(latest.text)) {
+			// truthful; only the clearing is skipped. Two signals: exact text
+			// match, and recency to our last inject — the live projection can
+			// carry user messages with no readable body (content null), which
+			// defeats text matching, but our prompt always lands within seconds
+			// of the inject on the same box clock.
+			const ownByText = typeof latest.text === "string" && latest.text.length > 0 && w.ownPromptTexts.includes(latest.text)
+			const ownByTime =
+				typeof latest.at === "number" &&
+				w.lastInjectAt > 0 &&
+				latest.at >= w.lastInjectAt &&
+				latest.at - w.lastInjectAt < OWN_PROMPT_TIME_MS
+			if (ownByText || ownByTime) {
 				dbg(`${short(sid)} newest user message is our own prompt — not re-arming budgets`)
 				return
 			}

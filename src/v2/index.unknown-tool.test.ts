@@ -290,6 +290,24 @@ describe("v2: naming a replacement for a tool that does not exist", () => {
 		await teardown(h)
 	})
 
+	test("own prompt with an unreadable body still does not re-arm", async () => {
+		// The live projection can carry user messages with no readable text
+		// (observed: content null), which defeats text matching. Recency to
+		// our own inject is the backstop: our prompt always lands within
+		// seconds of it.
+		const tools = [{ id: "read" }, { id: "shell" }, { id: "glob" }]
+		const h = await setup({
+			history: [userMessage("go", OLD), assistantWith(toolPart("call_1", "bash")), assistantWith(toolPart("call_2", "bash"))],
+			tools,
+		})
+		await goIdle(h)
+		expect(suggestions(h)).toHaveLength(1)
+		h.history.push({ type: "user", id: "msg_own_bare", time: { created: Date.now() }, content: null })
+		await goIdle(h)
+		expect(suggestions(h)).toHaveLength(1)
+		await teardown(h)
+	})
+
 	test("a v1 tool name maps to its v2 rename instead of (none)", async () => {
 		// "bash" is edit-distance 4 from "shell" against a threshold of 2, so
 		// the fuzzy matcher can never bridge it. A static alias tried first can.
