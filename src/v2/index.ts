@@ -1072,10 +1072,39 @@ function isTaskToolCall(ev: V2Event): boolean {
 // Plugin
 // ---------------------------------------------------------------------------
 
+/**
+ * The one live instance of this plugin in this process, if any.
+ *
+ * `setup()` is re-run by the loader on every config reload — the live log shows
+ * 2523 loads of this ONE entrypoint against a single server process, and bursts
+ * of SIX `ready` lines with no `stopped` between them. Every setup call builds
+ * its own `sessions` map, its own watchdog interval and its own event pump, so
+ * six live instances meant six private `resumeAttempts` counters: one stall
+ * produced six `resume attempt 1/3` lines in the same millisecond and six
+ * identical continues with no wait between them (2026-10-03, session
+ * ses_efcc2ade…kJmjQR3o). The counter was never broken — each copy had its own.
+ *
+ * Last-wins: a fresh setup disposes the previous instance before arming its own,
+ * so exactly one watchdog and one counter exist no matter how often the loader
+ * re-runs setup. Disposal is deliberately not left to the host, because the
+ * storms prove it does not always happen.
+ */
+let activeInstance: { dispose: () => void } | null = null
+
 export default define({
 	id: "auto-resume.v2",
 
 	setup: async (ctx: AutoResumePluginInput) => {
+		// Supersede any instance the loader left running. Wrapped: a throwing
+		// predecessor must not block the new one from arming.
+		if (activeInstance) {
+			try {
+				activeInstance.dispose()
+			} catch {
+				/* predecessor already torn down */
+			}
+			activeInstance = null
+		}
 		const opts = (ctx.options ?? {}) as AutoResumeOptions
 
 		const chunkTimeoutMs = opts.chunkTimeoutMs ?? DEFAULT_CHUNK_TIMEOUT_MS
@@ -1606,11 +1635,50 @@ export default define({
 			return false
 		}
 
-		async function injectOnce(
+		/**
+		 * Per-session async mutex around the whole injection. Bun is
+		 * single-threaded, so a promise chain serializes overlapping callers:
+		 * stacked watchdogs interleave at every await, and without this the
+		 * log check below runs six-wide against the same empty log before any
+		 * send lands. First holder checks-then-sends; the rest re-check after
+		 * and stand down on sight of the first prod.
+		 */
+		const injectLocks = new Map<string, Promise<void>>()
+		async function withInjectLock<T>(sid: string, fn: () => Promise<T>): Promise<T> {
+			const prev = injectLocks.get(sid) ?? Promise.resolve()
+			let release!: () => void
+			const current = new Promise<void>((resolve) => {
+				release = resolve
+			})
+			// The chain tail is what the NEXT caller waits on, so it must resolve only
+			// after this holder's work finishes — hence `prev.then(() => current)`.
+			const tail = prev.then(() => current)
+			injectLocks.set(sid, tail)
+			await prev
+			try {
+				return await fn()
+			} finally {
+				release()
+				// Drop the key once we are the last holder, so a long-lived process
+				// does not accumulate one entry per session it ever watched.
+				if (injectLocks.get(sid) === tail) injectLocks.delete(sid)
+			}
+		}
+
+		/**
+		 * The injection body. Split out of `injectOnce` so the per-session mutex
+		 * wraps the WHOLE check-then-act: every guard above (subagent, self-abort,
+		 * busy, debounce, duplicate) is a read, and the send is the write. Stacked
+		 * callers interleave at every `await`, so six watchdogs could each pass all
+		 * six reads against pre-send state and then all six send. Serialized here,
+		 * the first caller to finish sends and the rest re-read its result.
+		 */
+		async function injectOnceLocked(
 			sid: string,
 			text: string,
 			notification: string,
-			allowDuringSelfAbort = false,
+			allowDuringSelfAbort: boolean,
+			checkDuplicate: boolean,
 		): Promise<boolean> {
 			const w = ensureWatch(sid)
 			// A subagent is not ours to recover. Checked first, before every other
@@ -1647,6 +1715,19 @@ export default define({
 				w.prodAssistantSnapshot = w.lastAssistantText
 			}
 			return sent
+		}
+
+		/** `injectOnceLocked` serialized per session; see the mutex's own comment. */
+		async function injectOnce(
+			sid: string,
+			text: string,
+			notification: string,
+			allowDuringSelfAbort = false,
+			checkDuplicate = false,
+		): Promise<boolean> {
+			return withInjectLock(sid, () =>
+				injectOnceLocked(sid, text, notification, allowDuringSelfAbort, checkDuplicate),
+			)
 		}
 
 		function cleanupIdleSessions() {
@@ -3777,7 +3858,7 @@ export default define({
 		)
 
 		// Cleanup: stop timers and the event pump; OpenCode awaits this on disable/reload/shutdown.
-		return () => {
+		const dispose = () => {
 			running = false
 			eventAbort.abort()
 			clearInterval(watchdog)
@@ -3790,7 +3871,12 @@ export default define({
 				w.toolTextTimer = null
 			}
 			sessions.clear()
+			// Only clear the singleton if it is still OURS: a later setup may already
+			// have superseded us, and unregistering it would strand a live watchdog.
+			if (activeInstance?.dispose === dispose) activeInstance = null
 			log("info", "stopped")
 		}
+		activeInstance = { dispose }
+		return dispose
 	},
 })
