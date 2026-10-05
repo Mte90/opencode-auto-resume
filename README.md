@@ -521,6 +521,8 @@ Defaults are the same on v1 and v2 unless a row says otherwise.
 | `activeUserWindowMs` | `300000` | Inbound-user-message recency window during which idle nudges stand down (user likely composing) |
 | `subagentNativeCompactionEnabled` | `false` | Opt-in native `session.summarize()` for saturated subagent sessions (no magic-context detection required) |
 | `injectIntervalMs` | v2 only | Minimum gap between recovery injections for one session. No v1 equivalent |
+| `visibleContinue` | `false`, v2 only | Send stall continue via `session.prompt()` — a real user message visible in session history (cattleprod-style) — instead of hidden `session.synthetic({resume:true})`. Checks that decide nothing stay silent either way |
+| `richContinuePrompt` | `true`, v2 only | Stall continue names the stall reason, attempt count, and remaining todos instead of bare `"continue"`. A custom `continuePrompt` always wins verbatim |
 | `logFile` | v2 only | Where this build appends its log. v2 removed v1's server log endpoint, so without this the plugin is silent. Defaults to `~/.local/state/opencode-v2/auto-resume.log` |
 | `rateLimitCooldownsMs` | v2 only | Per-attempt cooldowns (ms) before a rate-limited session may be retried, evaluated as gates on each failure and watchdog tick (no armed timers to lose on reload). Default `[900000, 1800000, 3600000, 7200000 ×5]` ≈ 12h coverage; past the ladder the session stays silent until a genuine user turn. Quota hits never consume the normal retry budget |
 

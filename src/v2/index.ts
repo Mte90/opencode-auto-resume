@@ -289,6 +289,20 @@ export interface AutoResumeOptions {
 	/** Minimum gap between recovery injections for one session. */
 	injectIntervalMs?: number
 	continuePrompt?: string
+	/**
+	 * When true, a stall continue is sent via `ctx.session.prompt()` — a real
+	 * user message visible in session history (cattleprod-style) — instead of
+	 * the hidden `ctx.session.synthetic({resume:true})`. Default false: same
+	 * channel as before. Checks that decide nothing stay silent either way;
+	 * only the action-driving continue becomes visible.
+	 */
+	visibleContinue?: boolean
+	/**
+	 * When true (default), a stall continue names the stall reason, attempt
+	 * count, and remaining todos instead of sending bare "continue". A custom
+	 * `continuePrompt` always wins verbatim. Same channel and guards either way.
+	 */
+	richContinuePrompt?: boolean
 	toolTextRecoveryPrompt?: string
 	doneWithoutWorkPrompt?: string
 	actionIntentPrompt?: string
@@ -1225,6 +1239,8 @@ export default define({
 		const debug = opts.debug ?? DEFAULT_DEBUG
 		const activeUserWindowMs = opts.activeUserWindowMs ?? DEFAULT_ACTIVE_USER_WINDOW_MS
 		const injectIntervalMs = opts.injectIntervalMs ?? DEFAULT_INJECT_INTERVAL_MS
+		const visibleContinue = opts.visibleContinue ?? false
+		const richContinuePrompt = opts.richContinuePrompt ?? true
 		const logFile = opts.logFile ?? process.env.AUTO_RESUME_LOG_FILE ?? DEFAULT_LOG_FILE
 		const rateLimitCooldownsMs =
 			Array.isArray(opts.rateLimitCooldownsMs) && opts.rateLimitCooldownsMs.length > 0 &&
@@ -1322,6 +1338,8 @@ export default define({
 			"debug",
 			"activeUserWindowMs",
 			"injectIntervalMs",
+			"visibleContinue",
+			"richContinuePrompt",
 			"continuePrompt",
 			"toolTextRecoveryPrompt",
 			"actionIntentPrompt",
@@ -1853,6 +1871,25 @@ export default define({
 				dbg(`${short(sid)} injection debounced — ${Math.round(since / 1000)}s since last (min ${injectIntervalMs / 1000}s)`)
 				return false
 			}
+			// Exact-duplicate anti-repeat (cattleprod-style soft skip, opt-in per
+			// caller): an immediate re-fire with identical text and zero model
+			// progress since the last successful prod means the previous nudge
+			// changed nothing — skip it and let the sliding-window counter /
+			// escalation own the loop. No message fetch needed: progress is
+			// assistant-text growth plus tool completions. Scoped to the stall
+			// path by default: the targeted nudges below own per-kind budgets
+			// with re-arm semantics this must not second-guess.
+			if (
+				checkDuplicate &&
+				!allowDuringSelfAbort &&
+				w.lastProdText !== "" &&
+				text === w.lastProdText &&
+				w.pendingTools <= 0 &&
+				w.lastAssistantText === w.prodAssistantSnapshot
+			) {
+				dbg(`${short(sid)} duplicate continue suppressed — identical text, no progress since last prod`)
+				return false
+			}
 			w.lastInjectAt = Date.now()
 			// Cross-instance backstop for the in-memory skip above: stacked
 			// watchdogs cannot see each other's counters, but they share the
@@ -1959,6 +1996,18 @@ export default define({
 		 */
 		async function notifyAndPrompt(sid: string, text: string, notification: string, resume = true): Promise<boolean> {
 			ensureWatch(sid).selfRecovery = true
+			if (visibleContinue) {
+				// Cattleprod-style: a real user message in session history, so the
+				// intervention — and any loop — is self-evident in the transcript.
+				// Falls back to synthetic only if the prompt call throws.
+				try {
+					await ctx.session.prompt({ sessionID: sid, text })
+					return true
+				} catch (err) {
+					const msg = err instanceof Error ? err.message : String(err)
+					log("warn", `${short(sid)} visible prompt failed: ${msg}`)
+				}
+			}
 			try {
 				await ctx.session.synthetic({
 					sessionID: sid,
@@ -2044,6 +2093,35 @@ export default define({
 		}
 
 		/**
+		 * Build the stall-continue text. A custom `continuePrompt` always wins
+		 * verbatim; otherwise, when `richContinuePrompt` is on (default), the
+		 * text names the stall reason, attempt count, and remaining todos
+		 * (cattleprod-style) instead of bare "continue". Same channel and
+		 * guards either way — only the content changes.
+		 */
+		async function buildStallContinueText(sid: string, reason: string, attempt: number): Promise<string> {
+			if (opts.continuePrompt !== undefined && opts.continuePrompt !== "") return opts.continuePrompt
+			if (!richContinuePrompt) return CONTINUE_PROMPT
+			let suffix = "Todo list unavailable."
+			try {
+				const todos = await readTodos(sid)
+				const open = todos.filter((t) => t.status !== "completed" && t.status !== "cancelled")
+				if (open.length > 0) {
+					const lines = open
+						.slice(0, 5)
+						.map((t) => `• [${t.status}] ${String(t.content).slice(0, 120)}`)
+					if (open.length > 5) lines.push(`• …and ${open.length - 5} more`)
+					suffix = `Remaining todos:\n${lines.join("\n")}`
+				} else {
+					suffix = "No open todos recorded."
+				}
+			} catch {
+				// Best effort: a todo-read failure must never block recovery.
+			}
+			return `continue — stalled (${reason}; attempt ${attempt}/${maxRetries}).\n${suffix}`.slice(0, 2000)
+		}
+
+		/**
 		 * Core recovery ladder for a stuck/failed session.
 		 * plain continue with backoff -> more attempts -> abort+resume escalation.
 		 */
@@ -2111,7 +2189,8 @@ export default define({
 						dbg(`${short(sid)} waiting on subagents at inject time — not interrupting`)
 						return
 					}
-					const ok = await injectOnce(sid, opts.continuePrompt ?? CONTINUE_PROMPT, "stalled — retrying")
+					const stallText = await buildStallContinueText(sid, reason, attempt)
+					const ok = await injectOnce(sid, stallText, "stalled — retrying", false, true)
 					w.pendingRecoveryArmed = false
 					if (ok) {
 						w.lastRetryAt = Date.now()
