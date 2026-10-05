@@ -138,7 +138,7 @@ describe("v2: stand down while the user owes us an answer", () => {
 			events: turnEvents(READY_TEXT),
 		})
 		expect(injected.length).toBeGreaterThan(0)
-		expect(injected[0].kind).toBe("synthetic")
+		expect(injected[0].kind).toBe("prompt")
 	})
 
 	// The v2 message projection never writes "pending" — it writes "running".
