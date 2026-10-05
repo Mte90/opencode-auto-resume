@@ -210,6 +210,12 @@ interface SessionWatch {
 	/** Tool calls started but not finished, tracked from the tool lifecycle events.
 	 * The orphan watch must never abort a session that is legitimately working. */
 	pendingTools: number
+	/** Snapshot of `pendingTools` taken at the `session.idle` transition, before
+	 * `markIdle()` zeroes the live counter. Idle does not mean nothing is in
+	 * flight — the event fires between steps while tools run — so any idle-path
+	 * check that reads the live counter always sees zero. Same class of bug the
+	 * `busyBefore` sample above guards against. */
+	toolsInFlightAtIdle: number
 	unknownToolErrors: Map<string, number>
 	/** Set once a suggestion has been injected, so it is sent at most once per
 	 * user message rather than on every idle. */
@@ -1398,6 +1404,7 @@ export default define({
 					toolTextTimer: null,
 					lastSubagentCheckAt: 0,
 					pendingTools: 0,
+					toolsInFlightAtIdle: 0,
 					unknownToolErrors: new Map(),
 					unknownToolSuggestionSent: false,
 					checkedToolPartIDs: new Set(),
@@ -2294,8 +2301,12 @@ export default define({
 		 * finish, and walking back past a delivered answer to one of those would
 		 * recover a session that just used a tool.
 		 *
-		 * Returns `null` when the newest finished message carried text, or when
-		 * there is no finished message at all.
+		 * Returns `null` when the newest finished message carried text — or when it
+		 * carried tool calls, which are delivered work, not silence. A thinking
+		 * model doing tool work ends turns with a finish reason, spent output
+		 * tokens, and no text parts; judging that "silent" fires a continue
+		 * into active work (ses_efaec2f99ffexosULGDJJ8i6sA, 2026-10-04).
+		 * Returns `null` as well when there is no finished message at all.
 		 */
 		function lastSilentDeadStream(messages: unknown[]): { finish: string; outputTokens: number } | null {
 			for (let i = messages.length - 1; i >= 0; i--) {
@@ -2308,9 +2319,16 @@ export default define({
 				if (msg?.type !== "assistant") continue
 				const finish = typeof msg.finish === "string" ? msg.finish : undefined
 				if (!finish) continue
-				const hasText = Array.isArray(msg.content) &&
-					msg.content.some((p) => p?.type === "text" && typeof p.text === "string" && p.text.length > 0)
+				const parts = Array.isArray(msg.content) ? msg.content : []
+				const hasText = parts.some((p) => p?.type === "text" && typeof p.text === "string" && p.text.length > 0)
 				if (hasText) return null
+				// Same tool-part convention as hasPendingUserInput: a finished
+				// turn that issued tool calls did work, even with no chatter.
+				const hasToolCalls = parts.some((p) => {
+					const t = p?.type ?? ""
+					return t === "tool_use" || t === "tool" || t === "tool_call" || t.startsWith("tool")
+				})
+				if (hasToolCalls) return null
 				return { finish, outputTokens: posNum(msg.tokens?.output) }
 			}
 			return null
@@ -2338,6 +2356,14 @@ export default define({
 				return false
 			}
 			const w = ensureWatch(sid)
+			// Tools still awaiting results are working, not stalled — even when
+			// the finished message predates the tool events and looks dead.
+			// Reads the at-idle snapshot, not the live counter: markIdle zeroes
+			// it on the transition, and idle fires while tools run.
+			if (w.toolsInFlightAtIdle > 0) {
+				dbg(`${short(sid)} silent dead stream, but ${w.toolsInFlightAtIdle} tool(s) still in flight — working, not stalled`)
+				return true
+			}
 			// Ask the server before injecting, not just our own flag. A provider
 			// that is quietly retrying looks exactly like a dead stream from the
 			// event stream, and the event may not have arrived yet when the turn
@@ -3530,6 +3556,10 @@ export default define({
 					// of busy sessions behind it. Sampling after markIdle would make every
 					// idle look like a drop to zero and the arming condition unreachable.
 					const busyBefore = busySessionsForOrphanWatch().length
+					// Snapshot before the transition for the same reason: markIdle
+					// zeroes the live counter, and idle fires while tools run.
+					const wPre = ensureWatch(sid)
+					wPre.toolsInFlightAtIdle = wPre.pendingTools
 					markIdle(sid)
 					const w = ensureWatch(sid)
 					w.pendingRecoveryArmed = false

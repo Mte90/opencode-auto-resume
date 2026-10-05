@@ -86,6 +86,16 @@ const finished = (opts: { finish?: string; text?: string; output?: number; reaso
 	tokens: { input: 100, output: opts.output ?? 400, reasoning: 0, cache: { read: 0, write: 0 } },
 })
 
+/** A finished turn that issued tool calls but no chatter text: active work. */
+const finishedWithTools = () => ({
+	type: "assistant",
+	id: "msg_a3",
+	time: { created: Date.now() - 60_000 },
+	content: [{ type: "tool", id: "call_9", name: "bash", state: { status: "completed" } }],
+	finish: "stop",
+	tokens: { input: 100, output: 400, reasoning: 0, cache: { read: 0, write: 0 } },
+})
+
 /** An intermediate tool-call step: no finish reason, so the walk skips it. */
 const toolStep = () => ({
 	type: "assistant",
@@ -114,7 +124,7 @@ type Harness = { injected: Array<{ text?: string }>; logs: string[] }
 async function replay(
 	messages: unknown[],
 	opts: Record<string, unknown> = {},
-	extra: { serverRunning?: boolean } = {},
+	extra: { serverRunning?: boolean; preIdleEvents?: Array<{ type: string; data?: Record<string, unknown> }> } = {},
 ): Promise<Harness> {
 	const injected: Harness["injected"] = []
 	const stream = makeEventStream()
@@ -147,6 +157,7 @@ async function replay(
 	for (const e of [
 		ev("session.execution.started"),
 		ev("session.step.started"),
+		...(extra.preIdleEvents ?? []).map((p) => ev(p.type, p.data ?? {})),
 		ev("session.step.ended"),
 		ev("session.idle"),
 	]) {
@@ -205,6 +216,26 @@ describe("v2: silent dead stream", () => {
 		// dead finish behind it.
 		const { injected } = await replay([finished({ output: 400 }), toolStep()])
 		expect(injected).toHaveLength(1)
+	})
+
+	test("a finished turn carrying tool calls is working, not a dead stream", async () => {
+		// ses_efaec2f99ffexosULGDJJ8i6sA 2026-10-04: a thinking model doing tool
+		// work ends turns with finish=stop, hundreds of output tokens, and no
+		// text parts. Judging that "silent" fires a visible continue into
+		// active work. Tool calls are delivered work — not silence.
+		const { injected, logs } = await replay([finishedWithTools()])
+		expect(injected).toEqual([])
+		expect(logs.some((l) => l.includes("silent dead stream"))).toBe(false)
+	})
+
+	test("tools still in flight veto the dead-stream inject", async () => {
+		// Belt and braces for the race the test above cannot see: the finished
+		// message predates the tool events, so the message looks dead while the
+		// calls it issued have not answered yet.
+		const { injected } = await replay([finished({ output: 400 })], {}, {
+			preIdleEvents: [{ type: "session.tool.called", data: { tool: "bash", id: "call_9" } }],
+		})
+		expect(injected).toEqual([])
 	})
 
 	test("a session the server still reports as running is left alone", async () => {
