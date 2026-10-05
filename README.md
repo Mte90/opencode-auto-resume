@@ -522,6 +522,7 @@ Defaults are the same on v1 and v2 unless a row says otherwise.
 | `subagentNativeCompactionEnabled` | `false` | Opt-in native `session.summarize()` for saturated subagent sessions (no magic-context detection required) |
 | `injectIntervalMs` | v2 only | Minimum gap between recovery injections for one session. No v1 equivalent |
 | `logFile` | v2 only | Where this build appends its log. v2 removed v1's server log endpoint, so without this the plugin is silent. Defaults to `~/.local/state/opencode-v2/auto-resume.log` |
+| `rateLimitCooldownsMs` | v2 only | Per-attempt cooldowns (ms) before a rate-limited session may be retried, evaluated as gates on each failure and watchdog tick (no armed timers to lose on reload). Default `[900000, 1800000, 3600000, 7200000 ×5]` ≈ 12h coverage; past the ladder the session stays silent until a genuine user turn. Quota hits never consume the normal retry budget |
 
 Message patterns are matched case-insensitively. Error names use exact match.
 

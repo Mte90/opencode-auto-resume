@@ -221,6 +221,13 @@ interface SessionWatch {
 	 * check that reads the live counter always sees zero. Same class of bug the
 	 * `busyBefore` sample above guards against. */
 	toolsInFlightAtIdle: number
+	/** Rate-limit ladder state. `rateLimitedAt` is the last quota decision
+	 * point, `rateLimitAttempts` counts served attempts in this episode, and
+	 * `awaitingQuotaRetry` arms the watchdog-tick gate. A fresh turn resets
+	 * all three: new activity means quota is available again. */
+	rateLimitedAt: number
+	rateLimitAttempts: number
+	awaitingQuotaRetry: boolean
 	unknownToolErrors: Map<string, number>
 	/** Set once a suggestion has been injected, so it is sent at most once per
 	 * user message rather than on every idle. */
@@ -332,6 +339,13 @@ export interface AutoResumeOptions {
 	 * variable sets the same thing and wins over neither.
 	 */
 	logFile?: string
+	/**
+	 * Per-attempt cooldowns (ms) before a rate-limited session may be retried.
+	 * Gates, not timers: evaluated on each failure and each watchdog tick, so
+	 * nothing is lost to a reload. Past the ladder the session stays silent
+	 * until a genuine user turn. Default spans ~12h for overnight coverage.
+	 */
+	rateLimitCooldownsMs?: number[]
 }
 
 // ---------------------------------------------------------------------------
@@ -498,6 +512,15 @@ const SHELL_OPEN_MAX_MS = 30 * 60_000
 
 /** OOC (out-of-context) errors that `continue` can never clear — recovery is locked out on these. */
 const OOC_ERROR_RE = /exceeds the available context size|context size \(\d+\)|too large to compact|too many tokens|prompt is too long/i
+/** Quota/rate-limit errors (observed: `{type:"provider.quota", message:"Rate
+ * limit exceeded. Please try again later."}`). An immediate continue retries
+ * straight into the ban, so these stand down on a gate ladder instead of the
+ * normal backoff. Gates, not timers: armed timeouts do not survive a reload. */
+const RATE_LIMIT_RE = /rate limit exceeded|too many requests|\b429\b|quota exceeded|provider\.quota/i
+/** Per-attempt cooldowns before a rate-limited session may be retried: 15m,
+ * 30m, 1h, then 2h out to ~12h of unattended coverage. Past the ladder the
+ * session stays silent until a genuine user turn. */
+const DEFAULT_RATE_LIMIT_COOLDOWNS_MS = [15, 30, 60, 120, 120, 120, 120, 120].map((m) => m * 60_000)
 
 /**
  * Window after `session.interrupt()` during which any abort-shaped event is
@@ -1197,6 +1220,11 @@ export default define({
 		const activeUserWindowMs = opts.activeUserWindowMs ?? DEFAULT_ACTIVE_USER_WINDOW_MS
 		const injectIntervalMs = opts.injectIntervalMs ?? DEFAULT_INJECT_INTERVAL_MS
 		const logFile = opts.logFile ?? process.env.AUTO_RESUME_LOG_FILE ?? DEFAULT_LOG_FILE
+		const rateLimitCooldownsMs =
+			Array.isArray(opts.rateLimitCooldownsMs) && opts.rateLimitCooldownsMs.length > 0 &&
+			opts.rateLimitCooldownsMs.every((n) => typeof n === "number" && n > 0)
+				? (opts.rateLimitCooldownsMs as number[])
+				: DEFAULT_RATE_LIMIT_COOLDOWNS_MS
 		// How long a parent may sit busy after its last subagent went idle before
 		// the orphan watch acts. v1 default, honoured for the first time here.
 		const subagentWaitMs = opts.subagentWaitMs ?? DEFAULT_SUBAGENT_WAIT_MS
@@ -1310,6 +1338,7 @@ export default define({
 			"thinkingToolRecoveryPrompt",
 			"doneWithoutWorkPrompt",
 			"logFile",
+			"rateLimitCooldownsMs",
 		])
 		const unknownOptions = Object.keys(opts).filter((key) => !RECOGNISED_OPTIONS.has(key))
 		if (unknownOptions.length > 0) {
@@ -1428,6 +1457,9 @@ export default define({
 					lastSubagentCheckAt: 0,
 					pendingTools: 0,
 					toolsInFlightAtIdle: 0,
+					rateLimitedAt: 0,
+					rateLimitAttempts: 0,
+					awaitingQuotaRetry: false,
 					unknownToolErrors: new Map(),
 					unknownToolSuggestionSent: false,
 					checkedToolPartIDs: new Set(),
@@ -1568,6 +1600,43 @@ export default define({
 		/** Does this failure signature mean "the turn was interrupted"? */
 		function isAbortError(errType: string, errMsg: string): boolean {
 			return ABORT_ERROR_TYPE_RE.test(errType.trim()) || ABORT_ERROR_MSG_RE.test(errMsg)
+		}
+
+		function isRateLimitError(errType: string, errMsg: string): boolean {
+			return RATE_LIMIT_RE.test(`${errType} ${errMsg}`)
+		}
+
+		/**
+		 * Stand down on quota/rate-limit failures instead of retrying into the
+		 * ban. Gates, not timers: the decision is re-evaluated on each failure
+		 * and each watchdog tick against `rateLimitedAt`, so nothing is lost
+		 * to a reload. Served cooldowns flow into the normal `recover()` path
+		 * (budgets, loop guard and inject guards all apply); past the ladder
+		 * the session stays silent until a genuine user turn.
+		 */
+		function handleRateLimitFailure(sid: string, w: SessionWatch, errType: string, errMsg: string): void {
+			const ladder = rateLimitCooldownsMs
+			const n = w.rateLimitAttempts
+			markIdle(sid)
+			if (n >= ladder.length) {
+				w.awaitingQuotaRetry = false
+				log("warn", `${short(sid)} rate-limit budget exhausted (${ladder.length} attempts) — standing down until user turn`)
+				return
+			}
+			const now = Date.now()
+			if (w.rateLimitedAt > 0 && now - w.rateLimitedAt >= ladder[n]) {
+				w.rateLimitAttempts = n + 1
+				w.rateLimitedAt = now
+				w.awaitingQuotaRetry = false
+				w.pendingRecoveryArmed = true
+				log("info", `${short(sid)} rate-limit cooldown served — retrying (attempt ${n + 1}/${ladder.length})`)
+				void recover(sid, "rate-limit cooldown served")
+				return
+			}
+			if (w.rateLimitedAt === 0) w.rateLimitedAt = now
+			w.awaitingQuotaRetry = true
+			const waitMs = Math.max(0, ladder[n] - (now - w.rateLimitedAt))
+			log("warn", `${short(sid)} rate limited (${errType || "error"}) — standing down, next attempt in ${Math.ceil(waitMs / 1000)}s (${n + 1}/${ladder.length})`)
 		}
 
 		/** Remaining plugin-initiated interrupts allowed in the current window. */
@@ -3237,6 +3306,27 @@ export default define({
 					await recover(sid, `no activity for ${Math.ceil(silence / 1000)}s`)
 				}
 			}
+			// Rate-limit gate: sessions stood down on quota get one attempt per
+			// served cooldown, evaluated here so no armed timer can be lost to
+			// a reload. Guards mirror the failure handler; `recover()` applies
+			// its own budget, loop and inject guards on top.
+			for (const [rsid, rw] of sessions) {
+				if (!rw.awaitingQuotaRetry) continue
+				const rn = rw.rateLimitAttempts
+				if (rn >= rateLimitCooldownsMs.length) {
+					rw.awaitingQuotaRetry = false
+					continue
+				}
+				if (rw.userCancelled || rw.gaveUp || rw.compacting || rw.permissionPending) continue
+				if (selfAbortActive(rw)) continue
+				if (Date.now() - rw.rateLimitedAt < rateLimitCooldownsMs[rn]) continue
+				rw.awaitingQuotaRetry = false
+				rw.rateLimitAttempts = rn + 1
+				rw.rateLimitedAt = Date.now()
+				rw.pendingRecoveryArmed = true
+				log("info", `${short(rsid)} rate-limit cooldown served — retrying (attempt ${rn + 1}/${rateLimitCooldownsMs.length})`)
+				void recover(rsid, "rate-limit cooldown served")
+			}
 			cleanupIdleSessions()
 		}
 
@@ -3563,10 +3653,18 @@ export default define({
 					const w = ensureWatch(sid)
 					if (w.selfRecovery) {
 						w.selfRecovery = false
-					} else if (w.oocLocked) {
-						w.oocLocked = false
-						w.oocLockReason = null
-						log("info", `${short(sid)} genuine execution — clearing OOC lock`)
+					} else {
+						if (w.oocLocked) {
+							w.oocLocked = false
+							w.oocLockReason = null
+							log("info", `${short(sid)} genuine execution — clearing OOC lock`)
+						}
+						// A genuine turn is activity, and activity means quota is
+						// available again: the rate-limit ladder starts over. Our
+						// own recovery turns (selfRecovery) do not reset it.
+						w.rateLimitedAt = 0
+						w.rateLimitAttempts = 0
+						w.awaitingQuotaRetry = false
 					}
 					markBusy(sid)
 					return
@@ -3925,6 +4023,12 @@ export default define({
 					if (isAbortError(errType, errMsg)) {
 						dbg(`${short(sid)} failure was an interrupt (${errType || "error"}) — not recovering`)
 						w.pendingRecoveryArmed = false
+						return
+					}
+					// Quota/rate-limit failures stand down on the gate ladder — an
+					// immediate continue retries straight into the ban.
+					if (isRateLimitError(errType, errMsg)) {
+						handleRateLimitFailure(sid, w, errType, errMsg)
 						return
 					}
 					maybeLockOoc(sid, errMsg)
