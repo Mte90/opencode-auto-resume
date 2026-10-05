@@ -15,8 +15,9 @@ Ports the plugin from the v1 hooks API (`Plugin` factory returning a hooks
 object) to the v2 promise-plugin API (`Plugin.define({ id, setup })` +
 `ctx.event.subscribe()`). All detection/recovery features are preserved.
 Strict-mode typechecked against the real `@opencode/plugin@2.0.5` types, and
-covered by 188 tests across 13 files driven through the real event stream — one
-file per feature area, 780 passing repo-wide including v1.
+covered by 233 tests across 20 files driven through the real event stream — one
+file per feature area (figures rechecked 2026-10-05 after the todo-branch fix
+ports; repo-wide total in the suite footer below counts v1+v2).
 
 ## 1. Config key renamed: `plugin` → `plugins`
 
@@ -218,7 +219,7 @@ Disable by id without touching other plugins: add `"-auto-resume.v2"`.
 ## Testing
 
 - `tsc --strict --noEmit` clean against **`@opencode/plugin@2.0.5`** (stable).
-- Runtime suite (bun, 13 files / 188 tests) against the stable API:
+- Runtime suite (bun, 20 files / 233 tests, rechecked 2026-10-05) against the stable API:
   definition shape · `subscribe({ signal })` · abort-on-cleanup · stall watchdog
   → `synthetic` with visible `description` + `resume` · idle forensics via the
   `session.context()` fallback · healthy idle turn is a no-op · permission-hold
@@ -229,7 +230,9 @@ Disable by id without touching other plugins: add `"-auto-resume.v2"`.
   silent dead streams, premature stop, context saturation, the todo list, explicit
   `task_complete`, reasoning-tool recovery, orphan parent recovery, the settle
   delay, session discovery, the options surface, and the hand-off and stand-down
-  guards.
+  guards — plus cross-instance duplicate suppression, the inject mutex and
+  singleton registry, the quota ladder, parent-wait on live subagents, and the
+  visible channel with rich stall text.
 
   Two tests in the settle-delay file were **vacuous** on the first pass — they
   passed whether or not the code under test ran. Every test in the v2 port is now
