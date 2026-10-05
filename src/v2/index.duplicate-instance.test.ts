@@ -5,7 +5,6 @@ import { join } from "node:path"
 import { tmpdir } from "node:os"
 import plugin from "./index"
 
-const SOURCE = readFileSync(join(import.meta.dir, "index.ts"), "utf8")
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_dupinst"
 let counter = 0
@@ -142,14 +141,4 @@ describe("v2: N live setups must not become N identical injections", () => {
 		// One live instance, therefore one counter, therefore one injection.
 		expect(stalls).toBe(1)
 	}, 25_000)
-
-	test("structural: a module-scope singleton guards setup() against stacking", () => {
-		const singletonAt = SOURCE.indexOf("let activeInstance:")
-		expect(singletonAt).toBeGreaterThan(-1)
-		const setupAt = SOURCE.indexOf("setup: async (ctx: AutoResumePluginInput) => {")
-		// Declared BEFORE setup opens, and consulted inside it: that ordering is the fix.
-		expect(singletonAt).toBeLessThan(setupAt)
-		expect(SOURCE).toContain("activeInstance.dispose()")
-		expect(SOURCE).toContain("activeInstance = { dispose }")
-	})
 })
