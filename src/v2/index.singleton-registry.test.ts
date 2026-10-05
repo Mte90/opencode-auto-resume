@@ -1,11 +1,24 @@
 import { describe, test, expect } from "bun:test"
-import { readFileSync } from "node:fs"
+import { readFileSync, rmSync } from "node:fs"
 import { join } from "node:path"
+import { tmpdir } from "node:os"
 import plugin from "./index"
 
 const SOURCE = readFileSync(join(import.meta.dir, "index.ts"), "utf8")
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_registry"
+let counter = 0
+
+/**
+ * A private log file. Without `logFile` the plugin writes to its DEFAULT path,
+ * which is the LIVE server's log — test sessions then show up interleaved with
+ * real ones and the live log stops being usable as forensics.
+ */
+function privateLog(tag: string): string {
+	const f = join(tmpdir(), `auto-resume-${tag}-${process.pid}-${counter++}.log`)
+	rmSync(f, { force: true })
+	return f
+}
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -60,6 +73,7 @@ type Boot = { injected: any[]; registryLive: unknown; registryKey: string }
 async function boot(instances: number): Promise<Boot> {
 	const injected: any[] = []
 	const streams = Array.from({ length: instances }, () => makeEventStream())
+	const logFile = privateLog("registry")
 	let next = 0
 	const ctx: any = {
 		event: {
@@ -69,7 +83,7 @@ async function boot(instances: number): Promise<Boot> {
 				return s
 			},
 		},
-		options: { ...FAST, maxRetries: 1 },
+		options: { ...FAST, maxRetries: 1, logFile },
 		session: {
 			active: async () => ({}),
 			interrupt: async () => ({}),
@@ -91,6 +105,7 @@ async function boot(instances: number): Promise<Boot> {
 	await wait(700)
 	const duringStall = (globalThis as any)[key]?.live
 	for (const c of cleanups) (c as (() => void) | undefined)?.()
+	rmSync(logFile, { force: true })
 
 	return { injected, registryLive: duringStall ?? afterSetup, registryKey: key }
 }

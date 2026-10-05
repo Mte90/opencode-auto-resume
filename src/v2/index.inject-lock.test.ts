@@ -1,11 +1,24 @@
 import { describe, test, expect } from "bun:test"
-import { readFileSync } from "node:fs"
+import { readFileSync, rmSync } from "node:fs"
 import { join } from "node:path"
+import { tmpdir } from "node:os"
 import plugin from "./index"
 
 const SOURCE = readFileSync(join(import.meta.dir, "index.ts"), "utf8")
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_lock"
+let counter = 0
+
+/**
+ * A private log file. Without `logFile` the plugin writes to its DEFAULT path,
+ * which is the LIVE server's log — test sessions then show up interleaved with
+ * real ones and the live log stops being usable as forensics.
+ */
+function privateLog(tag: string): string {
+	const f = join(tmpdir(), `auto-resume-${tag}-${process.pid}-${counter++}.log`)
+	rmSync(f, { force: true })
+	return f
+}
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -63,9 +76,10 @@ const FAST = {
 async function run(slowMs: number) {
 	const injected: any[] = []
 	const stream = makeEventStream()
+	const logFile = privateLog("lock")
 	const ctx: any = {
 		event: stream,
-		options: { ...FAST, maxRetries: 1, debug: true },
+		options: { ...FAST, maxRetries: 1, debug: true, logFile },
 		session: {
 			active: async () => ({}),
 			interrupt: async () => ({}),
@@ -86,6 +100,7 @@ async function run(slowMs: number) {
 	stream.push(ev("session.execution.started"))
 	await wait(800)
 	;(cleanup as (() => void) | undefined)?.()
+	rmSync(logFile, { force: true })
 	return injected
 }
 
