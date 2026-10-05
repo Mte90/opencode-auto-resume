@@ -244,13 +244,10 @@ describe("v2: naming a replacement for a tool that does not exist", () => {
 		// a fresh tool list in front of it, so the previous round's typos say nothing
 		// about this one.
 		//
-		// The second suggestion names the *old* typo, not the new one, and that is
-		// v1's behaviour reproduced rather than a bug in the port: the re-arm clears
-		// the "already examined" set, so the walk restarts from the top of the
-		// history and the oldest name still above threshold wins. Recorded in
-		// known-issues-v2.md as a quirk worth a decision, not silently changed —
-		// suppressing a name once it has been suggested is a behaviour change, and
-		// the project's bar is parity.
+		// The re-arm resets counts and the latch, but NOT the examined-parts set:
+		// recounting already-suggested errors is what nagged a live session with
+		// the same suggestion on every user message (2026-10-04). New errors still
+		// earn a suggestion — and it names the NEW name, not the old one.
 		const h = await setup({
 			history: [userMessage("go", OLD), assistantWith(toolPart("call_1", "globb")), assistantWith(toolPart("call_2", "globb"))],
 		})
@@ -261,7 +258,24 @@ describe("v2: naming a replacement for a tool that does not exist", () => {
 		h.history.push(assistantWith(toolPart("call_4", "wriet")))
 		await goIdle(h)
 		expect(suggestions(h)).toHaveLength(2)
-		expect(suggestions(h)[1].text).toContain('"globb"')
+		expect(suggestions(h)[1].text).toContain('"wriet"')
+		await teardown(h)
+	})
+
+	test("a genuine new request does not re-suggest already-reported errors", async () => {
+		// The 3:40 PM incident: every real user message re-armed, cleared the
+		// examined set, and recounted the SAME stale bash errors — one suggestion
+		// per user message while the model had long moved on.
+		const h = await setup({
+			history: [userMessage("go", OLD), assistantWith(toolPart("call_1", "bash")), assistantWith(toolPart("call_2", "bash"))],
+			tools: [{ id: "read" }, { id: "shell" }, { id: "glob" }],
+		})
+		await goIdle(h)
+		expect(suggestions(h)).toHaveLength(1)
+		h.history.push(userMessage("stop ignoring; report repeats", OLD + 2_000, "msg_u_second"))
+		await goIdle(h)
+		await goIdle(h)
+		expect(suggestions(h)).toHaveLength(1)
 		await teardown(h)
 	})
 

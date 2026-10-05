@@ -336,12 +336,11 @@ TOOL_STATE_* note in the source.)
 Two behaviours are inherited from v1 rather than fixed here, and the second is
 worth a decision:
 
-- **A re-armed turn re-names the oldest typo.** The per-request reset clears the
-  "already examined" set, so the walk restarts from the top of the history and
-  the oldest name still above threshold wins — a turn that introduced a *new*
-  invented name is told about the *previous* one. Suppressing a name once it has
-  been suggested is a behaviour change rather than a port, so it is documented
-  instead of made.
+- **A re-armed turn names the newest typo.** The per-request reset clears
+  counts and the latch but keeps the "already examined" set: already-reported
+  errors are never recounted (2026-10-04 changed this — recounting made every
+  genuine user message re-suggest the same stale errors). A turn that
+  introduces a *new* invented name is told about that one.
 - **No registry, no check.** With no tool list every name looks invented, so the
   check is skipped rather than accusing the model of tools that plainly exist.
   Same for an empty registry and for a registry that throws, which is logged and

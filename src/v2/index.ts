@@ -2628,7 +2628,11 @@ export default define({
 			}
 			w.unknownToolErrors.clear()
 			w.unknownToolSuggestionSent = false
-			w.checkedToolPartIDs.clear()
+			// Deliberately NOT clearing checkedToolPartIDs: already-reported
+			// errors must never be recounted. Clearing it made every genuine
+			// user message re-suggest the same stale errors (2026-10-04: one
+			// bash suggestion per message, long after the model moved to shell).
+			// New error parts still count fresh toward the threshold.
 		}
 
 		/** Registered tool names, cached briefly — the registry only changes when a
