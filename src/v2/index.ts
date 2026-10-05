@@ -1089,21 +1089,69 @@ function isTaskToolCall(ev: V2Event): boolean {
  * re-runs setup. Disposal is deliberately not left to the host, because the
  * storms prove it does not always happen.
  */
-let activeInstance: { dispose: () => void } | null = null
+/**
+ * The one live instance of this plugin in this PROCESS, shared across every
+ * evaluation of this bundle.
+ *
+ * It lives on `globalThis`, not in module scope, and that is the whole fix. The
+ * loader re-EVALUATES the plugin file on every config reload: the live log shows
+ * one entrypoint URL, one pid, and a fresh module identity each time
+ * (`mod=1812055.c6d4mu`, `.72a9tl`, `.dt27x7`, … six distinct copies inside one
+ * server process). Module scope cannot help, because each copy gets its own
+ * `activeInstance` — a singleton fix shipped that way and the storms continued
+ * (19:54:19, eight identical `resume attempt 1/3` lines in 5ms).
+ *
+ * `globalThis` is shared by all module instances in a process (verified on both
+ * node and bun), so a key here is the one channel that survives re-evaluation.
+ * Each setup finds its predecessor through the registry and disposes it before
+ * arming itself: last wins, so exactly one watchdog and one `resumeAttempts`
+ * counter exist however often the loader reloads us. Disposal cannot be left to
+ * the host, because the storms prove it does not always happen.
+ *
+ * Keyed by pid + plugin id: two servers in one process cannot happen, but two
+ * config trees (v1 and v2) can load different builds, and they must not dispose
+ * each other.
+ */
+const REGISTRY_KEY = `__auto_resume_singleton__:${process.pid}`
+
+type SingletonRegistry = { live?: { dispose: () => void } }
+
+function singletonRegistry(): SingletonRegistry {
+	const g = globalThis as unknown as Record<string, SingletonRegistry | undefined>
+	let reg = g[REGISTRY_KEY]
+	if (!reg) {
+		reg = {}
+		g[REGISTRY_KEY] = reg
+	}
+	return reg
+}
+
+/**
+ * Identity of THIS module evaluation, stamped into the ready line.
+ *
+ * `pid` separates processes; `eval` separates module evaluations inside one
+ * process. Six distinct values under one pid is what exposed the real cause —
+ * keep this until the storms are gone, because it is the only way to tell a
+ * re-evaluation apart from a genuine second server.
+ */
+const MODULE_INSTANCE = `${process.pid}.${Math.random().toString(36).slice(2, 8)}`
 
 export default define({
 	id: "auto-resume.v2",
 
 	setup: async (ctx: AutoResumePluginInput) => {
-		// Supersede any instance the loader left running. Wrapped: a throwing
-		// predecessor must not block the new one from arming.
-		if (activeInstance) {
+		// Supersede any instance the loader left running — found through the
+		// process-wide registry, so it also catches instances belonging to OTHER
+		// evaluations of this bundle. Wrapped: a throwing predecessor must not
+		// block the new one from arming.
+		const registry = singletonRegistry()
+		if (registry.live) {
 			try {
-				activeInstance.dispose()
+				registry.live.dispose()
 			} catch {
 				/* predecessor already torn down */
 			}
-			activeInstance = null
+			registry.live = undefined
 		}
 		const opts = (ctx.options ?? {}) as AutoResumeOptions
 
@@ -3853,7 +3901,7 @@ export default define({
 
 		log(
 			"info",
-			`ready (opencode v2). timeout=${chunkTimeoutMs}ms interval=${checkIntervalMs}ms retries=${maxRetries} loop=${loopMaxContinues}/${loopWindowMs / 1000}s warmup=${warmupMs}ms stall=${busyStallStrategy}` +
+			`ready (opencode v2). timeout=${chunkTimeoutMs}ms interval=${checkIntervalMs}ms retries=${maxRetries} loop=${loopMaxContinues}/${loopWindowMs / 1000}s warmup=${warmupMs}ms stall=${busyStallStrategy} mod=${MODULE_INSTANCE}` +
 				(gatedInUse.length > 0 ? ` accepted-but-inert=${gatedInUse.join(",")}` : ""),
 		)
 
@@ -3871,12 +3919,15 @@ export default define({
 				w.toolTextTimer = null
 			}
 			sessions.clear()
-			// Only clear the singleton if it is still OURS: a later setup may already
-			// have superseded us, and unregistering it would strand a live watchdog.
-			if (activeInstance?.dispose === dispose) activeInstance = null
-			log("info", "stopped")
+			// Only clear the registry slot if it is still OURS: a later setup may
+			// already have superseded us, and unregistering it would strand a live
+			// watchdog. The identity check matters across copies too, since they
+			// share one registry.
+			const reg = singletonRegistry()
+			if (reg.live?.dispose === dispose) reg.live = undefined
+			log("info", `stopped mod=${MODULE_INSTANCE}`)
 		}
-		activeInstance = { dispose }
+		registry.live = { dispose }
 		return dispose
 	},
 })
