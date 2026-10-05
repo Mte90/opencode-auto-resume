@@ -143,6 +143,17 @@ describe("v2: stall-continue channel", () => {
 		expect(injected.length).toBeGreaterThan(0)
 		expect(injected.every((i) => i.kind === "prompt")).toBe(true)
 	})
+
+	test("AUTO_RESUME_VISIBLE_CONTINUE=1 enables the visible channel", async () => {
+		process.env.AUTO_RESUME_VISIBLE_CONTINUE = "1"
+		try {
+			const { injected } = await replay(busyStallEvents, { maxRetries: 1 })
+			expect(injected.length).toBeGreaterThan(0)
+			expect(injected.every((i) => i.kind === "prompt")).toBe(true)
+		} finally {
+			delete process.env.AUTO_RESUME_VISIBLE_CONTINUE
+		}
+	})
 })
 
 describe("v2: rich stall-continue text", () => {
