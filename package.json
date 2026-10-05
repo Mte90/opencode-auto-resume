@@ -21,13 +21,19 @@
   "author": "Daniele \"mte90\" Scasciafratte",
   "type": "module",
   "main": "dist/index.js",
-"scripts": {
-    "build": "bun build src/index.ts --outdir dist --target bun",
+  "exports": {
+    ".": "./dist/index.js",
+    "./v2": "./dist/v2.js"
+  },
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target bun && bun build src/index-v2.ts --outfile dist/v2.js --target bun",
     "dev": "bun build src/index.ts --outdir dist --target bun --watch",
     "test": "bun test",
     "prepublishOnly": "bun run build"
-},  "files": [
+  },
+  "files": [
     "dist/index.js",
+    "dist/v2.js",
     "README.md",
     "LICENSE"
   ],
