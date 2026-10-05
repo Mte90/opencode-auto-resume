@@ -156,6 +156,11 @@ interface SessionWatch {
 	/** Last injected prod text + assistant snapshot at prod time, for duplicate suppression. */
 	lastProdText: string
 	prodAssistantSnapshot: string
+	/** Texts this plugin injected (visible channel posts them as real user
+	 * messages). `noteInboundUserMessage` must not read them as new user
+	 * instructions, or every injection re-arms the budgets it just spent and
+	 * the same errors refire on the next idle. Capped; identity is exact text. */
+	ownPromptTexts: string[]
 	recovering: boolean
 	/** Latched when a failure carries an OOC error that `continue` can never clear; recovery (continue + abort+resume) is refused until a genuine user/agent turn. */
 	oocLocked: boolean
@@ -1028,6 +1033,23 @@ function levenshtein(a: string, b: string): number {
  * sloppy. Without that, a two-letter name would match almost anything and the
  * suggestion would be noise.
  */
+/**
+ * Names models invent for tools that exist under another name. Edit distance
+ * cannot bridge these ("bash"→"shell" is 4 against a threshold of 2), so the
+ * map is consulted before the fuzzy matcher. The target must be registered —
+ * an unguarded guess names a second nonexistent tool and teaches the model
+ * the registry lies.
+ */
+const TOOL_NAME_ALIASES: Record<string, string> = {
+	bash: "shell",
+}
+
+function resolveToolSuggestion(wrongName: string, available: string[]): string | null {
+	const alias = TOOL_NAME_ALIASES[wrongName.toLowerCase()]
+	if (alias && available.includes(alias)) return alias
+	return suggestClosestTool(wrongName, available)
+}
+
 function suggestClosestTool(wrongName: string, available: string[]): string | null {
 	const lower = wrongName.toLowerCase()
 	let best: string | null = null
@@ -1381,6 +1403,7 @@ export default define({
 					lastInjectAt: 0,
 					lastProdText: "",
 					prodAssistantSnapshot: "",
+					ownPromptTexts: [],
 					recovering: false,
 					oocLocked: false,
 					oocLockReason: null,
@@ -1768,6 +1791,8 @@ export default define({
 			if (sent) {
 				w.lastProdText = text
 				w.prodAssistantSnapshot = w.lastAssistantText
+				w.ownPromptTexts.push(text)
+				if (w.ownPromptTexts.length > 10) w.ownPromptTexts.shift()
 			}
 			return sent
 		}
@@ -2466,7 +2491,7 @@ export default define({
 		 * budget each time it announced, and the nudge would never stop.
 		 */
 		function noteInboundUserMessage(sid: string, w: SessionWatch, messages: unknown[]): void {
-			let latest: { id?: string; at?: number } | null = null
+			let latest: { id?: string; at?: number; text?: string } | null = null
 			for (let i = messages.length - 1; i >= 0; i--) {
 				const m = messages[i] as {
 					id?: string
@@ -2474,10 +2499,14 @@ export default define({
 					role?: string
 					time?: { created?: number }
 					info?: { time?: { created?: number }; role?: string }
+					content?: Array<{ type?: string; text?: string }>
 				}
 				const isUser = m?.type === "user" || m?.role === "user" || m?.info?.role === "user"
 				if (!isUser) continue
-				latest = { id: typeof m.id === "string" ? m.id : undefined, at: m.time?.created ?? m.info?.time?.created }
+				const text = Array.isArray(m?.content)
+					? m.content.filter((p) => p?.type === "text" && typeof p.text === "string").map((p) => p.text as string).join("\n")
+					: undefined
+				latest = { id: typeof m.id === "string" ? m.id : undefined, at: m.time?.created ?? m.info?.time?.created, text }
 				break
 			}
 			if (!latest) return
@@ -2487,6 +2516,16 @@ export default define({
 			if (!isNew) return
 			w.lastUserMessageID = latest.id
 			if (typeof latest.at === "number") w.lastUserMessageSeenAt = latest.at
+			// Our own injections travel the visible channel as real user messages.
+			// They start a new turn but carry no new instructions: re-arming on
+			// them clears the budgets just spent and the same errors refire on
+			// the next idle (ses_ef81e8561ffeXyx3jAzKl5lltv, 2026-10-04 — four
+			// identical unknown-tool prompts, each "2x"). Tracking above stays
+			// truthful; only the clearing is skipped.
+			if (typeof latest.text === "string" && latest.text.length > 0 && w.ownPromptTexts.includes(latest.text)) {
+				dbg(`${short(sid)} newest user message is our own prompt — not re-arming budgets`)
+				return
+			}
 			if (w.doneClaimAttempts > 0 || w.doneClaimOpenTodosAttempts > 0) {
 				dbg(`${short(sid)} new user message — re-arming the done-claim budgets`)
 			}
@@ -2579,7 +2618,7 @@ export default define({
 						const count = (w.unknownToolErrors.get(toolName) ?? 0) + 1
 						w.unknownToolErrors.set(toolName, count)
 						if (count < UNKNOWN_TOOL_THRESHOLD) continue
-						const suggestion = suggestClosestTool(toolName, available)
+						const suggestion = resolveToolSuggestion(toolName, available)
 						const toolList = available.slice(0, UNKNOWN_TOOL_LIST_LIMIT).join(", ")
 						const prompt = suggestion
 							? `You tried to use the tool "${toolName}" ${count} times, but it does not exist. ` +

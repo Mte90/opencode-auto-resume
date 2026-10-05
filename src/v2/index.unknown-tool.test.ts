@@ -264,6 +264,60 @@ describe("v2: naming a replacement for a tool that does not exist", () => {
 		expect(suggestions(h)[1].text).toContain('"globb"')
 		await teardown(h)
 	})
+
+	test("our own suggestion is not a new request and does not re-arm", async () => {
+		// ses_ef81e8561ffeXyx3jAzKl5lltv 2026-10-04: the visible channel posts
+		// our suggestion as a real user message with a new id. The next idle
+		// read it as new instructions, cleared the error map, the latch and
+		// the examined-parts set, recounted the SAME parts back to threshold,
+		// and suggested again — four identical "(none)" prompts, each "2x".
+		const tools = [{ id: "read" }, { id: "shell" }, { id: "glob" }]
+		const h = await setup({
+			history: [userMessage("go", OLD), assistantWith(toolPart("call_1", "bash")), assistantWith(toolPart("call_2", "bash"))],
+			tools,
+		})
+		await goIdle(h)
+		expect(suggestions(h)).toHaveLength(1)
+		const own = suggestions(h)[0]
+		h.history.push({
+			type: "user",
+			id: "msg_own_suggestion",
+			time: { created: OLD + 3_000 },
+			content: [{ type: "text", text: own.text }],
+		})
+		await goIdle(h)
+		expect(suggestions(h)).toHaveLength(1)
+		await teardown(h)
+	})
+
+	test("a v1 tool name maps to its v2 rename instead of (none)", async () => {
+		// "bash" is edit-distance 4 from "shell" against a threshold of 2, so
+		// the fuzzy matcher can never bridge it. A static alias tried first can.
+		const h = await setup({
+			history: [userMessage("go", OLD), assistantWith(toolPart("call_1", "bash")), assistantWith(toolPart("call_2", "bash"))],
+			tools: [{ id: "read" }, { id: "shell" }, { id: "glob" }],
+		})
+		await goIdle(h)
+		const said = suggestions(h)
+		expect(said).toHaveLength(1)
+		expect(said[0].text).toContain('The closest matching tool is "shell"')
+		await teardown(h)
+	})
+
+	test("CONTROL: an alias whose target is not registered falls back to the list", async () => {
+		// The alias must never name a tool that does not exist: a wrong guess
+		// costs a second failure round and teaches the model the registry lies.
+		const h = await setup({
+			history: [userMessage("go", OLD), assistantWith(toolPart("call_1", "bash")), assistantWith(toolPart("call_2", "bash"))],
+			tools: [{ id: "read" }, { id: "write" }, { id: "glob" }],
+		})
+		await goIdle(h)
+		const said = suggestions(h)
+		expect(said).toHaveLength(1)
+		expect(said[0].text).toContain("Please check the available tools")
+		expect(said[0].text).not.toContain("The closest matching tool is")
+		await teardown(h)
+	})
 })
 
 describe("v2: what the unknown-tool check ignores", () => {
