@@ -365,6 +365,12 @@ export interface AutoResumeOptions {
 	 * until a genuine user turn. Default spans ~12h for overnight coverage.
 	 */
 	rateLimitCooldownsMs?: number[]
+	/**
+	 * Inert delivery probe. Never affects behaviour; echoed in the `ready`
+	 * line so a config-options change can be verified without touching a
+	 * live knob. Bump the value to test delivery.
+	 */
+	configProbe?: string | number
 }
 
 // ---------------------------------------------------------------------------
@@ -1257,6 +1263,9 @@ export default define({
 			opts.rateLimitCooldownsMs.every((n) => typeof n === "number" && n > 0)
 				? (opts.rateLimitCooldownsMs as number[])
 				: DEFAULT_RATE_LIMIT_COOLDOWNS_MS
+		// Inert probe: proves `plugins[].options` reaches `ctx.options` without
+		// touching a live knob. Echoed in the `ready` line only.
+		const configProbe = opts.configProbe ?? null
 		// How long a parent may sit busy after its last subagent went idle before
 		// the orphan watch acts. v1 default, honoured for the first time here.
 		const subagentWaitMs = opts.subagentWaitMs ?? DEFAULT_SUBAGENT_WAIT_MS
@@ -1373,6 +1382,7 @@ export default define({
 			"doneWithoutWorkPrompt",
 			"logFile",
 			"rateLimitCooldownsMs",
+			"configProbe",
 		])
 		const unknownOptions = Object.keys(opts).filter((key) => !RECOGNISED_OPTIONS.has(key))
 		if (unknownOptions.length > 0) {
@@ -4221,7 +4231,7 @@ export default define({
 
 		log(
 			"info",
-			`ready (opencode v2). timeout=${chunkTimeoutMs}ms interval=${checkIntervalMs}ms retries=${maxRetries} loop=${loopMaxContinues}/${loopWindowMs / 1000}s warmup=${warmupMs}ms stall=${busyStallStrategy} visibleContinue=${visibleContinue} mod=${MODULE_INSTANCE}` +
+			`ready (opencode v2). timeout=${chunkTimeoutMs}ms interval=${checkIntervalMs}ms retries=${maxRetries} loop=${loopMaxContinues}/${loopWindowMs / 1000}s warmup=${warmupMs}ms stall=${busyStallStrategy} visibleContinue=${visibleContinue} probe=${configProbe ?? "-"} mod=${MODULE_INSTANCE}` +
 				(gatedInUse.length > 0 ? ` accepted-but-inert=${gatedInUse.join(",")}` : ""),
 		)
 
