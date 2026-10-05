@@ -132,8 +132,14 @@ async function replay(
 }
 
 describe("v2: stall-continue channel", () => {
-	test("CONTROL: default channel is hidden synthetic", async () => {
+	test("CONTROL: default channel is the visible prompt", async () => {
 		const { injected } = await replay(busyStallEvents, { maxRetries: 1 })
+		expect(injected.length).toBeGreaterThan(0)
+		expect(injected.every((i) => i.kind === "prompt")).toBe(true)
+	})
+
+	test("visibleContinue:false restores hidden synthetic", async () => {
+		const { injected } = await replay(busyStallEvents, { maxRetries: 1, visibleContinue: false })
 		expect(injected.length).toBeGreaterThan(0)
 		expect(injected.every((i) => i.kind === "synthetic")).toBe(true)
 	})
@@ -150,6 +156,17 @@ describe("v2: stall-continue channel", () => {
 			const { injected } = await replay(busyStallEvents, { maxRetries: 1 })
 			expect(injected.length).toBeGreaterThan(0)
 			expect(injected.every((i) => i.kind === "prompt")).toBe(true)
+		} finally {
+			delete process.env.AUTO_RESUME_VISIBLE_CONTINUE
+		}
+	})
+
+	test("AUTO_RESUME_VISIBLE_CONTINUE=0 opts back out to hidden", async () => {
+		process.env.AUTO_RESUME_VISIBLE_CONTINUE = "0"
+		try {
+			const { injected } = await replay(busyStallEvents, { maxRetries: 1 })
+			expect(injected.length).toBeGreaterThan(0)
+			expect(injected.every((i) => i.kind === "synthetic")).toBe(true)
 		} finally {
 			delete process.env.AUTO_RESUME_VISIBLE_CONTINUE
 		}

@@ -292,12 +292,14 @@ export interface AutoResumeOptions {
 	/**
 	 * When true, a stall continue is sent via `ctx.session.prompt()` — a real
 	 * user message visible in session history (cattleprod-style) — instead of
-	 * the hidden `ctx.session.synthetic({resume:true})`. Default false: same
-	 * channel as before. Env fallback `AUTO_RESUME_VISIBLE_CONTINUE=1` (the
-	 * `opencode.jsonc` `plugin` array has no options slot on this box, so env
-	 * via the top-level `env` block is the live knob). Checks that decide
-	 * nothing stay silent either way; only the action-driving continue
-	 * becomes visible.
+	 * the hidden `ctx.session.synthetic({resume:true})`. Default true: the
+	 * intervention — and any loop — is self-evident in the transcript, which
+	 * is the point. Set false for the old hidden channel. Explicit option
+	 * wins; else `AUTO_RESUME_VISIBLE_CONTINUE` (`1`/`true`/`yes` = visible,
+	 * anything else set = hidden) wins over the default. (Options set via
+	 * the config `plugin` entry are dropped by this box's parser and the
+	 * top-level `env` block never reaches the plugin process, so code
+	 * default is the only live knob.)
 	 */
 	visibleContinue?: boolean
 	/**
@@ -1242,9 +1244,12 @@ export default define({
 		const debug = opts.debug ?? DEFAULT_DEBUG
 		const activeUserWindowMs = opts.activeUserWindowMs ?? DEFAULT_ACTIVE_USER_WINDOW_MS
 		const injectIntervalMs = opts.injectIntervalMs ?? DEFAULT_INJECT_INTERVAL_MS
+		const envVisible = process.env.AUTO_RESUME_VISIBLE_CONTINUE
 		const visibleContinue =
 			opts.visibleContinue ??
-			/^(1|true|yes)$/i.test(process.env.AUTO_RESUME_VISIBLE_CONTINUE ?? "")
+			(envVisible === undefined || envVisible === ""
+				? true
+				: /^(1|true|yes)$/i.test(envVisible))
 		const richContinuePrompt = opts.richContinuePrompt ?? true
 		const logFile = opts.logFile ?? process.env.AUTO_RESUME_LOG_FILE ?? DEFAULT_LOG_FILE
 		const rateLimitCooldownsMs =
