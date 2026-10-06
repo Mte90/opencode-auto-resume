@@ -1931,6 +1931,10 @@ export default define({
 			allowDuringSelfAbort: boolean,
 			checkDuplicate: boolean,
 		): Promise<boolean> {
+			// Dead instances stay silent across every injection path, not
+			// just the stall timer that schedules most of them. Checked
+			// before ensureWatch so a dead copy cannot resurrect watch state.
+			if (!running) return false
 			const w = ensureWatch(sid)
 			// A subagent is not ours to recover. Checked first, before every other
 			// guard, so no code path below can reach a child.
@@ -2094,6 +2098,10 @@ export default define({
 					dbg(`${short(sid)} prompt threw but the text is already the newest user message — treating as delivered`)
 					return true
 				}
+				// Dead instances stay silent: a superseded setup's in-flight
+				// send may reject after disposal — the live instance owns the
+				// session now, and any fallback from here would double-send.
+				if (!running) return false
 				}
 			}
 			try {
@@ -2107,6 +2115,7 @@ export default define({
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : String(err)
 				log("warn", `${short(sid)} synthetic failed: ${msg}`)
+				if (!running) return false
 				// Same verify-before-retry: a delivered synthetic also acts as
 				// a user turn, so it reads back through the same log check.
 				if (await recentOwnProdInLog(sid, text)) {
@@ -2157,8 +2166,11 @@ export default define({
 				const msg = err instanceof Error ? err.message : String(err)
 				log("warn", `${short(sid)} interrupt failed: ${msg}`)
 			}
-			// Give the runtime a beat to settle the interrupted turn
+			// Give the runtime a beat to settle the interrupted turn.
+			// A superseded setup must not resume after this gap: liveness is
+			// re-checked because disposal can land mid-sleep.
 			await new Promise((r) => setTimeout(r, 2_000))
+			if (!running) return false
 			w.aborting = false
 			w.resumeAttempts = 0
 			// Deliberately does not recordContinue(): our own escalation must not feed
@@ -3367,6 +3379,7 @@ export default define({
 		 * killing the parent and its whole turn.
 		 */
 		async function recoverStuckSubagent(sid: string): Promise<boolean> {
+			if (!running) return false
 			try {
 				await callSessionApi("synthetic", { sessionID: sid, text: SUBAGENT_RECOVERY_PROMPT })
 				log("info", `${short(sid)} recovery prompt sent to stuck subagent`)

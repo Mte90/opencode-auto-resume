@@ -158,7 +158,59 @@ async function makeBusyStalled(h: any) {
 	await wait(900)
 }
 
-describe("v2: a send that throws after delivering sends nothing more", () => {
+describe("v2: a disposed instance sends nothing more", () => {
+	test("prompt rejects post-dispose: no synthetic fallback", async () => {
+		// The twin mechanism: timer fired and the prompt await is in flight
+		// when a newer setup disposes this one. The rejection must not
+		// trigger the fallback send — the live instance owns the session now.
+		let releasePrompt!: (err: unknown) => void
+		const promptGate = new Promise<never>((_, reject) => {
+			releasePrompt = reject
+		})
+		const sent: string[] = []
+		const now = Date.now()
+		const stream = makeEventStream()
+		const logFile = join(tmpdir(), `auto-resume-disposed-${process.pid}-${counter++}.log`)
+		rmSync(logFile, { force: true })
+		const ctx: any = {
+			event: stream,
+			options: { ...OPTIONS, logFile, maxRetries: 1 },
+			session: {
+				context: async () => [
+					{ type: "assistant", time: { created: now - 5_000 }, content: [{ type: "text", text: "working" }] },
+				],
+				active: async () => ({ [SID]: {} }),
+				interrupt: async () => ({}),
+				synthetic: async (a: any) => (sent.push(`synthetic:${a?.text}`), {}),
+				prompt: async (a: any) => {
+					sent.push(`prompt:${a?.text}`)
+					await promptGate
+					return {}
+				},
+			},
+			client: {
+				session: {
+					get: async ({ path }: any) => ({ data: { id: path?.id } }),
+					list: async () => ({ data: [] }),
+					message: { list: async () => [] },
+				},
+			},
+			storage: { get: async () => ({ todos: [] }), set: async () => {}, remove: async () => {} },
+			tool: { transform: async (cb: any) => (cb({ add: () => {} }), { dispose() {} }), list: async () => [] },
+		}
+		const cleanup = await (plugin as any).setup(ctx)
+		await wait(60)
+		stream.push({ type: "session.execution.started", data: { sessionID: SID } })
+		await wait(10)
+		stream.push({ type: "session.step.started", data: { sessionID: SID } })
+		await wait(700)
+		;(cleanup as () => void)()
+		releasePrompt(new Error("transport blew up"))
+		await wait(300)
+		expect(sent.filter((s) => s.startsWith("synthetic:"))).toHaveLength(0)
+		rmSync(logFile, { force: true })
+	})
+
 	test("prompt delivers-then-throws: no synthetic fallback", async () => {
 		const now = Date.now()
 		const h = await setup({
