@@ -75,7 +75,13 @@ const assistantAt = (at: number) => ({
 
 type History = Record<string, unknown[]>
 
-async function setup(opts: { history?: History; active?: string[] }): Promise<any> {
+async function setup(opts: {
+	history?: History
+	/** Session ids the server reports busy. */
+	active?: string[]
+	/** Rows `session.list` returns. Defaults to parent + one linked child. */
+	listRows?: Array<{ id: string; parentID?: string }>
+}): Promise<any> {
 	const injected: Array<{ sid?: string; text?: string }> = []
 	const interrupted: string[] = []
 	const stream = makeEventStream()
@@ -84,7 +90,7 @@ async function setup(opts: { history?: History; active?: string[] }): Promise<an
 
 	const history: History = opts.history ?? {}
 	const active = new Set(opts.active ?? [])
-	const rows = [{ id: SID }, { id: CHILD, parentID: SID }]
+	const rows = opts.listRows ?? [{ id: SID }, { id: CHILD, parentID: SID }]
 
 	const ctx: any = {
 		event: stream,
@@ -167,15 +173,14 @@ describe("v2: busy-stall skips a parent waiting on a live subagent", () => {
 
 	test("CONTROL: a truly stalled parent with no live children still recovers", async () => {
 		// No children at all on the parentID link — ordinary stall, must fire.
+		// (A merely-quiet child now reads as waiting, not dead, so the link
+		// itself must be absent for this control.)
 		const now = Date.now()
 		const h = await setup({
 			active: [SID],
+			listRows: [{ id: SID }],
 			history: { [SID]: [userMessage("go", now - 60_000)] },
 		})
-		// NOTE: default rows still link CHILD to SID; override by pushing the
-		// child stale AND out of the active set is covered by the next test.
-		// Here we keep the link but the child is long dead.
-		h.history[CHILD] = [assistantAt(now - 10 * 60_000)]
 		await makeBusy(h, SID)
 		await wait(900)
 		expect(parentInjects(h).length).toBeGreaterThan(0)
