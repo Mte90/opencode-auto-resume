@@ -212,6 +212,11 @@ interface SessionWatch {
 	 * it rather than stack a second judgement on the same turn, and so a new turn
 	 * can cancel it. */
 	toolTextTimer: ReturnType<typeof setTimeout> | null
+	/** The pending deferred stall-recovery inject, if any. Held so dispose
+	 * can cancel it: without this, a reloaded-away instance fires its
+	 * backoff timer after disposal and injects from a dead sessions map
+	 * (observed 2026-10-06: twin identical prods 5ms apart). */
+	recoverTimer: ReturnType<typeof setTimeout> | null
 	/** Tool calls started but not finished, tracked from the tool lifecycle events.
 	 * The orphan watch must never abort a session that is legitimately working. */
 	pendingTools: number
@@ -1498,6 +1503,7 @@ export default define({
 					orphanWatchStartAt: null,
 					orphanRecoveryTried: false,
 					toolTextTimer: null,
+					recoverTimer: null,
 					lastSubagentCheckAt: 0,
 					pendingTools: 0,
 					toolsInFlightAtIdle: 0,
@@ -1707,6 +1713,39 @@ export default define({
 		}
 
 		/**
+		 * Loopback session list with parentID rows. `ctx` offers no list/get/
+		 * active surface and no client in production (verified 2026-10-06:
+		 * every subagent check silently degraded to false, zero refusals in
+		 * log history) — but `GET /api/session` answers with parentID rows
+		 * under the same auth as the message reads. Short-TTL cache: verdicts
+		 * and guards call this several times per watchdog pass. Fail-open
+		 * toward the pre-guard behavior (empty) on any fetch problem.
+		 */
+		type SessionRow = { id?: unknown; parentID?: unknown }
+		let sessionRowsCache: { at: number; rows: SessionRow[] } | null = null
+		const SESSION_ROWS_TTL_MS = 10_000
+		async function listSessionsHttp(): Promise<SessionRow[]> {
+			const now = Date.now()
+			if (sessionRowsCache && now - sessionRowsCache.at < SESSION_ROWS_TTL_MS) return sessionRowsCache.rows
+			for (const base of serverBaseUrls()) {
+				try {
+					const res = await fetch(`${base}/api/session?limit=500`, { headers: serverHeaders() })
+					if (!res.ok) continue
+					const body = (await res.json()) as unknown
+					const data = (body as { data?: unknown } | undefined)?.data ?? body
+					if (Array.isArray(data)) {
+						const rows = (data as SessionRow[]).filter((r) => r !== null && typeof r === "object")
+						sessionRowsCache = { at: now, rows }
+						return rows
+					}
+				} catch {
+					// Next base; exhaustion degrades to stale/empty below.
+				}
+			}
+			return sessionRowsCache?.rows ?? []
+		}
+
+		/**
 		 * Is this session itself a subagent? Definitive test: ask the server for
 		 * our own record and look at `parentID`.
 		 *
@@ -1735,6 +1774,17 @@ export default define({
 				sub = !!res?.data?.parentID
 			} catch {
 				sub = false
+			}
+			if (!sub) {
+				// HTTP fallback: prod ctx has no client (verified 2026-10-06),
+				// so the lookup above always misses there. Same degraded-false
+				// contract on any fetch problem.
+				try {
+					const rows = await listSessionsHttp()
+					sub = rows.some((r) => r?.id === sid && typeof r?.parentID === "string")
+				} catch {
+					sub = false
+				}
 			}
 			w.isSubAgent = sub
 			return sub
@@ -2182,7 +2232,13 @@ export default define({
 				"info",
 				`${short(sid)} stall detected (${reason}) — resume attempt ${attempt}/${maxRetries} in ${delay}ms`,
 			)
-			setTimeout(async () => {
+			if (w.recoverTimer) clearTimeout(w.recoverTimer)
+			w.recoverTimer = setTimeout(async () => {
+				w.recoverTimer = null
+				// Disposed instances must stay silent: a superseded setup's
+				// backoff outlives its own dispose (which is exactly how twin
+				// identical prods landed milliseconds apart).
+				if (!running) return
 				try {
 					// Skip only if the session genuinely turned healthy again
 					// (a normal completion clears pendingRecoveryArmed) or the
@@ -3170,6 +3226,18 @@ export default define({
 				if (sid === parentSid) continue
 				if ((row as { parentID?: unknown }).parentID !== parentSid) continue
 				out.push(sid)
+			}
+			if (out.length === 0) {
+				// HTTP fallback: prod ctx has no list surface, so the call
+				// above always misses there (verified 2026-10-06). Same
+				// client-side verification as above.
+				for (const row of await listSessionsHttp()) {
+					const sid = row?.id
+					if (typeof sid !== "string" || !sid.startsWith("ses_")) continue
+					if (sid === parentSid) continue
+					if (row?.parentID !== parentSid) continue
+					out.push(sid)
+				}
 			}
 			return out
 		}
@@ -4287,6 +4355,8 @@ export default define({
 			for (const w of sessions.values()) {
 				if (w.toolTextTimer) clearTimeout(w.toolTextTimer)
 				w.toolTextTimer = null
+				if (w.recoverTimer) clearTimeout(w.recoverTimer)
+				w.recoverTimer = null
 			}
 			sessions.clear()
 			// Only clear the registry slot if it is still OURS: a later setup may
