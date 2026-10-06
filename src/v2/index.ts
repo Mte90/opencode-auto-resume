@@ -340,6 +340,8 @@ export interface AutoResumeOptions {
 	toolTextCheckDelayMs?: number
 	/** Wait for a subagent to report before treating it as stalled. */
 	subagentWaitMs?: number
+	/** Outer bound: quiet past this with no error evidence reads as dead. */
+	subagentDeadMs?: number
 	/** Token floor for the silent-dead-stream heuristic. */
 	silentDeadStreamMinTokens?: number
 	/** Error names that mark a streaming failure. */
@@ -467,6 +469,12 @@ const DEFAULT_SUBAGENT_WAIT_MS = 15_000
  * as stuck. v1 used the same number, and a tool call still outstanding triples
  * it, because a long tool is not a hung model. */
 const SUBAGENT_STUCK_MS = 60_000
+/** Outer bound: quiet past this with no error evidence reads as dead, not
+ * merely stuck. Between the stuck window and this bound a quiet child is
+ * waited on — a hung model must not sit forever, but a long-thinking one
+ * (coder blocks run many minutes on one shared GPU) must not read as
+ * crashed at 60s either. ses_ef1c822c 2026-10-06. */
+const DEFAULT_SUBAGENT_DEAD_MS = 30 * 60_000
 const SUBAGENT_RECOVERY_PROMPT =
 	"It looks like you may have stalled or timed out. Please retry the last operation or continue with the task."
 const DEFAULT_SILENT_DEAD_STREAM_MIN_TOKENS = 200
@@ -1274,6 +1282,7 @@ export default define({
 		// How long a parent may sit busy after its last subagent went idle before
 		// the orphan watch acts. v1 default, honoured for the first time here.
 		const subagentWaitMs = opts.subagentWaitMs ?? DEFAULT_SUBAGENT_WAIT_MS
+		const subagentDeadMs = opts.subagentDeadMs ?? DEFAULT_SUBAGENT_DEAD_MS
 		// How long to let a finished turn's text settle before judging it against the
 		// done/tool patterns. v1's default, and the reason v1 does not judge on idle
 		// at all — see inspectOnIdle.
@@ -1377,6 +1386,7 @@ export default define({
 			"minActivityGapMs",
 			"toolTextCheckDelayMs",
 			"subagentWaitMs",
+			"subagentDeadMs",
 			"silentDeadStreamMinTokens",
 			"streamingFailureErrorNames",
 			"streamingFailureMessagePatterns",
@@ -3256,7 +3266,7 @@ export default define({
 			return out
 		}
 
-		type SubagentVerdict = { status: "crashed" | "idle" | "busy"; stuckSid?: string }
+		type SubagentVerdict = { status: "crashed" | "idle" | "busy" | "waiting"; stuckSid?: string }
 
 		/**
 		 * What a parent's subagents are doing, in v1's three-way shape.
@@ -3286,6 +3296,7 @@ export default define({
 				if (children.length === 0) return { status: "idle" }
 				const now = Date.now()
 				let sawBusy = false
+				let sawWaiting: string | null = null
 				for (const child of children) {
 					const messages = await loadMessages(child)
 					const last = messages[messages.length - 1] as
@@ -3307,9 +3318,23 @@ export default define({
 						(p) => p?.type === "tool" && p.state?.status !== "completed" && p.state?.status !== "error",
 					)
 					const limit = hasToolCall ? SUBAGENT_STUCK_MS * 3 : SUBAGENT_STUCK_MS
+					// Outer bound: quiet past the stuck window but inside the dead
+					// window, with no error evidence, is a long thinker — waited
+					// on, not killed. Only past-dead quiet reads as crashed, so
+					// a hung model still terminates (bounded wait, ses_ef1c822c).
+					// Error evidence above already returned; scan on so a later
+					// crashed sibling is still surfaced.
+					const deadLimit = hasToolCall ? subagentDeadMs * 3 : subagentDeadMs
 					if (silentFor <= limit) {
 						// Recent enough to be believed, whatever the server thinks.
 						if (activeIDs.has(child)) sawBusy = true
+						continue
+					}
+					if (silentFor <= deadLimit) {
+						dbg(
+							`subagent ${short(child)} quiet for ${Math.round(silentFor / 1000)}s, inside ${Math.round(deadLimit / 1000)}s patience — waiting, not crashed (active=${activeIDs.has(child)})`,
+						)
+						if (sawWaiting === null) sawWaiting = child
 						continue
 					}
 					dbg(
@@ -3317,7 +3342,9 @@ export default define({
 					)
 					return { status: "crashed", stuckSid: child }
 				}
-				return sawBusy ? { status: "busy" } : { status: "idle" }
+				if (sawBusy) return { status: "busy" }
+				if (sawWaiting !== null) return { status: "waiting", stuckSid: sawWaiting }
+				return { status: "idle" }
 			} catch (e) {
 				dbg(`subagent check failed for ${short(parentSid)}:`, e instanceof Error ? e.message : String(e))
 				// Unknown is treated as busy: the cost of waiting is a later abort, and
@@ -3440,7 +3467,16 @@ export default define({
 					}
 				}
 				log("info", `${short(sid)} subagent crashed and did not recover — aborting and resuming the parent`)
+				// Count orphan aborts toward the gaveUp budget (checked at this
+				// function's top): without this the watch cycles forever, because
+				// nothing else increments resumeAttempts on this path.
+				w.resumeAttempts++
 				tryAbortAndResume(sid, w)
+				return
+			}
+			if (verdict.status === "waiting") {
+				dbg(`${short(sid)} subagents quiet but inside patience — waiting, not aborting`)
+				w.orphanWatchStartAt = now
 				return
 			}
 			if (verdict.status === "busy") {
@@ -3456,6 +3492,7 @@ export default define({
 			// 15s, and its name is the warning.
 			log("info", `${short(sid)} stuck with no live subagents — aborting and resuming`)
 			tryAbortAndResume(sid, w)
+			w.resumeAttempts++
 		}
 
 		/**
@@ -3466,14 +3503,15 @@ export default define({
 		 * heuristic below: native dispatches may never emit `session.tool.called`,
 		 * and the server active set may lag the parentID link.
 		 *
-		 * Waits when the verdict confirms a live child, or when the parent still
-		 * holds tools in flight against children that are neither confirmed live
-		 * nor proven dead. A crashed verdict, or tools held with no children on
-		 * the link at all (wedged bare tool), falls through to normal recovery.
+		 * Waits when the verdict confirms a live child or a quiet one inside
+		 * the patience window, or when the parent still holds tools in flight
+		 * against children that are neither confirmed live nor proven dead.
+		 * A crashed verdict, or tools held with no children on the link at
+		 * all (wedged bare tool), falls through to normal recovery.
 		 */
 		async function parentWaitingOnSubagents(sid: string, activeIDs: Set<string>): Promise<boolean> {
 			const verdict = await subagentVerdict(sid, activeIDs)
-			if (verdict.status === "busy") return true
+			if (verdict.status === "busy" || verdict.status === "waiting") return true
 			if (verdict.status !== "idle") return false
 			const w = ensureWatch(sid)
 			if (w.pendingTools <= 0) return false

@@ -496,6 +496,7 @@ Defaults are the same on v1 and v2 unless a row says otherwise.
 | `baseBackoffMs` | `1000` | First retry delay (doubles each attempt) |
 | `maxBackoffMs` | `8000` | Backoff cap |
 | `subagentWaitMs` | `15000` | Wait before treating orphan parent as stuck |
+| `subagentDeadMs` | `1800000` | Outer bound: quiet past this with no error evidence reads as dead (v2 only). Inside it, a quiet child is waited on, not aborted — 30 min default for long-thinking models |
 | `loopMaxContinues` | `3` | Continues in window before triggering abort |
 | `loopWindowMs` | `600000` | Hallucination loop detection window (10 min) |
 | `streamingFailureErrorNames` | `["ProviderError","APIError","StreamError","ConnectionError","TimeoutError"]` | Error names that classify as streaming failures (exact match) |

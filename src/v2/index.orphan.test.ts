@@ -170,6 +170,9 @@ async function childGoesBusyThenIdle(h: any) {
 }
 
 const A_LONG_WAY_AGO = Date.now() - 10 * 60_000
+// Past the 30m dead window: quiet this long with no error reads as crashed,
+// while A_LONG_WAY_AGO (10m) now reads as waiting. Crashed-path tests use this.
+const PAST_DEAD = Date.now() - 40 * 60_000
 
 describe("v2: the orphan watch arms when a parent's subagents fall quiet", () => {
 	test("CONTROL: nothing is armed while only the parent is busy", async () => {
@@ -272,7 +275,7 @@ describe("v2: the orphan watch arms when a parent's subagents fall quiet", () =>
 			active: [SID, CHILD],
 			history: {
 				[SID]: [userMessage("go", A_LONG_WAY_AGO)],
-				[CHILD]: [assistantAt(A_LONG_WAY_AGO)],
+				[CHILD]: [assistantAt(PAST_DEAD)],
 			},
 		})
 		await makeBusy(h, SID)
@@ -313,7 +316,7 @@ describe("v2: the orphan watch refuses to kill a working parent", () => {
 			active: [SID, CHILD],
 			history: {
 				[SID]: [userMessage("go", A_LONG_WAY_AGO)],
-				[CHILD]: [assistantAt(A_LONG_WAY_AGO)],
+				[CHILD]: [assistantAt(PAST_DEAD)],
 			},
 		})
 		await makeBusy(h, SID)
@@ -336,7 +339,7 @@ describe("v2: the orphan watch refuses to kill a working parent", () => {
 			active: [SID, CHILD],
 			history: {
 				[SID]: [userMessage("go", A_LONG_WAY_AGO)],
-				[CHILD]: [assistantAt(A_LONG_WAY_AGO)],
+				[CHILD]: [assistantAt(PAST_DEAD)],
 			},
 		})
 		await makeBusy(h, SID)
@@ -466,7 +469,7 @@ describe("v2: a dead subagent is woken before the parent is killed", () => {
 			subagentWaitMs: 400,
 			history: {
 				[SID]: [userMessage("go", A_LONG_WAY_AGO)],
-				[CHILD]: [assistantAt(A_LONG_WAY_AGO)],
+				[CHILD]: [assistantAt(PAST_DEAD)],
 			},
 		})
 		await makeBusy(h, SID)
@@ -490,7 +493,7 @@ describe("v2: a dead subagent is woken before the parent is killed", () => {
 			subagentWaitMs: 200,
 			history: {
 				[SID]: [userMessage("go", A_LONG_WAY_AGO)],
-				[CHILD]: [assistantAt(A_LONG_WAY_AGO)],
+				[CHILD]: [assistantAt(PAST_DEAD)],
 			},
 		})
 		await makeBusy(h, SID)
