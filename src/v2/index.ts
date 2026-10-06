@@ -2076,6 +2076,14 @@ export default define({
 				} catch (err) {
 					const msg = err instanceof Error ? err.message : String(err)
 					log("warn", `${short(sid)} visible prompt failed: ${msg}`)
+				// A transport error can land AFTER the message was delivered
+				// (observed: twin identical prods 5ms apart). The delivered
+				// prompt is a user message in the log, so verify before
+				// falling back — a second send of the same text is the dupe.
+				if (await recentOwnProdInLog(sid, text)) {
+					dbg(`${short(sid)} prompt threw but the text is already the newest user message — treating as delivered`)
+					return true
+				}
 				}
 			}
 			try {
@@ -2089,6 +2097,12 @@ export default define({
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : String(err)
 				log("warn", `${short(sid)} synthetic failed: ${msg}`)
+				// Same verify-before-retry: a delivered synthetic also acts as
+				// a user turn, so it reads back through the same log check.
+				if (await recentOwnProdInLog(sid, text)) {
+					dbg(`${short(sid)} synthetic threw but the text is already the newest user message — treating as delivered`)
+					return true
+				}
 				// Last resort: a plain prompt still resumes the session (just
 				// without the visible synthetic notification in the TUI).
 				try {
