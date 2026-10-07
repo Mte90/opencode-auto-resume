@@ -141,6 +141,10 @@ interface SessionWatch {
 	lastActivityAt: number
 	status: "busy" | "idle" | "unknown"
 	userCancelled: boolean
+	/** When the user-cancel latch was set. Re-arm requires an inbound user
+	 * message newer than this — otherwise a pre-interrupt message the plugin
+	 * simply hadn't observed yet would clear a latch it postdates. */
+	userCancelledAt: number
 	resumeAttempts: number
 	lastRetryAt: number
 	gaveUp: boolean
@@ -1481,6 +1485,7 @@ export default define({
 					lastActivityAt: Date.now(),
 					status: "unknown",
 					userCancelled: false,
+					userCancelledAt: 0,
 					resumeAttempts: 0,
 					lastRetryAt: 0,
 					gaveUp: false,
@@ -2303,7 +2308,7 @@ export default define({
 					}
 					// Same re-check for user input: a question asked between
 					// detection and this delayed inject parks the turn.
-					if (isWaitingOnUser(await loadMessages(sid))) {
+					if (isWaitingOnUser(sid, w, await loadMessages(sid))) {
 						dbg(`${short(sid)} waiting on user input at inject time — not interrupting`)
 						return
 					}
@@ -2724,7 +2729,11 @@ export default define({
 		 * on one of those is waiting, not stalled (ses_ef72c5f3 2026-10-05: a
 		 * stall continue fired into a session parked on a `question`).
 		 */
-		function isWaitingOnUser(messages: unknown[]): boolean {
+		function isWaitingOnUser(sid: string, w: SessionWatch, messages: unknown[]): boolean {
+			// A genuine new user message re-arms here too (not just on the
+			// idle path): this is what clears a user-interrupt stand-down
+			// when the user hands the session back.
+			noteInboundUserMessage(sid, w, messages)
 			const newest = messages[messages.length - 1] as {
 				type?: string
 				content?: { type?: string; name?: string; state?: { status?: string } }[]
@@ -2846,6 +2855,17 @@ export default define({
 			}
 			w.doneClaimAttempts = 0
 			w.doneClaimOpenTodosAttempts = 0
+			// A genuine new user message hands the session back: clear a
+			// user-interrupt stand-down (ses_eeb02d4b, 2026-10-07 — the latch
+			// otherwise holds until session cleanup and even an explicit
+			// "continue" is refused). Only a message newer than the latch
+			// itself re-arms: a pre-interrupt message the plugin simply
+			// hadn't observed yet must not clear it. Manual interrupts
+			// themselves are untouched; only future recovery re-arms.
+			if (w.userCancelled && typeof latest.at === "number" && latest.at >= w.userCancelledAt) {
+				dbg(`${short(sid)} new user message after interrupt — re-arming recovery`)
+				w.userCancelled = false
+			}
 			// A new request is new work: the ack self-loop counter starts clean,
 			// because the model re-announcing completion after the user asked for
 			// more is not the stuck case this counts.
@@ -3545,7 +3565,18 @@ export default define({
 			const activeSet = new Set(activeIDs)
 
 			for (const [sid, w] of sessions) {
-				if (w.status !== "busy" || w.userCancelled) continue
+				if (w.status !== "busy" || w.userCancelled) {
+					// A stood-down session still gets its inbound mail read: a
+					// genuine new user message re-arms (clears userCancelled
+					// inside noteInboundUserMessage), so the latch cannot block
+					// its own clearing path. Skipped otherwise.
+					if (w.status === "busy" && w.userCancelled) {
+						noteInboundUserMessage(sid, w, await loadMessages(sid))
+						if (w.userCancelled) continue
+					} else {
+						continue
+					}
+				}
 				// Warmup: a session that only just went busy has not had a chance to
 				// emit anything. Without this a freshly-started turn can be declared
 				// stalled while it is still queueing its first model call.
@@ -3621,7 +3652,7 @@ export default define({
 				// an unanswered permission beyond the event flow) is waiting,
 				// not stalled. Narrower than the idle-path check on purpose: a
 				// wedged bare tool with zero events is still a stall.
-				if (isWaitingOnUser(await loadMessages(sid))) {
+				if (isWaitingOnUser(sid, w, await loadMessages(sid))) {
 					dbg(`${short(sid)} waiting on user input — skipping stall detection`)
 					continue
 				}
@@ -4075,7 +4106,10 @@ export default define({
 				// userCancelled; `shutdown`/`superseded`/`inactivity` must not
 				// permanently disable recovery for the session.
 				const mine = w.aborting || selfAbortActive(w)
-				if (!mine) w.userCancelled = reason === undefined || reason === "user"
+				if (!mine) {
+					w.userCancelled = reason === undefined || reason === "user"
+					if (w.userCancelled) w.userCancelledAt = Date.now()
+				}
 					// A user interrupt also ends any in-flight compaction.
 					w.compacting = false
 					w.compactionStartedAt = null
