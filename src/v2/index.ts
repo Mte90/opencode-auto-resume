@@ -787,6 +787,28 @@ function containsDoneClaimPattern(text: string, patterns: RegExp[] = DONE_CLAIM_
 }
 
 /**
+ * Explicit stop statements: the model stating it is stopping, distinct from
+ * claiming completion. Like celebrations these latch completion when no
+ * todos are open (ses_eec5ba74, 2026-10-07 — "No action needed … Stopping
+ * here" kept collecting nudges after the work was finished). Unlike the
+ * done-claim patterns these carry no completion assertion to challenge,
+ * so an explicit stop wins over the challenge below (ordered before it
+ * 2026-10-07: challenging a stopped true completion nags exactly the
+ * sessions this latch exists to quiet).
+ */
+const STOP_STATEMENT_PATTERNS: RegExp[] = [
+	/no action needed/i,
+	/stopping (here|there)[.!]*$/i,
+	/nothing (further |else )?(to do|left|remaining|needed)[.!]*$/i,
+	/no further action[.!]*$/i,
+]
+function containsStopStatement(text: string): boolean {
+	const lines = text.split("\n")
+	const lastLines = lines.slice(-3).join("\n")
+	return STOP_STATEMENT_PATTERNS.some((pat) => pat.test(lastLines))
+}
+
+/**
  * True when a done-claim already carries a concrete work report.
  *
  * v1 asks for details once per done-claim and then trusts the answer. A length
@@ -2935,6 +2957,11 @@ export default define({
 				// — on a re-armed turn the guard could see the previous turn's latch
 				// still standing and skip the check that was supposed to re-arm it.
 				noteInboundUserMessage(sid, w, messages)
+				// Stop statements latch in the pattern pass, which runs after this
+				// check on the same idle - evaluate the stop here too, from the
+				// just-loaded history, or a turn that ends stopped eats one
+				// unknown-tool nudge first.
+				if (containsStopStatement(w.lastAssistantText || lastAssistantTextFrom(messages))) return false
 				if (w.unknownToolSuggestionSent) return false
 				const available = await getAvailableToolIds()
 				// No registry, or nothing registered: every name would look unknown.
@@ -3191,6 +3218,32 @@ export default define({
 				await targetedRecovery(sid, "action-intent", opts.actionIntentPrompt ?? opts.continuePrompt ?? CONTINUE_PROMPT, "intentNudgeAttempts")
 				return
 			}
+			// An explicit stop latches like a celebration and wins over the
+			// done-claim challenge below: a turn that says it is stopping
+			// with no open todos is finished, not evidence-light. Challenging
+			// it for details would nag exactly the completed sessions this
+			// latch exists to quiet (ses_eec5ba74). Tool-call-as-text and
+			// action-intent above still win: pasted tool calls and declared
+			// next steps are unfinished business even beside stop words.
+			// An explicit stop latches like a celebration: the turn declares the
+			// work over without claiming anything to verify. Open todos still
+			// earn the once-budgeted reminder (a stop with listed work is not a
+			// completion); with nothing open, latch and end the turn quietly.
+			if (containsStopStatement(text)) {
+				const open = getOpenTodos(await readTodos(sid))
+				if (open.length > 0) {
+					await targetedRecovery(sid, "stop-open-todos", buildOpenTodosReminder(open), "todoNudgeAttempts")
+					return
+				}
+				if (!w.completionSignaled) {
+					w.completionSignaled = true
+					log("info", `${short(sid)} turn ends with an explicit stop and no open todos — latching completion, not nudging`)
+				} else {
+					dbg(`${short(sid)} completion already latched — skipping`)
+				}
+				return
+			}
+
 			if (containsDoneClaimPattern(text, doneClaimPatterns)) {
 				// Two different prompts for two different situations, which is why the
 				// budgets are separate: spending the details prompt must not silence the
@@ -3589,6 +3642,15 @@ export default define({
 					if (!w.aborting && !w.gaveUp && !w.completionSignaled) {
 						await runOrphanWatch(sid, w, now, activeSet)
 					}
+					continue
+				}
+				// A latched completion stands down the stall path too: the session
+				// declared itself done (task_complete tool, celebration, or an
+				// explicit stop) and no fresh turn has cleared the latch in
+				// markBusy since. Nudging a completed quiet session is the nagging
+				// this exists to prevent; a new turn re-arms by clearing the latch.
+				if (w.completionSignaled) {
+					dbg(`${short(sid)} completion latched — skipping stall detection`)
 					continue
 				}
 				// Stale compaction flag: a compaction that never reports
