@@ -527,6 +527,7 @@ Defaults are the same on v1 and v2 unless a row says otherwise.
 | `logFile` | v2 only | Where this build appends its log. v2 removed v1's server log endpoint, so without this the plugin is silent. Defaults to `~/.local/state/opencode-v2/auto-resume.log` |
 | `configProbe` | v2 only, inert | Delivery probe: echoed as `probe=<value>` in the `ready` startup line and read nowhere else. Bump the token to prove `plugins[].options` reaches the plugin without touching a live knob |
 | `rateLimitCooldownsMs` | v2 only | Per-attempt cooldowns (ms) before a rate-limited session may be retried, evaluated as gates on each failure and watchdog tick (no armed timers to lose on reload). Default `[900000, 1800000, 3600000, 7200000 ×5]` ≈ 12h coverage; past the ladder the session stays silent until a genuine user turn. Quota hits never consume the normal retry budget |
+| `sendTimeoutMs` | `30000` | Bound (ms) on any single recovery send (prompt/synthetic); expiry flows into the normal throw path instead of stacking wedged sends |
 
 Message patterns are matched case-insensitively. Error names use exact match.
 

@@ -376,6 +376,8 @@ export interface AutoResumeOptions {
 	 * until a genuine user turn. Default spans ~12h for overnight coverage.
 	 */
 	rateLimitCooldownsMs?: number[]
+	/** Bound (ms) on any single recovery send; see DEFAULT_SEND_TIMEOUT_MS. */
+	sendTimeoutMs?: number
 	/**
 	 * Inert delivery probe. Never affects behaviour; echoed in the `ready`
 	 * line so a config-options change can be verified without touching a
@@ -563,6 +565,14 @@ const RATE_LIMIT_RE = /rate limit exceeded|too many requests|\b429\b|quota excee
  * 30m, 1h, then 2h out to ~12h of unattended coverage. Past the ladder the
  * session stays silent until a genuine user turn. */
 const DEFAULT_RATE_LIMIT_COOLDOWNS_MS = [15, 30, 60, 120, 120, 120, 120, 120].map((m) => m * 60_000)
+/** Bound on any single recovery send (prompt/synthetic). A transport
+ * await that never settles stacks cascades that flush together as twins
+ * (ses_ee7dade1, 2026-10-07: two texts 5ms apart, one wedged minutes).
+ * Expiry flows into the normal throw path (log verify + fallback). */
+const DEFAULT_SEND_TIMEOUT_MS = 30_000
+/** Above this, a completed send logs a latency warning for forensics. */
+const SEND_SLOW_MS = 10_000
+
 
 /**
  * Window after `session.interrupt()` during which any abort-shaped event is
@@ -1302,6 +1312,7 @@ export default define({
 			opts.rateLimitCooldownsMs.every((n) => typeof n === "number" && n > 0)
 				? (opts.rateLimitCooldownsMs as number[])
 				: DEFAULT_RATE_LIMIT_COOLDOWNS_MS
+		const sendTimeoutMs = opts.sendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS
 		// Inert probe: proves `plugins[].options` reaches `ctx.options` without
 		// touching a live knob. Echoed in the `ready` line only.
 		const configProbe = opts.configProbe ?? null
@@ -1423,6 +1434,7 @@ export default define({
 			"doneWithoutWorkPrompt",
 			"logFile",
 			"rateLimitCooldownsMs",
+			"sendTimeoutMs",
 			"configProbe",
 		])
 		const unknownOptions = Object.keys(opts).filter((key) => !RECOGNISED_OPTIONS.has(key))
@@ -2105,6 +2117,32 @@ export default define({
 		 * When `resume` is true the synthetic also acts as a user turn that
 		 * kicks the session back to life, replacing the separate `prompt()`.
 		 */
+		/**
+		 * Bound a recovery send. Transport awaits with no deadline stack
+		 * cascades that flush together as twin prods (ses_ee7dade1) — bound
+		 * them so expiry flows into the normal throw path instead. Slow
+		 * completions log a latency warning; that timing is the forensics
+		 * the twins lacked.
+		 */
+		async function sendBound(label: string, sid: string, send: () => Promise<unknown>): Promise<void> {
+			const started = Date.now()
+			let timer: ReturnType<typeof setTimeout> | undefined
+			try {
+				await Promise.race([
+					send(),
+					new Promise<never>((_, reject) => {
+						timer = setTimeout(() => reject(new Error(`${label} timed out after ${sendTimeoutMs}ms`)), sendTimeoutMs)
+					}),
+				])
+			} finally {
+				if (timer !== undefined) clearTimeout(timer)
+			}
+			const elapsed = Date.now() - started
+			if (elapsed > SEND_SLOW_MS) {
+				log("warn", `${short(sid)} ${label} took ${Math.round(elapsed / 1000)}s (over ${SEND_SLOW_MS / 1000}s slow threshold)`)
+			}
+		}
+
 		async function notifyAndPrompt(sid: string, text: string, notification: string, resume = true): Promise<boolean> {
 			ensureWatch(sid).selfRecovery = true
 			if (visibleContinue) {
@@ -2112,7 +2150,7 @@ export default define({
 				// intervention — and any loop — is self-evident in the transcript.
 				// Falls back to synthetic only if the prompt call throws.
 				try {
-					await ctx.session.prompt({ sessionID: sid, text })
+					await sendBound("prompt", sid, () => ctx.session.prompt({ sessionID: sid, text }))
 					return true
 				} catch (err) {
 					const msg = err instanceof Error ? err.message : String(err)
@@ -2132,12 +2170,14 @@ export default define({
 				}
 			}
 			try {
-				await ctx.session.synthetic({
+				await sendBound("synthetic", sid, () =>
+					ctx.session.synthetic({
 					sessionID: sid,
 					text,
 					description: `auto-resume: ${notification}`,
 					resume,
-				})
+					}),
+				)
 				return true
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : String(err)
@@ -2152,7 +2192,7 @@ export default define({
 				// Last resort: a plain prompt still resumes the session (just
 				// without the visible synthetic notification in the TUI).
 				try {
-					await ctx.session.prompt({ sessionID: sid, text })
+					await sendBound("prompt", sid, () => ctx.session.prompt({ sessionID: sid, text }))
 					return true
 				} catch {
 					log("error", `${short(sid)} all recovery attempts failed: ${msg}`)
