@@ -160,6 +160,10 @@ interface SessionWatch {
 	/** Last injected prod text + assistant snapshot at prod time, for duplicate suppression. */
 	lastProdText: string
 	prodAssistantSnapshot: string
+	/** Tool/shell completions since the last successful prod. The
+	 * duplicate skip promises 'zero model progress' but text growth
+	 * plus in-flight tools cannot see a tool that ran silently. */
+	completedSinceProd: number
 	/** Texts this plugin injected (visible channel posts them as real user
 	 * messages). `noteInboundUserMessage` must not read them as new user
 	 * instructions, or every injection re-arms the budgets it just spent and
@@ -1530,6 +1534,7 @@ export default define({
 					lastInjectAt: 0,
 					lastProdText: "",
 					prodAssistantSnapshot: "",
+					completedSinceProd: 0,
 					ownPromptTexts: [],
 					recovering: false,
 					oocLocked: false,
@@ -2008,6 +2013,7 @@ export default define({
 				w.lastProdText !== "" &&
 				text === w.lastProdText &&
 				w.pendingTools <= 0 &&
+				w.completedSinceProd === 0 &&
 				w.lastAssistantText === w.prodAssistantSnapshot
 			) {
 				dbg(`${short(sid)} duplicate continue suppressed — identical text, no progress since last prod`)
@@ -2025,6 +2031,7 @@ export default define({
 			const sent = await notifyAndPrompt(sid, text, notification)
 			if (sent) {
 				w.lastProdText = text
+				w.completedSinceProd = 0
 				w.prodAssistantSnapshot = w.lastAssistantText
 				w.ownPromptTexts.push(text)
 				if (w.ownPromptTexts.length > 10) w.ownPromptTexts.shift()
@@ -4409,6 +4416,8 @@ export default define({
 					const sid = openShells.get(id)?.sessionID
 					if (sid === undefined) return
 					openShells.delete(id)
+					const wsh = ensureWatch(sid)
+					wsh.completedSinceProd++
 					touch(sid)
 					return
 				}
@@ -4418,6 +4427,7 @@ export default define({
 					const w = ensureWatch(sid)
 					w.lastWasTaskTool = false
 					w.pendingTools = Math.max(0, w.pendingTools - 1)
+					w.completedSinceProd++
 					touch(sid)
 					return
 				}
@@ -4427,6 +4437,7 @@ export default define({
 					const w = ensureWatch(sid)
 					w.lastWasTaskTool = false
 					w.pendingTools = Math.max(0, w.pendingTools - 1)
+					w.completedSinceProd++
 					touch(sid)
 					return
 				}
