@@ -22,12 +22,15 @@
   "type": "module",
   "main": "dist/index.js",
 "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target bun",
+    "build": "bun run build:v1 && bun run build:v2",
+    "build:v1": "bun build src/index.ts --outdir dist --target bun",
+    "build:v2": "bun build src/v2/index.ts --outfile dist/v2/index.js --target bun",
     "dev": "bun build src/index.ts --outdir dist --target bun --watch",
     "test": "bun test",
     "prepublishOnly": "bun run build"
 },  "files": [
     "dist/index.js",
+    "dist/v2/index.js",
     "README.md",
     "LICENSE"
   ],
