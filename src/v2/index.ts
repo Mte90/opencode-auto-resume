@@ -2328,6 +2328,15 @@ export default define({
 				w.continueTimestamps = []
 				return
 			}
+			// A stall after fresh model output is a NEW episode, not a deeper
+			// one: restart the ladder so it reads attempt 1/3 again
+			// (ses_ee7dade1 — 2/3 landed after real work). Text growth since
+			// our last prod, or tool completions since it, both count. Silent
+			// consecutive prods keep climbing toward gaveUp. gaveUp itself is
+			// left alone: only a fresh turn (markBusy) clears that latch.
+			if (w.lastProdText !== "" && (w.lastAssistantText !== w.prodAssistantSnapshot || w.completedSinceProd > 0)) {
+				w.resumeAttempts = 0
+			}
 			recordContinue(sid)
 			if (w.resumeAttempts >= maxRetries) {
 				log("warn", `${short(sid)} giving up after ${maxRetries} attempts (${reason})`)
