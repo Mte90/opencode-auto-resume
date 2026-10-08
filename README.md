@@ -376,6 +376,19 @@ With options:
 }
 ```
 
+### OpenCode 2.x
+
+OpenCode 2.x loads plugins through the new plugin API (`{ id, setup(context) }`) and
+prefers the `./server` export of an npm package. This package ships a v2 entrypoint
+(`src/server.ts`, exposed as `./server`) that adapts the same v1 recovery engine to the
+v2 API — the `plugin` config above works unchanged on both host versions: OpenCode 2.x
+loads the `./server` export automatically, OpenCode 1.x keeps using the v1 entrypoint.
+
+The adapter bridges the v1 plugin onto the v2 domain API (event subscription, tool
+registration, prompt/tool/command hooks) and translates v2 bus events into the v1 event
+shape. The recovery logic itself is untouched, so both host versions run the exact same
+engine.
+
 ## Configuration
 
 ```json
