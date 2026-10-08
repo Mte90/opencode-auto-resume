@@ -479,6 +479,19 @@ function getOpenTodos(todos: Todo[]): Todo[] {
     return todos.filter(isOpenTodo)
 }
 
+// `stopPatterns` option → RegExp list (invalid patterns are skipped).
+function parseStopPatterns(raw: unknown): RegExp[] {
+    if (!Array.isArray(raw)) return []
+    return raw.map(s => { try { return new RegExp(String(s), "m") } catch { return null } }).filter((r): r is RegExp => r !== null)
+}
+
+// Does an assistant message's visible text match one of the stop patterns?
+function endsWithStopLine(parts: Array<Record<string, unknown>>, patterns: RegExp[]): boolean {
+    if (!patterns.length) return false
+    const text = parts.filter(p => (p.type as string) === "text").map(p => String(p.text ?? "")).join("\n")
+    return patterns.some(re => re.test(text))
+}
+
 function buildOpenTodosReminder(todos: Todo[]): string {
     if (!Array.isArray(todos)) return "continue"
     const open = todos.filter(t => t.status === "pending" || t.status === "in_progress")
@@ -562,6 +575,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         if (!Array.isArray(raw) || raw.length === 0) return READY_TO_CONTINUE_PATTERNS
         return raw.map(s => { try { return new RegExp(s, "i") } catch { return null } }).filter((r): r is RegExp => r !== null)
     })()
+    // Explicit hand-off lines (e.g. "STOP: NEEDS_DECISION ...") that put the ball in the user's court. Default: none.
+    const stopPatterns: RegExp[] = parseStopPatterns(options?.stopPatterns)
     const dbg = (...args: unknown[]) => { if (debug) console.log("[debug]", ...args) }
 
     const sessions = new Map<string, SessionWatch>()
@@ -1044,6 +1059,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             if (rawRole !== "assistant") continue
             const parts = msg.parts as Array<Record<string, unknown>> | undefined
             if (!parts) return false
+            // An explicit stop line (stopPatterns) in the newest assistant message also awaits the user.
+            if (endsWithStopLine(parts, stopPatterns)) return true
             for (const part of parts) {
                 if ((part.type as string) !== "tool_use") continue
                 const state = part.state as Record<string, unknown> | undefined

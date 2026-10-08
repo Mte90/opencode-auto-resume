@@ -247,10 +247,11 @@ If the assistant claims the task is done ("task done", "finished", "all complete
 
 ### User-input awareness
 
-The session is not stalled while the ball is in the user's court. Two gates stand down idle nudges:
+The session is not stalled while the ball is in the user's court. Three gates stand down idle nudges:
 
 - **Awaiting input**: the newest assistant message holds a `tool_use` part with `state.status: "pending"` (e.g. an open `question` tool call). All idle checks, the periodic recheck, delayed action-intent callbacks, and the tool-text scan skip prompting until a newer user message clears the gate. Completed tool calls never engage it.
 - **Recently active user**: any inbound user message within `activeUserWindowMs` (default 5 minutes) means the user is engaged — likely composing a reply, which leaves no pending tool call behind. Open-todos nudges (idle + periodic), the tool-text reminder fallback, and action-intent callbacks stand down until the window expires.
+- **Explicit stop line** (opt-in): when the newest assistant message's text matches one of `stopPatterns`, the agent has deliberately handed the ball to the user — typical for agent setups whose prompts end a turn with a protocol line such as `STOP: NEEDS_DECISION <question>` or `STOP: BLOCKED <reason>`, while the todo for that decision is still open. It counts exactly like the awaiting-input gate. Default: no patterns (unchanged behaviour).
 
 ---
 
@@ -422,6 +423,7 @@ With options:
 | `busyStallStrategy` | `"continue"` | Busy-stall response: `"continue"`, `"abort"` (abort-first), or `"off"` (disabled) |
 | `contextSaturationThreshold` | `0.85` | Ratio of used/usable context that routes a saturated parent to magic-context `ctx-wrapup` (only when magic-context is installed) |
 | `activeUserWindowMs` | `300000` | Inbound-user-message recency window (5 min) during which idle nudges stand down (user likely composing) |
+| `stopPatterns` | `[]` | Array of regex strings (multiline). When the newest assistant message's text matches one, the session counts as awaiting the user and idle nudges stand down — e.g. `["STOP:\\s*(BLOCKED\|NEEDS_DECISION)\\b"]`. Invalid regexes are skipped. |
 | `subagentNativeCompactionEnabled` | `false` | Opt-in native `session.summarize()` for saturated subagent sessions (no magic-context detection required) |
 
 Message patterns are matched case-insensitively. Error names use exact match.
