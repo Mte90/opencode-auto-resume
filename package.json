@@ -21,18 +21,24 @@
   "author": "Daniele \"mte90\" Scasciafratte",
   "type": "module",
   "main": "dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./server": "./src/server.ts"
+  },
 "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target bun",
+    "build": "bun build src/index.ts src/server.ts --outdir dist --target bun",
     "dev": "bun build src/index.ts --outdir dist --target bun --watch",
     "test": "bun test",
     "prepublishOnly": "bun run build"
 },  "files": [
     "dist/index.js",
+    "src/server.ts",
     "README.md",
     "LICENSE"
   ],
   "dependencies": {
-    "@opencode-ai/plugin": "latest"
+    "@opencode-ai/plugin": "latest",
+    "zod": "^4.1.8"
   },
   "devDependencies": {
     "@opencode-ai/sdk": "latest",
