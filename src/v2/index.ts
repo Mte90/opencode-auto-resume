@@ -307,6 +307,7 @@ interface SessionWatch {
 export interface AutoResumeOptions {
 	chunkTimeoutMs?: number
 	gracePeriodMs?: number
+	stuckToolAgeMs?: number
 	checkIntervalMs?: number
 	maxRetries?: number
 	baseBackoffMs?: number
@@ -470,6 +471,13 @@ const CTX_WRAPUP_TRIGGER = "ctx-wrapup"
 const DEFAULT_CHUNK_TIMEOUT_MS = 180_000
 const DEFAULT_CHECK_INTERVAL_MS = 5_000
 const DEFAULT_GRACE_PERIOD_MS = 3_000
+/** How old an unanswered tool part must be before the stuck-tool pass acts.
+ * Deliberately far shorter than the stall window: an idle session with an
+ * unfinished call is not 'maybe still working' — the turn already ended, so
+ * the only race is late-flushing results (seconds-scale, per the settle-delay
+ * design). 60s gives 20x margin over that while cutting the ~3min stall-window
+ * wait the pass used before (ses_edf403f5: parked 94 min on a wedged compress). */
+const DEFAULT_STUCK_TOOL_AGE_MS = 60_000
 const DEFAULT_MAX_RETRIES = 3
 const DEFAULT_BASE_BACKOFF_MS = 1_000
 const DEFAULT_MAX_BACKOFF_MS = 8_000
@@ -1397,6 +1405,7 @@ export default define({
 		const chunkTimeoutMs = opts.chunkTimeoutMs ?? DEFAULT_CHUNK_TIMEOUT_MS
 		const checkIntervalMs = opts.checkIntervalMs ?? DEFAULT_CHECK_INTERVAL_MS
 		const gracePeriodMs = opts.gracePeriodMs ?? DEFAULT_GRACE_PERIOD_MS
+		const stuckToolAgeMs = opts.stuckToolAgeMs ?? DEFAULT_STUCK_TOOL_AGE_MS
 		// `maxRecoveryRetries` is v1's name for the same knob. Prefer the v2 name,
 		// fall back to the v1 alias so an existing v1 config ports unchanged.
 		const maxRetries = opts.maxRetries ?? opts.maxRecoveryRetries ?? DEFAULT_MAX_RETRIES
@@ -1543,6 +1552,7 @@ export default define({
 			"logFile",
 			"rateLimitCooldownsMs",
 			"sendTimeoutMs",
+			"stuckToolAgeMs",
 			"configProbe",
 		])
 		const unknownOptions = Object.keys(opts).filter((key) => !RECOGNISED_OPTIONS.has(key))
@@ -1850,6 +1860,11 @@ export default define({
 			w.awaitingQuotaRetry = true
 			const waitMs = Math.max(0, ladder[n] - (now - w.rateLimitedAt))
 			log("warn", `${short(sid)} rate limited (${errType || "error"}) — standing down, next attempt in ${Math.ceil(waitMs / 1000)}s (${n + 1}/${ladder.length})`)
+			// Machine-readable arm record so a later evaluation can re-arm after a
+			// reload wipes this in-memory gate (ses_ef72c5f3, 2026-10-09: armed at
+			// 14:31:49, plugin reloaded 14:37:28, gate due 14:46:49 never fired).
+			// Full sid: short() truncates and suffixes can collide across sessions.
+			log("warn", `quota-armed sid=${sid} at=${now} rung=${n} ladder=${ladder.length}`)
 		}
 
 		/** Remaining plugin-initiated interrupts allowed in the current window. */
@@ -3265,7 +3280,7 @@ export default define({
 			for (const m of messages as Array<{ type?: string; time?: { created?: number } }>) {
 				if (m?.type === "user" && typeof m?.time?.created === "number") lastUserAt = Math.max(lastUserAt, m.time.created)
 			}
-			const cutoff = Date.now() - chunkTimeoutMs - gracePeriodMs
+			const cutoff = Date.now() - stuckToolAgeMs
 			const stuck: string[] = []
 			for (const m of messages as Array<{ type?: string; time?: { created?: number }; content?: Array<{ type?: string; name?: string; state?: { status?: string }; time?: { created?: number } }> }>) {
 				if (!m || m.type !== "assistant" || !Array.isArray(m.content)) continue
@@ -4421,6 +4436,58 @@ export default define({
 			}
 		}
 
+		/**
+		 * Re-arm quota ladders lost to a reload.
+		 *
+		 * The ladder gate is in-memory (`awaitingQuotaRetry`, `rateLimitedAt`,
+		 * `rateLimitAttempts`), and `dispose()` clears the session map — so any
+		 * reload between arming and the next rung silently cancels the retry.
+		 * The `quota-armed` marker lines in the (file-backed, reload-proof) log
+		 * are the record. For each still-listed session with a marker:
+		 * live state wins (already armed — nothing to do), stale markers past
+		 * the ladder horizon are dropped, and a user message newer than the arm
+		 * means the ladder already reset — re-arming would retry a session the
+		 * user already continued. Otherwise the gate is restored at its rung and
+		 * the watchdog serves it on schedule, possibly immediately if overdue.
+		 */
+		async function restoreQuotaLadders(): Promise<void> {
+			let text: string
+			try {
+				text = readFileSync(logFile, "utf8")
+			} catch {
+				return
+			}
+			const marks = new Map<string, { at: number; rung: number }>()
+			for (const line of text.split("\n").slice(-3000)) {
+				const m = /quota-armed sid=(ses_\S+) at=(\d+) rung=(\d+)/.exec(line)
+				if (m) marks.set(m[1], { at: Number(m[2]), rung: Number(m[3]) })
+			}
+			if (marks.size === 0) return
+			let listed: Set<string>
+			try {
+				listed = new Set(unwrapList(await callSessionApi<unknown>("list")).map((r) => r.id).filter((id): id is string => typeof id === "string"))
+			} catch {
+				return
+			}
+			const horizon = rateLimitCooldownsMs.reduce((a, b) => a + b, 0)
+			for (const [sid, mark] of marks) {
+				if (!listed.has(sid)) continue
+				const w = ensureWatch(sid)
+				if (w.awaitingQuotaRetry || w.rateLimitedAt > 0) continue
+				if (Date.now() - mark.at >= horizon) continue
+				const messages = await loadMessages(sid)
+				let lastUserAt = 0
+				for (const m of messages as Array<{ type?: string; time?: { created?: number } }>) {
+					if (m?.type === "user" && typeof m?.time?.created === "number") lastUserAt = Math.max(lastUserAt, m.time.created)
+				}
+				if (lastUserAt > mark.at) continue
+				w.rateLimitedAt = mark.at
+				w.rateLimitAttempts = mark.rung
+				w.awaitingQuotaRetry = true
+				log("warn", `${short(sid)} quota ladder restored (armed ${Math.round((Date.now() - mark.at) / 1000)}s ago, rung ${mark.rung}) — retry due on schedule`)
+			}
+		}
+
 		// ---------------------------------------------------------------------
 		// Event stream
 		// ---------------------------------------------------------------------
@@ -4865,6 +4932,7 @@ export default define({
 			}
 		}
 		void pump()
+		void restoreQuotaLadders()
 
 		if (superseded) {
 			// Two mod ids under ONE boot is the evidence that separates a plugin

@@ -210,6 +210,33 @@ describe("v2: turns parked on an unanswered tool call", () => {
 		expect(said).toHaveLength(0)
 	})
 
+	test("a call stuck 61s nudges without waiting the stall window", async () => {
+		// The age gate is 60s by default, not the ~3min stall window: idle plus
+		// an unfinished call is already conclusive, the turn ended. Deterministic
+		// fixed timestamps, no waiting.
+		const now = Date.now()
+		const h = await setup([
+			userMessage("go", now - 120_000),
+			assistantWith(now - 61_000, toolPart("call_1", "shell", "running", now - 61_000)),
+		])
+		await goIdle(h)
+		const said = stuckNudges(h)
+		await teardown(h)
+		expect(said).toHaveLength(1)
+	})
+
+	test("CONTROL: a 30s-old call is still inside the age gate", async () => {
+		const now = Date.now()
+		const h = await setup([
+			userMessage("go", now - 120_000),
+			assistantWith(now - 30_000, toolPart("call_1", "shell", "running", now - 30_000)),
+		])
+		await goIdle(h)
+		const said = stuckNudges(h)
+		await teardown(h)
+		expect(said).toHaveLength(0)
+	})
+
 	test("the nudge names the tool and tells the model not to retry it", async () => {
 		const h = await setup([
 			userMessage("go", OLD),
