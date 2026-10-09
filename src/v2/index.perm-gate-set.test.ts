@@ -135,7 +135,6 @@ const GATED: Array<[string, string, number | undefined]> = [
 	["provider.auth", "Forbidden: your account lacks access to this model.", 403],
 	["provider.auth", "no api key found for anthropic", undefined],
 	["provider.no-route", "No LLM route for openai/gpt-5 using default", undefined],
-	["provider.unknown", "Model not found: exo-free", 404],
 	["provider.content-filter", "Your request was blocked by content policy", undefined],
 	// message-keyed (type too broad to gate on)
 	["provider.invalid-request", "Model exo-free has been deprecated.", undefined],
@@ -178,6 +177,35 @@ describe("v2: permanent-failure gate set", () => {
 			expect(latched).toBe(false)
 		})
 	}
+
+	test("provider.unknown with transient abort gets ONE recovery attempt, then latches", async () => {
+		// provider.unknown is a catch-all for transient server hiccups (e.g.
+		// "Chat completion aborted. Please check the server console").
+		// It must NOT hard-gate on the first occurrence.
+		const h = await setup()
+		push(h, "session.execution.started")
+		await wait(20)
+		push(h, "session.step.failed", {
+			error: { type: "provider.unknown", message: "Chat completion aborted. Please check the server console." },
+		})
+		await wait(300)
+		const afterFirst = h.injected.length
+		const latchedAfterFirst = logsOf(h).includes("permanent failure latched")
+
+		// Second occurrence: the indeterminate budget is spent.
+		push(h, "session.step.failed", {
+			error: { type: "provider.unknown", message: "Chat completion aborted. Please check the server console." },
+		})
+		await wait(300)
+		const log = logsOf(h)
+		await teardown(h)
+
+		expect(afterFirst).toBeGreaterThanOrEqual(1)
+		expect(latchedAfterFirst).toBe(false)
+		expect(h.injected.length).toBe(afterFirst)
+		expect(log).toContain("permanent failure latched")
+		expect(log).toContain("2 strikes")
+	})
 
 	test("an indeterminate type gets ONE recovery attempt, then latches", async () => {
 		// provider.unsupported-operation is the only gated-looking type with no

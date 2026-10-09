@@ -599,7 +599,6 @@ const OOC_ERROR_RE = /exceeds the available context size|context size \(\d+\)|to
 const PERMANENT_ERROR_TYPES = new Set([
 	"provider.auth",
 	"provider.no-route",
-	"provider.unknown",
 	"provider.content-filter",
 ])
 /** Types whose permanence is NOT established upstream, so they are not hard
@@ -612,7 +611,7 @@ const PERMANENT_ERROR_TYPES = new Set([
  * single retry, a permanent one costs one wasted turn instead of three, and the
  * first occurrence is logged so a real `retryable` value can promote it to a hard
  * gate. */
-const INDETERMINATE_ERROR_TYPES = new Set(["provider.unsupported-operation"])
+const INDETERMINATE_ERROR_TYPES = new Set(["provider.unsupported-operation", "provider.unknown"])
 /** Occurrences of an indeterminate failure tolerated before latching. */
 const INDETERMINATE_STRIKES = 2
 /** HTTP statuses that are permanent whatever type is reported. 401/403 only:
