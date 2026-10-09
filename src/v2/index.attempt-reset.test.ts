@@ -77,7 +77,10 @@ async function setup(): Promise<any> {
 			loopMaxContinues: 99,
 			injectIntervalMs: 0,
 			subagentWaitMs: 40,
-			debug: false,
+			// Without this the test writes into the PRODUCTION log, where a run is
+			// indistinguishable from a reload storm.
+			logFile,
+			debug: true,
 		},
 		session: {
 			context: async () => [],
