@@ -573,11 +573,61 @@ const OOC_ERROR_RE = /exceeds the available context size|context size \(\d+\)|to
  * recovery for a session that just needs one more try. ses_ee46693e
  * (2026-10-08): "Model exo-free has been deprecated" matched no recovery
  * category and fell into generic stall recovery, retrying a dead model. */
-const PERMANENT_FAILURE_RE = new RegExp(
-	"model\\b[^.]{0,80}\\b(deprecat\\w*|discontinued|retired|removed|no longer (available|supported|offered))\\b" +
-		"|\\b(model[_ ]?not[_ ]?found|model_not_found|unknown model|no such model|invalid model|unsupported model)\\b",
-	"i",
-)
+/** Exact `error.type` values a `continue` can never clear. These ARE opencode's
+ * own taxonomy (packages/llm/src/schema/errors.ts), read off the running binary's
+ * type->tag switch — not guesses. Each maps to a reason class whose
+ * `get retryable()` returns false there: Authentication:69, NoRoute:53,
+ * UnknownProvider:155, ContentPolicy:104. UnsupportedOperation is in the shipped
+ * binary but absent from the dev union, so its retryable getter is unverified; it
+ * is gated on class semantics instead (the model cannot perform the operation, so
+ * repeating the request cannot change that).
+ *
+ * Exact strings, never a `provider.*` prefix: the same file marks RateLimit (:82)
+ * and ProviderInternal (:117) retryable, and Transport (:129) plus
+ * InvalidProviderOutput (:143) recover fine minutes later. A prefix match would
+ * gate all four.
+ *
+ * Not here on purpose: provider.rate-limit and provider.quota keep the cooldown
+ * ladder (15m -> 2h, ~12h total) — a 5h rolling quota needs more patience than a
+ * non-retryable verdict implies, and the ladder only retries behind a long gate.
+ */
+const PERMANENT_ERROR_TYPES = new Set([
+	"provider.auth",
+	"provider.no-route",
+	"provider.unknown",
+	"provider.content-filter",
+	"provider.unsupported-operation",
+])
+/** HTTP statuses that are permanent whatever type is reported. 401/403 only:
+ * opencode's own text for them is "your authentication token may be missing or
+ * expired — try running `opencode auth login`" (provider/error.ts:61,64).
+ * Deliberately NOT 404 — provider/error.ts:26 says "openai sometimes returns 404
+ * for models that are actually available", and opencode treats an openai 404 as
+ * retryable. Nor 429/5xx, which are the transient rungs. */
+const PERMANENT_STATUS_CODES = new Set([401, 403])
+/** Permanent messages that are about the session's own HISTORY, so every retry
+ * re-sends the same broken payload. Measured on the live log: "Referenced
+ * reasoning item" recurred in one session ~17.6 minutes apart over ~4 episodes —
+ * the continues did not clear it. Both arrive as InvalidRequest upstream, which
+ * that source marks non-retryable. */
+const PERMANENT_HISTORY_RE =
+	/referenced (reasoning )?item [^\n]{0,80}not found|no tool output found for (function )?call/i
+/** Model-shape permanent failures, message-keyed, split in two because a 404
+ * splits them. opencode funnels a gone model through InvalidRequest ->
+ * `provider.invalid-request`, whose type is far too broad to gate on — the same
+ * type also carries provider state errors a retry survives. Neither literal
+ * string is in the opencode binary (both are provider passthroughs), which is
+ * exactly why these stay message-keyed. */
+/** The model itself is gone: permanent whatever the status, including 404. */
+const PERMANENT_GONE_RE =
+	/model\b[^.]{0,80}\b(deprecat\w*|discontinued|retired|removed|no longer (available|supported|offered))\b|\bno llm route for\b/i
+/** "This model is not in the catalog" — permanent per source, EXCEPT behind a
+ * 404: provider/error.ts:26 says "openai sometimes returns 404 for models that
+ * are actually available" and opencode treats an openai 404 as retryable, so a
+ * 404 keeps recovering. Without the status (opencode's own ProviderModelNotFound
+ * catalog miss) it gates. */
+const PERMANENT_UNKNOWN_MODEL_RE =
+	/\b(model[_ ]?not[_ ]?found|model_not_found|unknown model|no such model|invalid model|unsupported model)\b/i
 /** Quota/rate-limit errors (observed: `{type:"provider.quota", message:"Rate
  * limit exceeded. Please try again later."}`). An immediate continue retries
  * straight into the ban, so these stand down on a gate ladder instead of the
@@ -2287,17 +2337,34 @@ export default define({
 		}
 
 		/** Latch the OOC lock when a failure carries an out-of-context error (which `continue` can never clear). */
-		/** Latch the permanent-failure lock when the error names a model that is
-		 * gone. Returns true when recovery must be skipped this time. */
-		function maybeLockPermanent(sid: string, errMsg: string): boolean {
+				/** Classify one failure as permanent or not. Type first (opencode's own
+		 * taxonomy), then status, then message — the type is the strongest signal
+		 * and the message the weakest, so an unknown type carrying a known message
+		 * still gates. Returns the reason for the log line, or null. */
+		function permanentFailureReason(errMsg: string, errType?: string, status?: unknown): string | null {
+			if (errType && PERMANENT_ERROR_TYPES.has(errType)) return `type ${errType}`
+			if (typeof status === "number" && PERMANENT_STATUS_CODES.has(status)) return `http ${status}`
+			if (PERMANENT_GONE_RE.test(errMsg)) return errMsg.slice(0, 160)
+			if (PERMANENT_HISTORY_RE.test(errMsg)) return errMsg.slice(0, 160)
+			if (PERMANENT_UNKNOWN_MODEL_RE.test(errMsg)) {
+				if (status === 404) return null // openai 404s can be live models; keep recovering
+				return errMsg.slice(0, 160)
+			}
+			return null
+		}
+
+		/** Latch the permanent-failure lock when the error names something a continue
+		 * can never clear. Returns true when recovery must be skipped this time. */
+		function maybeLockPermanent(sid: string, errMsg: string, errType?: string, status?: unknown): boolean {
 			const w = ensureWatch(sid)
 			if (w.permLocked) return true
-			if (!PERMANENT_FAILURE_RE.test(errMsg)) return false
+			const why = permanentFailureReason(errMsg, errType, status)
+			if (why === null) return false
 			w.permLocked = true
-			w.permLockReason = errMsg.slice(0, 200)
+			w.permLockReason = why
 			log(
 				"warn",
-				`${short(sid)} permanent failure latched — recovery locked out until a genuine turn: ${errMsg.slice(0, 120)}`,
+				`${short(sid)} permanent failure latched (${why}) — recovery locked out until a genuine turn: ${errMsg.slice(0, 120)}`,
 			)
 			return true
 		}
@@ -4527,7 +4594,7 @@ export default define({
 					const errType = String(ev.data?.error?.type ?? "")
 					const errMsg = String(ev.data?.error?.message ?? "")
 					maybeLockOoc(sid, errMsg)
-					if (maybeLockPermanent(sid, errMsg)) return
+					if (maybeLockPermanent(sid, errMsg, errType, ev.data?.error?.status)) return
 					log("info", `${short(sid)} provider retry #${ev.data?.attempt ?? "?"}: ${errType || errMsg}`)
 					if (!isStreamingFailure(errMsg, streamingFailureMessagePatterns) && !isStreamingFailureName(errType, streamingFailureErrorNames) && errType !== "retryable") return
 					// Let the provider retries play out first; only intervene if it stays quiet
@@ -4569,7 +4636,7 @@ export default define({
 					maybeLockOoc(sid, errMsg)
 					// Permanent failures still go idle — the session really is done —
 					// but nothing arms behind them, so no watchdog pass revives it.
-					if (maybeLockPermanent(sid, errMsg)) {
+					if (maybeLockPermanent(sid, errMsg, errType, ev.data?.error?.status)) {
 						markIdle(sid)
 						w.pendingRecoveryArmed = false
 						w.recovering = false
