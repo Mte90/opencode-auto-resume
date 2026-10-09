@@ -2056,6 +2056,18 @@ export default define({
 				dbg(`${short(sid)} subagent session — injection refused (parent owns recovery)`)
 				return false
 			}
+			// The permanent and OOC locks are enforced HERE rather than in each
+			// caller. There are five injection paths (stall, abort+resume, unknown-tool,
+			// task_complete-blocked, targetedRecovery) and a permanently failed or
+			// out-of-context session still goes idle with its history intact — so the
+			// feature passes read that history and injected into a model that cannot
+			// answer at all (observed: the unknown-tool suggestion landing on a session
+			// whose provider had just latched). The stall callers already checked; this
+			// closes the other three and every future path.
+			if (w.permLocked || w.oocLocked) {
+				dbg(`${short(sid)} locked (${w.permLocked ? "permanent" : "ooc"}) — injection refused on every path`)
+				return false
+			}
 			if (!allowDuringSelfAbort && selfAbortActive(w)) {
 				dbg(`${short(sid)} injection refused — inside our own abort window`)
 				return false
@@ -2664,6 +2676,15 @@ export default define({
 		) {
 			const w = ensureWatch(sid)
 			if (w.recovering || w.userCancelled || w.permissionPending) return
+			// Locked sessions skip the work, not just the send. Checking only at the
+			// injection choke point (injectOnceLocked) still burns these budgets: the pass
+			// marks its parts examined and sets its one-shot flag BEFORE sending, so a
+			// refused nudge would leave the feature dead until the next user message.
+			// Bailing here keeps the budget intact for when the lock clears.
+			if (w.permLocked || w.oocLocked) {
+				dbg(`${short(sid)} locked (${w.permLocked ? "permanent" : "ooc"}) — skipping ${kind} nudge`)
+				return
+			}
 			if (w.compacting) {
 				dbg(`${short(sid)} mid-compaction — skipping ${kind} nudge`)
 				return
@@ -3115,6 +3136,10 @@ export default define({
 		 */
 		async function checkForUnknownToolCalls(sid: string, w: SessionWatch): Promise<boolean> {
 			if (w.userCancelled || w.completionSignaled) return false
+			if (w.permLocked || w.oocLocked) {
+				dbg(`${short(sid)} locked (${w.permLocked ? "permanent" : "ooc"}) — skipping unknown-tool pass`)
+				return false
+			}
 			try {
 				const messages = await loadMessages(sid)
 				// The history is read before the "already suggested" guard, and the
