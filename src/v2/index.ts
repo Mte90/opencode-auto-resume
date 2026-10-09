@@ -2110,6 +2110,7 @@ export default define({
 			notification: string,
 			allowDuringSelfAbort: boolean,
 			checkDuplicate: boolean,
+			forceSynthetic = false,
 		): Promise<boolean> {
 			// Dead instances stay silent across every injection path, not
 			// just the stall timer that schedules most of them. Checked
@@ -2179,7 +2180,7 @@ export default define({
 				dbg(`${short(sid)} duplicate continue suppressed — identical prod already in session log`)
 				return false
 			}
-			const sent = await notifyAndPrompt(sid, text, notification)
+			const sent = await notifyAndPrompt(sid, text, notification, true, forceSynthetic)
 			if (sent) {
 				w.lastProdText = text
 				w.completedSinceProd = 0
@@ -2197,9 +2198,10 @@ export default define({
 			notification: string,
 			allowDuringSelfAbort = false,
 			checkDuplicate = false,
+			forceSynthetic = false,
 		): Promise<boolean> {
 			return withInjectLock(sid, () =>
-				injectOnceLocked(sid, text, notification, allowDuringSelfAbort, checkDuplicate),
+				injectOnceLocked(sid, text, notification, allowDuringSelfAbort, checkDuplicate, forceSynthetic),
 			)
 		}
 
@@ -2301,9 +2303,9 @@ export default define({
 			}
 		}
 
-		async function notifyAndPrompt(sid: string, text: string, notification: string, resume = true): Promise<boolean> {
+		async function notifyAndPrompt(sid: string, text: string, notification: string, resume = true, forceSynthetic = false): Promise<boolean> {
 			ensureWatch(sid).selfRecovery = true
-			if (visibleContinue) {
+			if (visibleContinue && !forceSynthetic) {
 				// Cattleprod-style: a real user message in session history, so the
 				// intervention — and any loop — is self-evident in the transcript.
 				// Falls back to synthetic only if the prompt call throws.
@@ -3431,7 +3433,12 @@ export default define({
 							"warn",
 							`${short(sid)} unknown tool "${toolName}" called ${count}x, suggesting "${suggestion ?? "(none)"}" mod=${MODULE_INSTANCE}`,
 						)
-						await injectOnce(sid, prompt, "unknown-tool")
+						// Feature corrections go synthetic, never visible: the model needs
+						// the correction, the user does not need a full-text user message
+						// for it. (Synthetic still renders as a plugin notification in
+						// the TUI — quieter, not silent.) Stall recovery stays visible
+						// by design so an intervention loop is self-evident.
+						await injectOnce(sid, prompt, "unknown-tool", false, false, true)
 						return true
 					}
 				}

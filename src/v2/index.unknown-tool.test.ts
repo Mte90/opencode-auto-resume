@@ -122,8 +122,8 @@ async function setup(
 			context: async () => history,
 			active: async () => ({}),
 			interrupt: async () => ({}),
-			synthetic: async (a: any) => (injected.push({ text: a?.text }), {}),
-			prompt: async (a: any) => (injected.push({ text: a?.text }), {}),
+			synthetic: async (a: any) => (injected.push({ kind: "synthetic", text: a?.text }), {}),
+			prompt: async (a: any) => (injected.push({ kind: "prompt", text: a?.text }), {}),
 		},
 		client: {
 			session: { get: async () => ({ data: opts.parentID ? { id: SID, parentID: opts.parentID } : { id: SID } }) },
@@ -168,6 +168,21 @@ async function goIdle(h: any) {
 const suggestions = (h: any) => h.injected.filter((i: any) => /does not exist/.test(i.text ?? ""))
 
 describe("v2: naming a replacement for a tool that does not exist", () => {
+	test("the suggestion travels synthetic, not as a visible user message", async () => {
+		// Feature corrections go to the model without dumping full text into the
+		// user's transcript. Stall recovery stays visible by design; the
+		// suggestion is one-shot per request, so no loop can hide behind the
+		// quieter channel.
+		const h = await setup({
+			history: [userMessage("go", OLD), assistantWith(toolPart("call_1", "globb")), assistantWith(toolPart("call_2", "globb"))],
+		})
+		await goIdle(h)
+		const said = suggestions(h)
+		expect(said).toHaveLength(1)
+		expect(said[0].kind).toBe("synthetic")
+		await teardown(h)
+	})
+
 	test("CONTROL: one invented tool call is a typo and gets no suggestion", async () => {
 		// The threshold is the whole design: a model that misspells one tool name
 		// normally self-corrects, and interrupting it teaches it nothing.
