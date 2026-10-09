@@ -3749,14 +3749,51 @@ export default define({
 		 * quiet while its child ran was declared stalled and interrupted.
 		 */
 		async function getActiveSessions(): Promise<string[]> {
+			// Without server truth the watchdog can only see sessions it observed
+			// events for since load: after any reload a hung-but-silent session is
+			// invisible while the server still reports it running, and nothing ever
+			// fires (ses_edf403f5, 2026-10-09: running 7+ min with two user messages
+			// unanswered). The HTTP loopback below restores server truth in prod.
 			try {
 				const fn = (ctx.session as any).active
-				if (typeof fn !== "function") return busySessions()
+				if (typeof fn !== "function") {
+					// Production has no active surface at all (verified 2026-10-06).
+					const http = await activeSessionsHttp()
+					if (http !== null) return http
+					return busySessions()
+				}
 				const active = await fn.call(ctx.session)
 				return Object.keys(active ?? {}).filter((k) => typeof k === "string")
 			} catch {
+				// Same loopback here: a throwing surface must not blind the watchdog.
+				const http = await activeSessionsHttp()
+				if (http !== null) return http
 				return busySessions()
 			}
+		}
+
+		type ActiveMap = Record<string, { type?: unknown }>
+		let activeCache: { at: number; ids: string[] } | null = null
+		const ACTIVE_TTL_MS = 10_000
+		async function activeSessionsHttp(): Promise<string[] | null> {
+			const now = Date.now()
+			if (activeCache && now - activeCache.at < ACTIVE_TTL_MS) return activeCache.ids
+			for (const base of serverBaseUrls()) {
+				try {
+					const res = await fetch(`${base}/api/session/active`, { headers: serverHeaders() })
+					if (!res.ok) continue
+					const body = (await res.json()) as unknown
+					const data = (body as { data?: unknown } | undefined)?.data ?? body
+					if (data && typeof data === "object") {
+						const ids = Object.keys(data as ActiveMap).filter((k) => k.startsWith("ses_"))
+						activeCache = { at: now, ids }
+						return ids
+					}
+				} catch {
+					// Next base URL, then fail-open.
+				}
+			}
+			return null
 		}
 
 		/** Busy sessions we are tracking, excluding cancelled ones. The orphan watch
