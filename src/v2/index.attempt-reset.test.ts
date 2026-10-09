@@ -109,6 +109,20 @@ async function teardown(h: any) {
 
 const push = (h: any, type: string, sid: string, data: Record<string, unknown> = {}) => h.streamRef.push(ev(type, sid, data))
 
+/**
+ * Wait for a condition instead of sleeping a guessed interval. This test
+ * used fixed waits and passed 3/3 in isolation while failing under
+ * full-suite load — exactly the flake that trains you to ignore a red suite.
+ */
+async function waitFor(what: () => boolean, budgetMs = 3000): Promise<boolean> {
+	const deadline = Date.now() + budgetMs
+	while (Date.now() < deadline) {
+		if (what()) return true
+		await wait(10)
+	}
+	return what()
+}
+
 const attemptOf = (text: string | undefined): string | null => {
 	const m = /attempt (\d)\/3/.exec(text ?? "")
 	return m ? m[1] : null
@@ -119,12 +133,13 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		const h = await setup()
 		push(h, "session.execution.started", SID)
 		await wait(10)
-		// Delta lands after attempt 1 but before the budget burns out,
-		// so a later attempt can observe the progress.
-		await wait(130)
+		// Wait for the first nudge, then land the delta while the ladder is still
+		// climbing. Ordering is the thing under test, so wait on events rather
+		// than on wall-clock guesses.
+		await waitFor(() => h.injected.length >= 1)
 		// Model produces text (progress, no completion), then goes quiet.
 		push(h, "session.text.delta", SID, { assistantMessageID: "m1", delta: "new findings from the probe" })
-		await wait(400)
+		await waitFor(() => h.injected.length >= 2)
 		await teardown(h)
 		const attempts = h.injected.map((i: any) => attemptOf(i.text))
 		expect(attempts.length).toBeGreaterThanOrEqual(2)

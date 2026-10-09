@@ -134,6 +134,11 @@ interface AutoResumeToolEditor {
 		input: Record<string, unknown>
 		execute: (input: any, context: { sessionID: string }) => Promise<{ content: string }>
 	}): void
+	/** Present in the shipped `@opencode/plugin` ToolEditor; optional here because
+	 *  a host that omits them must degrade to `add` alone, not throw. */
+	list?: () => readonly { id: string }[]
+	get?: (id: string) => { description?: string } | undefined
+	update?: (id: string, fn: (tool: { description?: string }) => void) => void
 }
 
 interface SessionWatch {
@@ -564,6 +569,9 @@ const DONE_WITHOUT_DETAILS_PROMPT =
  */
 const SHELL_OPEN_MAX_MS = 30 * 60_000
 
+/** Appended to the `shell` tool's description. One constant so the
+ * already-annotated guard and the text itself cannot drift apart. */
+const SHELL_ALIAS_HINT = "In v1 sessions this tool was called `bash`; use this one."
 /** OOC (out-of-context) errors that `continue` can never clear — recovery is locked out on these. */
 const OOC_ERROR_RE = /exceeds the available context size|context size \(\d+\)|too large to compact|too many tokens|prompt is too long/i
 /** Failures a `continue` can never clear: the model itself is gone
@@ -1317,7 +1325,7 @@ function isTaskToolCall(ev: V2Event): boolean {
  */
 const REGISTRY_KEY = `__auto_resume_singleton__:${process.pid}`
 
-type SingletonRegistry = { live?: { dispose: () => void } }
+type SingletonRegistry = { live?: { dispose: () => void; mod: string; startedAt: number } }
 
 function singletonRegistry(): SingletonRegistry {
 	const g = globalThis as unknown as Record<string, SingletonRegistry | undefined>
@@ -1339,6 +1347,20 @@ function singletonRegistry(): SingletonRegistry {
  */
 const MODULE_INSTANCE = `${process.pid}.${Math.random().toString(36).slice(2, 8)}`
 
+/**
+ * Host identity, for the reload forensics.
+ *
+ * `mod=` alone cannot tell a plugin reload from a host restart: every reload
+ * mints a new `eval` suffix, and a restart changes `pid` too. Uptime separates
+ * them — a plugin re-evaluated inside a long-lived host keeps a growing uptime
+ * and a constant `boot`, so a storm of mod ids under ONE boot is the plugin
+ * being re-imported, and a changing boot is opencode itself restarting.
+ * Measured 2026-10-08: 22 lifecycle lines in ten minutes, all pid 3686667 —
+ * re-evaluations inside one host, not host restarts.
+ */
+const HOST_UPTIME_S = Math.round(process.uptime())
+const HOST_BOOT = new Date(Date.now() - process.uptime() * 1000).toISOString()
+
 export default define({
 	id: "auto-resume.v2",
 
@@ -1348,9 +1370,16 @@ export default define({
 		// evaluations of this bundle. Wrapped: a throwing predecessor must not
 		// block the new one from arming.
 		const registry = singletonRegistry()
-		if (registry.live) {
+		// A second live instance means the host re-evaluated this bundle without
+		// disposing the first — the reload-storm signature. The predecessor's
+		// identity and age are captured HERE and logged later, because `log`
+		// closes over `logFile`, which is not initialised until well below this
+		// point: calling it from this block is a TDZ ReferenceError, and it only
+		// fires when a predecessor exists — i.e. never in a single-test process.
+		const superseded = registry.live
+		if (superseded) {
 			try {
-				registry.live.dispose()
+				superseded.dispose()
 			} catch {
 				/* predecessor already torn down */
 			}
@@ -2376,7 +2405,7 @@ export default define({
 			w.permLockReason = why
 			log(
 				"warn",
-				`${short(sid)} permanent failure latched (${why}) — recovery locked out until a genuine turn: ${errMsg.slice(0, 120)}`,
+				`${short(sid)} permanent failure latched (${why}) — recovery locked out until a genuine turn: ${errMsg.slice(0, 120)} mod=${MODULE_INSTANCE}`,
 			)
 			return true
 		}
@@ -2387,7 +2416,7 @@ export default define({
 			if (!OOC_ERROR_RE.test(errMsg)) return
 			w.oocLocked = true
 			w.oocLockReason = errMsg.slice(0, 200)
-			log("warn", `${short(sid)} OOC error latched — recovery locked out until a genuine turn: ${errMsg.slice(0, 120)}`)
+			log("warn", `${short(sid)} OOC error latched — recovery locked out until a genuine turn: ${errMsg.slice(0, 120)} mod=${MODULE_INSTANCE}`)
 		}
 
 		/**
@@ -2461,7 +2490,7 @@ export default define({
 			}
 			recordContinue(sid)
 			if (w.resumeAttempts >= maxRetries) {
-				log("warn", `${short(sid)} giving up after ${maxRetries} attempts (${reason})`)
+				log("warn", `${short(sid)} giving up after ${maxRetries} attempts (${reason}) mod=${MODULE_INSTANCE}`)
 				w.gaveUp = true
 				return
 			}
@@ -3188,7 +3217,7 @@ export default define({
 						w.unknownToolSuggestionSent = true
 						log(
 							"warn",
-							`${short(sid)} unknown tool "${toolName}" called ${count}x, suggesting "${suggestion ?? "(none)"}"`,
+							`${short(sid)} unknown tool "${toolName}" called ${count}x, suggesting "${suggestion ?? "(none) mod=${MODULE_INSTANCE}"}"`,
 						)
 						await injectOnce(sid, prompt, "unknown-tool")
 						return true
@@ -3220,6 +3249,53 @@ export default define({
 		 * call, so the escalation only ever measures a genuinely stuck loop rather
 		 * than several legitimate rounds of work.
 		 */
+		/**
+		 * Tell the model that `shell` is also called `bash`.
+		 *
+		 * The v2 plugin API cannot RENAME a tool. `ToolEditor` exposes list/get/
+		 * namespace/add/update/remove; `update` mutates a tool's Info and never its
+		 * id; the `tool.execute.before` payload types `tool` as readonly; and no
+		 * message-level hook rewrites an emitted call (the exposed hooks are
+		 * create.before, execute.before/after, model.request, http.* and
+		 * experimental.ws.handshake). opencode itself ships no such alias either —
+		 * the "bash" strings in the binary are shell-completion names and a
+		 * language-detection map, not a tool mapping. So an automatic bash->shell
+		 * rewrite is not reachable from a plugin.
+		 *
+		 * What IS available is prevention at the source: `update()` the real tool so
+		 * the provider sees the old name in its description and stops inventing the
+		 * call. Cost of not doing it, measured on the live log: 20 corrections in one
+		 * session, every one reporting exactly "called 2x" — one wasted call per
+		 * request, indefinitely. Not a runaway (the correction works, the count never
+		 * passes 2), but a permanent per-request tax.
+		 *
+		 * Deliberately NOT registering a `bash` tool that refuses: that would
+		 * advertise a permanently-failing name in the tool list and teach the model
+		 * to prefer it.
+		 */
+		async function annotateShellAlias(): Promise<void> {
+			if (!ctx.tool?.transform) return
+			try {
+				await ctx.tool.transform((editor) => {
+					// Nothing to point at, or `bash` is genuinely the tool here rather
+					// than an alias for it.
+					if (editor.list?.().some((t) => t.id === "bash")) return
+					if (!editor.get?.("shell")) return
+					// The transform re-runs on every reload; a doubled hint is noise
+					// the model has to read past.
+					if ((editor.get("shell")?.description ?? "").includes(SHELL_ALIAS_HINT)) return
+					editor.update?.("shell", (tool) => {
+						tool.description = `${tool.description ?? ""} (${SHELL_ALIAS_HINT})`.trim()
+					})
+					log("info", "annotated the shell tool with its v1 name (bash) so the model stops inventing the call mod=${MODULE_INSTANCE}")
+				})
+			} catch (e) {
+				// Best effort: a registry that refuses the annotation must not block
+				// the tool registration this plugin actually depends on.
+				dbg("shell alias annotation skipped:", e instanceof Error ? e.message : String(e))
+			}
+		}
+
 		async function registerTaskCompleteTool(): Promise<void> {
 			if (!ctx.tool?.transform) {
 				dbg("tool registry unavailable — task_complete not offered")
@@ -3938,7 +4014,7 @@ export default define({
 				rw.rateLimitAttempts = rn + 1
 				rw.rateLimitedAt = Date.now()
 				rw.pendingRecoveryArmed = true
-				log("info", `${short(rsid)} rate-limit cooldown served — retrying (attempt ${rn + 1}/${rateLimitCooldownsMs.length})`)
+				log("info", `${short(rsid)} rate-limit cooldown served — retrying (attempt ${rn + 1}/${rateLimitCooldownsMs.length}) mod=${MODULE_INSTANCE}`)
 				void recover(rsid, "rate-limit cooldown served")
 			}
 			cleanupIdleSessions()
@@ -4271,12 +4347,12 @@ export default define({
 						if (w.oocLocked) {
 							w.oocLocked = false
 							w.oocLockReason = null
-							log("info", `${short(sid)} genuine execution — clearing OOC lock`)
+							log("info", `${short(sid)} genuine execution — clearing OOC lock mod=${MODULE_INSTANCE}`)
 						}
 						if (w.permLocked) {
 							w.permLocked = false
 							w.permLockReason = null
-							log("info", `${short(sid)} genuine execution — clearing permanent-failure lock`)
+							log("info", `${short(sid)} genuine execution — clearing permanent-failure lock mod=${MODULE_INSTANCE}`)
 						}
 						// A genuine turn is activity, and activity means quota is
 						// available again: the rate-limit ladder starts over. Our
@@ -4708,9 +4784,21 @@ export default define({
 		}
 		void pump()
 
+		await annotateShellAlias()
+
+		if (superseded) {
+			// Two mod ids under ONE boot is the evidence that separates a plugin
+			// reload from an opencode restart. WARN, not dbg: a storm of these is
+			// the finding, not a curiosity.
+			log(
+				"warn",
+				`superseded live instance mod=${superseded.mod} (age ${Math.round((Date.now() - superseded.startedAt) / 1000)}s) by mod=${MODULE_INSTANCE} boot=${HOST_BOOT}`,
+			)
+		}
+
 		log(
 			"info",
-			`ready (opencode v2). timeout=${chunkTimeoutMs}ms interval=${checkIntervalMs}ms retries=${maxRetries} loop=${loopMaxContinues}/${loopWindowMs / 1000}s warmup=${warmupMs}ms stall=${busyStallStrategy} visibleContinue=${visibleContinue} probe=${configProbe ?? "-"} mod=${MODULE_INSTANCE}` +
+			`ready (opencode v2). timeout=${chunkTimeoutMs}ms interval=${checkIntervalMs}ms retries=${maxRetries} loop=${loopMaxContinues}/${loopWindowMs / 1000}s warmup=${warmupMs}ms stall=${busyStallStrategy} visibleContinue=${visibleContinue} probe=${configProbe ?? "-"} mod=${MODULE_INSTANCE} up=${HOST_UPTIME_S}s boot=${HOST_BOOT}` +
 				(gatedInUse.length > 0 ? ` accepted-but-inert=${gatedInUse.join(",")}` : ""),
 		)
 
@@ -4738,7 +4826,7 @@ export default define({
 			if (reg.live?.dispose === dispose) reg.live = undefined
 			log("info", `stopped mod=${MODULE_INSTANCE}`)
 		}
-		registry.live = { dispose }
+		registry.live = { dispose, mod: MODULE_INSTANCE, startedAt: Date.now() }
 		return dispose
 	},
 })

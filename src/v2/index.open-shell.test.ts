@@ -1,8 +1,10 @@
 import { describe, test, expect } from "bun:test"
-import { readFileSync } from "node:fs"
+import { readFileSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "./index"
 
+let counter = 0
 const SOURCE = readFileSync(join(import.meta.dir, "index.ts"), "utf8")
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_openshell"
@@ -95,7 +97,13 @@ async function replay(events: any[], messages?: any[]): Promise<Injected[]> {
 	const ctx: any = {
 		event: stream,
 		app: { log: () => {} },
-		options: { toolTextCheckDelayMs: 0 },
+		options: {
+			toolTextCheckDelayMs: 0,
+			// Without this the test writes into the PRODUCTION log
+			// (~/.local/state/opencode-v2/auto-resume.log), which corrupts the
+			// reload forensics — a test run looks exactly like a reload storm.
+			logFile: join(tmpdir(), `auto-resume-hygiene-${process.pid}-${counter++}.log`),
+		},
 		session: {
 			context: async () => messages ?? [oldUserTurn(), assistantTurn(READY_TEXT)],
 			// Empty: no other session is active, so the `lastWasTaskTool` branch

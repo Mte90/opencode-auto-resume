@@ -142,6 +142,9 @@ describe("v2: the singleton lives on globalThis, so re-evaluations share it", ()
 		// only when it still holds OUR disposer — otherwise a late teardown from a
 		// superseded copy unregisters the live one.
 		expect(SOURCE).toMatch(/if \(reg\.live\?\.dispose === dispose\) reg\.live = undefined/)
-		expect(SOURCE).toContain("registry.live = { dispose }")
+		// The slot is set through the registry, and now carries the identity the
+		// reload forensics read (mod + start time) so a superseding instance can
+		// name its predecessor instead of merely stepping on it.
+		expect(SOURCE).toContain("registry.live = { dispose, mod: MODULE_INSTANCE, startedAt: Date.now() }")
 	})
 })
