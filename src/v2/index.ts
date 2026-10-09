@@ -148,6 +148,16 @@ interface SessionWatch {
 	resumeAttempts: number
 	lastRetryAt: number
 	gaveUp: boolean
+	/** Consecutive failure-driven recoveries with no model output between them.
+	 * A dead backend turns every injected continue into the next failure, so
+	 * without this the ladder cycles 1/3, 2/3, 3/3, gaveUp, abort+resume,
+	 * 1/3… forever, one user-visible prod per cycle (ses_ede801ca, 2026-10-09:
+	 * backend down, prods every ~90s indefinitely). Past FAILURE_LOOP_MAX the
+	 * session stands down until a genuine user turn or fresh model output —
+	 * and neither our own injections nor markBusy clear it, or the loop that
+	 * set it would clear it too. */
+	consecFailureRecovers: number
+	failureLoopLatched: boolean
 	aborting: boolean
 	/** Timestamp of the last plugin-initiated `session.interrupt()`. Any abort-shaped
 	 * event inside `SELF_ABORT_TTL_MS` of it is ours, not the user's. */
@@ -488,6 +498,10 @@ const DEFAULT_GRACE_PERIOD_MS = 3_000
  * wait the pass used before (ses_edf403f5: parked 94 min on a wedged compress). */
 const DEFAULT_STUCK_TOOL_AGE_MS = 60_000
 const DEFAULT_MAX_RETRIES = 3
+/** Consecutive failure-driven recoveries tolerated before the failure-loop
+ * latch stands the session down. Counts recoveries with no model output
+ * between them, not attempts: a dead backend fails every turn identically. */
+const FAILURE_LOOP_MAX = 3
 const DEFAULT_BASE_BACKOFF_MS = 1_000
 const DEFAULT_MAX_BACKOFF_MS = 8_000
 const DEFAULT_LOOP_MAX_CONTINUES = 3
@@ -1669,6 +1683,8 @@ export default define({
 					resumeAttempts: 0,
 					lastRetryAt: 0,
 					gaveUp: false,
+					consecFailureRecovers: 0,
+					failureLoopLatched: false,
 					aborting: false,
 					selfAbortAt: 0,
 					interruptsThisWindow: 0,
@@ -2273,6 +2289,15 @@ export default define({
 		 */
 		function appendText(sid: string, messageID: string | undefined, delta: string) {
 			const w = ensureWatch(sid)
+			// Model output means the backend is alive: a failure loop built on
+			// consecutive silent failures ends here, latch included.
+			if (delta && (w.consecFailureRecovers > 0 || w.failureLoopLatched)) {
+				w.consecFailureRecovers = 0
+				if (w.failureLoopLatched) {
+					w.failureLoopLatched = false
+					log("info", `${short(sid)} model output after failure loop — latch cleared`)
+				}
+			}
 			const mid = messageID ?? "_anon"
 			w.textParts.set(mid, (w.textParts.get(mid) ?? "") + delta)
 			w.lastAssistantMessageID = mid
@@ -2518,6 +2543,11 @@ export default define({
 				w.permLockReason = null
 				log("info", `${short(sid)} genuine execution — clearing permanent-failure lock mod=${MODULE_INSTANCE}`)
 			}
+			w.consecFailureRecovers = 0
+			if (w.failureLoopLatched) {
+				w.failureLoopLatched = false
+				log("info", `${short(sid)} genuine execution — clearing failure-loop latch mod=${MODULE_INSTANCE}`)
+			}
 		}
 
 		function maybeLockOoc(sid: string, errMsg: string) {
@@ -2584,6 +2614,25 @@ export default define({
 		async function recover(sid: string, reason: string) {
 			const w = ensureWatch(sid)
 			if (w.recovering || w.aborting || w.gaveUp || w.userCancelled || w.permissionPending) return
+			if (w.failureLoopLatched) {
+				dbg(`${short(sid)} failure loop latched — standing down until a genuine turn or fresh model output`)
+				return
+			}
+			// Failure-driven recoveries with no model output between them mean the
+			// backend is down, not the session stalled: each injected continue
+			// manufactures the next failure. Count them; past the max, latch
+			// instead of cycling the ladder forever.
+			if (reason.startsWith("session.step.failed") || reason.startsWith("session.execution.failed")) {
+				w.consecFailureRecovers++
+				if (w.consecFailureRecovers > FAILURE_LOOP_MAX) {
+					w.failureLoopLatched = true
+					log(
+						"warn",
+						`${short(sid)} ${w.consecFailureRecovers} consecutive failure recoveries with no model output — backend likely down, standing down until a genuine turn mod=${MODULE_INSTANCE}`,
+					)
+					return
+				}
+			}
 			{
 				const kind = lockKind(w)
 				if (kind) {
