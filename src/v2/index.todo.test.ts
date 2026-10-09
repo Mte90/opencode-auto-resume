@@ -345,7 +345,9 @@ describe("v2: the todo list, read from the tool that owns it", () => {
 			doneWithoutWorkPrompt: "Your todo list still has open items.",
 		})
 		expect(injected).toHaveLength(1)
-		expect(injected[0].text).toBe("Your todo list still has open items.")
+		expect(injected[0].text).toBe(
+			"Your todo list still has open items. Do not acknowledge this message and do not reply to it visibly; apply it silently and continue the task.",
+		)
 	})
 })
 

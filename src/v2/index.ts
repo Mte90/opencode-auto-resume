@@ -331,6 +331,15 @@ export interface AutoResumeOptions {
 	 */
 	visibleContinue?: boolean
 	/**
+	 * When false, feature-correction nudges (unknown-tool suggestion, stuck-tool,
+	 * targeted pattern nudges) go through the visible prompt channel instead of
+	 * synthetic. Default true: the user cannot see the question, so the model
+	 * should not produce visible traffic for it — and every synthetic correction
+	 * already carries its own do-not-acknowledge order. Stall recovery always
+	 * stays visible so an intervention loop is self-evident.
+	 */
+	quietCorrections?: boolean
+	/**
 	 * When true (default), a stall continue names the stall reason, attempt
 	 * count, and remaining todos instead of sending bare "continue". A custom
 	 * `continuePrompt` always wins verbatim. Same channel and guards either way.
@@ -1439,6 +1448,7 @@ export default define({
 			(envVisible === undefined || envVisible === ""
 				? true
 				: /^(1|true|yes)$/i.test(envVisible))
+		const quietCorrections = opts.quietCorrections ?? true
 		const richContinuePrompt = opts.richContinuePrompt ?? true
 		const logFile = opts.logFile ?? process.env.AUTO_RESUME_LOG_FILE ?? DEFAULT_LOG_FILE
 		const rateLimitCooldownsMs =
@@ -1543,6 +1553,7 @@ export default define({
 			"activeUserWindowMs",
 			"injectIntervalMs",
 			"visibleContinue",
+			"quietCorrections",
 			"richContinuePrompt",
 			"continuePrompt",
 			"toolTextRecoveryPrompt",
@@ -2205,8 +2216,16 @@ export default define({
 			checkDuplicate = false,
 			forceSynthetic = false,
 		): Promise<boolean> {
+			// A correction the user cannot see must not produce a visible model
+			// reply: the silence order rides in the text itself, so it holds for
+			// any model with no memory and no config. Applied here, the single
+			// choke point, so every check below (dup suppression, own-prompt
+			// tracking, log verification) sees the exact delivered string.
+			const sendText = forceSynthetic
+				? `${text} Do not acknowledge this message and do not reply to it visibly; apply it silently and continue the task.`
+				: text
 			return withInjectLock(sid, () =>
-				injectOnceLocked(sid, text, notification, allowDuringSelfAbort, checkDuplicate, forceSynthetic),
+				injectOnceLocked(sid, sendText, notification, allowDuringSelfAbort, checkDuplicate, forceSynthetic),
 			)
 		}
 
@@ -2873,7 +2892,7 @@ export default define({
 			w.recovering = true
 			// injectOnce debounces: this nudge counts once, not alongside a
 			// concurrent stall-watchdog injection.
-			const ok = await injectOnce(sid, prompt, "recovering: " + kind)
+			const ok = await injectOnce(sid, prompt, "recovering: " + kind, false, false, quietCorrections)
 			w.recovering = false
 			if (ok) {
 				w[budgetKey] = attemptNum
@@ -3462,7 +3481,7 @@ export default define({
 						// for it. (Synthetic still renders as a plugin notification in
 						// the TUI — quieter, not silent.) Stall recovery stays visible
 						// by design so an intervention loop is self-evident.
-						await injectOnce(sid, prompt, "unknown-tool", false, false, true)
+						await injectOnce(sid, prompt, "unknown-tool", false, false, quietCorrections)
 						return true
 					}
 				}

@@ -156,7 +156,9 @@ describe("v2: stand down while the user owes us an answer", () => {
 			events: turnEvents(READY_TEXT),
 		})
 		expect(injected.length).toBeGreaterThan(0)
-		expect(injected[0].kind).toBe("prompt")
+		// Intent nudges are feature corrections: synthetic under the quiet
+		// default. What this CONTROL pins is that recovery FIRES, not the channel.
+		expect(injected[0].kind).toBe("synthetic")
 	})
 
 	// The v2 message projection never writes "pending" — it writes "running".

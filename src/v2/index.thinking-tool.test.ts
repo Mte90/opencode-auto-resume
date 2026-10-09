@@ -181,7 +181,9 @@ describe("v2: a tool call written into the reasoning block", () => {
 			thinkingToolRecoveryPrompt: "Use the real tool call, not reasoning.",
 		})
 		expect(injected).toHaveLength(1)
-		expect(injected[0].text).toBe("Use the real tool call, not reasoning.")
+		expect(injected[0].text).toBe(
+			"Use the real tool call, not reasoning. Do not acknowledge this message and do not reply to it visibly; apply it silently and continue the task.",
+		)
 	})
 
 	test("code blocks in reasoning are not mistaken for a tool call", async () => {

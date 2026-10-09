@@ -105,6 +105,7 @@ async function setup(
 		toolRegistry?: boolean
 		toolListThrows?: boolean
 		parentID?: string
+		quietCorrections?: boolean
 	},
 ): Promise<any> {
 	const injected: Array<{ kind?: string; text?: string }> = []
@@ -117,7 +118,7 @@ async function setup(
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile },
+		options: { ...OPTIONS, logFile, ...(opts.quietCorrections === undefined ? {} : { quietCorrections: opts.quietCorrections }) },
 		session: {
 			context: async () => history,
 			active: async () => ({}),
@@ -180,6 +181,34 @@ describe("v2: naming a replacement for a tool that does not exist", () => {
 		const said = suggestions(h)
 		expect(said).toHaveLength(1)
 		expect(said[0].kind).toBe("synthetic")
+		await teardown(h)
+	})
+
+	test("the suggestion carries its own silence order", async () => {
+		// The no-reply rule rides in the text, so it holds for any model with
+		// no memory and no config — the new-user case that motivated it.
+		const h = await setup({
+			history: [userMessage("go", OLD), assistantWith(toolPart("call_1", "globb")), assistantWith(toolPart("call_2", "globb"))],
+		})
+		await goIdle(h)
+		const said = suggestions(h)
+		expect(said).toHaveLength(1)
+		expect(said[0].text).toContain("Do not acknowledge")
+		await teardown(h)
+	})
+
+	test("quietCorrections:false sends the suggestion visibly", async () => {
+		// The escape hatch for anyone who wants corrections self-evident in
+		// the transcript. Stall recovery always stays visible regardless.
+		const h = await setup({
+			history: [userMessage("go", OLD), assistantWith(toolPart("call_1", "globb")), assistantWith(toolPart("call_2", "globb"))],
+			quietCorrections: false,
+		})
+		await goIdle(h)
+		const said = suggestions(h)
+		expect(said).toHaveLength(1)
+		expect(said[0].kind).toBe("prompt")
+		expect(said[0].text).not.toContain("Do not acknowledge")
 		await teardown(h)
 	})
 

@@ -178,7 +178,10 @@ describe("v2: rich stall-continue text", () => {
 		const { injected } = await replay(busyStallEvents, { maxRetries: 1 }, OPEN)
 		expect(injected.length).toBeGreaterThan(0)
 		expect(injected[0].text).toContain("continue — stalled")
-		expect(injected[0].text).toContain("no activity for")
+		// The duration is stated once (idle field), not twice: the "no activity
+		// for Ns" reason is log-only now. The open todos still ride along.
+		expect(injected[0].text).toContain("idle ")
+		expect(injected[0].text).not.toContain("no activity for")
 		expect(injected[0].text).toContain("Write the migration guide")
 		expect(injected[0].text).toContain("Delete the temp fixtures")
 	})
