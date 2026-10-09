@@ -2541,9 +2541,21 @@ export default define({
 			const elapsed = w.lastActivityAt ? Math.round((Date.now() - w.lastActivityAt) / 1000) : 0
 			const hms = (n: number) =>
 				n < 60 ? `${n}s` : n < 3600 ? `${Math.floor(n / 60)}m ${n % 60}s` : `${Math.floor(n / 3600)}h ${Math.floor((n % 3600) / 60)}m`
-			return (
-				`continue — stalled (${reason}; attempt ${attempt}/${maxRetries}; idle ${hms(elapsed)}; ${now}).\n${suffix}`
-			).slice(0, 2000)
+			// Each fact exactly once: a "no activity for Ns" reason already states
+			// the silence, so adding "idle M:SS" repeats it (188s vs 3m 9s); and a
+			// dead-stream stall is seconds old by construction, so its idle reads
+			// as noise. Timestamp always stays.
+			const isSilenceReason = /^no activity for \d+s/i.test(reason)
+			const isDeadStream = /dead stream/i.test(reason)
+			const head = [
+				isSilenceReason ? null : reason,
+				`attempt ${attempt}/${maxRetries}`,
+				isDeadStream ? null : `idle ${hms(elapsed)}`,
+				now,
+			]
+				.filter((x): x is string => typeof x === "string" && x.length > 0)
+				.join("; ")
+			return (`continue — stalled (${head}).\n${suffix}`).slice(0, 2000)
 		}
 
 		/**

@@ -193,4 +193,17 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		expect(text).toMatch(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/)
 	})
 
+	test("no-activity stalls state the silence once, not twice", async () => {
+		// (no activity for 188s; ... idle 3m 9s) prints the same duration twice.
+		// The reason already says it, so the idle field is dropped for exactly
+		// this reason shape; anything else keeps both fields.
+		const h = await setup()
+		push(h, "session.execution.started", SID)
+		await wait(250)
+		const text = h.injected[0]?.text ?? ""
+		await teardown(h)
+		expect(text).not.toMatch(/no activity for \d+s[^;]*;[^;]*idle/)
+		expect(text).toContain("idle ")
+	})
+
 })
