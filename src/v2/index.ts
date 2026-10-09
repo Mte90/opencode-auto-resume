@@ -3217,7 +3217,7 @@ export default define({
 						w.unknownToolSuggestionSent = true
 						log(
 							"warn",
-							`${short(sid)} unknown tool "${toolName}" called ${count}x, suggesting "${suggestion ?? "(none) mod=${MODULE_INSTANCE}"}"`,
+							`${short(sid)} unknown tool "${toolName}" called ${count}x, suggesting "${suggestion ?? "(none)"}" mod=${MODULE_INSTANCE}`,
 						)
 						await injectOnce(sid, prompt, "unknown-tool")
 						return true
@@ -3287,7 +3287,10 @@ export default define({
 					editor.update?.("shell", (tool) => {
 						tool.description = `${tool.description ?? ""} (${SHELL_ALIAS_HINT})`.trim()
 					})
-					log("info", "annotated the shell tool with its v1 name (bash) so the model stops inventing the call mod=${MODULE_INSTANCE}")
+					log(
+						"info",
+						`annotated the shell tool with its v1 name (bash) so the model stops inventing the call mod=${MODULE_INSTANCE}`,
+					)
 				})
 			} catch (e) {
 				// Best effort: a registry that refuses the annotation must not block
