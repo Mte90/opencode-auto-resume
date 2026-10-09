@@ -173,6 +173,12 @@ interface SessionWatch {
 	/** Latched when a failure carries an OOC error that `continue` can never clear; recovery (continue + abort+resume) is refused until a genuine user/agent turn. */
 	oocLocked: boolean
 	oocLockReason: string | null
+	/** Latched when a failure names a model that no longer exists. Same shape as
+	 * oocLocked but for a different unresolvable class, and for the same reason:
+	 * attempt budgets live per instance and reset on reload, so only the class
+	 * stops a retry loop that spans restarts. */
+	permLocked: boolean
+	permLockReason: string | null
 	/** True while one of our own recovery continues is in flight — distinguishes a self-caused execution.started from a genuine turn. */
 	selfRecovery: boolean
 
@@ -560,6 +566,18 @@ const SHELL_OPEN_MAX_MS = 30 * 60_000
 
 /** OOC (out-of-context) errors that `continue` can never clear — recovery is locked out on these. */
 const OOC_ERROR_RE = /exceeds the available context size|context size \(\d+\)|too large to compact|too many tokens|prompt is too long/i
+/** Failures a `continue` can never clear: the model itself is gone
+ * (deprecated/retired/removed) or the provider does not know it. Matched on
+ * the MESSAGE, never the error type — `provider.invalid-request` also carries
+ * transient 400s (ses_…a48FZxYX, 2026-10-07), and latching those would mute
+ * recovery for a session that just needs one more try. ses_ee46693e
+ * (2026-10-08): "Model exo-free has been deprecated" matched no recovery
+ * category and fell into generic stall recovery, retrying a dead model. */
+const PERMANENT_FAILURE_RE = new RegExp(
+	"model\\b[^.]{0,80}\\b(deprecat\\w*|discontinued|retired|removed|no longer (available|supported|offered))\\b" +
+		"|\\b(model[_ ]?not[_ ]?found|model_not_found|unknown model|no such model|invalid model|unsupported model)\\b",
+	"i",
+)
 /** Quota/rate-limit errors (observed: `{type:"provider.quota", message:"Rate
  * limit exceeded. Please try again later."}`). An immediate continue retries
  * straight into the ban, so these stand down on a gate ladder instead of the
@@ -1539,6 +1557,8 @@ export default define({
 					recovering: false,
 					oocLocked: false,
 					oocLockReason: null,
+					permLocked: false,
+					permLockReason: null,
 					selfRecovery: false,
 					textParts: new Map(),
 					lastAssistantText: "",
@@ -2217,6 +2237,10 @@ export default define({
 				return false
 			}
 			if (w.aborting || selfAbortActive(w)) return false
+			if (w.permLocked) {
+				dbg(`${short(sid)} permanently locked — refusing abort+resume escalation`)
+				return false
+			}
 			if (w.oocLocked) {
 				dbg(`${short(sid)} oocLocked — refusing abort+resume escalation`)
 				return false
@@ -2263,6 +2287,21 @@ export default define({
 		}
 
 		/** Latch the OOC lock when a failure carries an out-of-context error (which `continue` can never clear). */
+		/** Latch the permanent-failure lock when the error names a model that is
+		 * gone. Returns true when recovery must be skipped this time. */
+		function maybeLockPermanent(sid: string, errMsg: string): boolean {
+			const w = ensureWatch(sid)
+			if (w.permLocked) return true
+			if (!PERMANENT_FAILURE_RE.test(errMsg)) return false
+			w.permLocked = true
+			w.permLockReason = errMsg.slice(0, 200)
+			log(
+				"warn",
+				`${short(sid)} permanent failure latched — recovery locked out until a genuine turn: ${errMsg.slice(0, 120)}`,
+			)
+			return true
+		}
+
 		function maybeLockOoc(sid: string, errMsg: string) {
 			const w = ensureWatch(sid)
 			if (w.oocLocked) return
@@ -2308,6 +2347,10 @@ export default define({
 		async function recover(sid: string, reason: string) {
 			const w = ensureWatch(sid)
 			if (w.recovering || w.aborting || w.gaveUp || w.userCancelled || w.permissionPending) return
+			if (w.permLocked) {
+				dbg(`${short(sid)} permanently locked — refusing recovery (reason: ${w.permLockReason?.slice(0, 80)})`)
+				return
+			}
 			if (w.oocLocked) {
 				dbg(`${short(sid)} oocLocked — refusing recovery (reason: ${w.oocLockReason?.slice(0, 80)})`)
 				return
@@ -4138,6 +4181,11 @@ export default define({
 							w.oocLockReason = null
 							log("info", `${short(sid)} genuine execution — clearing OOC lock`)
 						}
+						if (w.permLocked) {
+							w.permLocked = false
+							w.permLockReason = null
+							log("info", `${short(sid)} genuine execution — clearing permanent-failure lock`)
+						}
 						// A genuine turn is activity, and activity means quota is
 						// available again: the rate-limit ladder starts over. Our
 						// own recovery turns (selfRecovery) do not reset it.
@@ -4479,6 +4527,7 @@ export default define({
 					const errType = String(ev.data?.error?.type ?? "")
 					const errMsg = String(ev.data?.error?.message ?? "")
 					maybeLockOoc(sid, errMsg)
+					if (maybeLockPermanent(sid, errMsg)) return
 					log("info", `${short(sid)} provider retry #${ev.data?.attempt ?? "?"}: ${errType || errMsg}`)
 					if (!isStreamingFailure(errMsg, streamingFailureMessagePatterns) && !isStreamingFailureName(errType, streamingFailureErrorNames) && errType !== "retryable") return
 					// Let the provider retries play out first; only intervene if it stays quiet
@@ -4518,6 +4567,15 @@ export default define({
 						return
 					}
 					maybeLockOoc(sid, errMsg)
+					// Permanent failures still go idle — the session really is done —
+					// but nothing arms behind them, so no watchdog pass revives it.
+					if (maybeLockPermanent(sid, errMsg)) {
+						markIdle(sid)
+						w.pendingRecoveryArmed = false
+						w.recovering = false
+						log("warn", `${short(sid)} ${ev.type}: ${errType || "error"} ${errMsg.slice(0, 160)}`)
+					return
+					}
 					markIdle(sid)
 					w.pendingRecoveryArmed = true // our delayed recovery must survive this idle transition
 					log("warn", `${short(sid)} ${ev.type}: ${errType || "error"} ${errMsg.slice(0, 160)}`)
