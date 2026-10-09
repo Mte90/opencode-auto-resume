@@ -146,11 +146,5 @@ describe("v2: the singleton lives on globalThis, so re-evaluations share it", ()
 		// reload forensics read (mod + start time) so a superseding instance can
 		// name its predecessor instead of merely stepping on it.
 		expect(SOURCE).toContain("registry.live = { dispose, mod: MODULE_INSTANCE, startedAt: Date.now() }")
-		// The shell-alias dedupe must ride the same process-wide registry. A
-		// module-scope WeakSet was measured failing: a deploy re-evaluates the
-		// bundle twice (two distinct mod values 86ms apart in one pid), so each
-		// evaluation would annotate again.
-		expect(SOURCE).not.toContain("const annotatedToolEditors = new WeakSet")
-		expect(SOURCE).toContain("if (!reg.annotatedEditors) reg.annotatedEditors = new WeakSet<object>()")
 	})
 })

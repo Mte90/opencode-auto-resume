@@ -134,11 +134,6 @@ interface AutoResumeToolEditor {
 		input: Record<string, unknown>
 		execute: (input: any, context: { sessionID: string }) => Promise<{ content: string }>
 	}): void
-	/** Present in the shipped `@opencode/plugin` ToolEditor; optional here because
-	 *  a host that omits them must degrade to `add` alone, not throw. */
-	list?: () => readonly { id: string }[]
-	get?: (id: string) => { description?: string } | undefined
-	update?: (id: string, fn: (tool: { description?: string }) => void) => void
 }
 
 interface SessionWatch {
@@ -569,9 +564,6 @@ const DONE_WITHOUT_DETAILS_PROMPT =
  */
 const SHELL_OPEN_MAX_MS = 30 * 60_000
 
-/** Appended to the `shell` tool's description. One constant so the
- * already-annotated guard and the text itself cannot drift apart. */
-const SHELL_ALIAS_HINT = "In v1 sessions this tool was called `bash`; use this one."
 
 /** OOC (out-of-context) errors that `continue` can never clear — recovery is locked out on these. */
 const OOC_ERROR_RE = /exceeds the available context size|context size \(\d+\)|too large to compact|too many tokens|prompt is too long/i
@@ -1328,8 +1320,6 @@ const REGISTRY_KEY = `__auto_resume_singleton__:${process.pid}`
 
 type SingletonRegistry = {
 	live?: { dispose: () => void; mod: string; startedAt: number }
-	/** Editors already annotated with the shell alias, process-wide. */
-	annotatedEditors?: WeakSet<object>
 }
 
 function singletonRegistry(): SingletonRegistry {
@@ -1390,20 +1380,6 @@ export default define({
 			}
 			registry.live = undefined
 		}
-		/**
-		 * Editors already annotated with the shell alias hint.
-		 *
-		 * Process-wide, not module-scope: a deploy re-evaluates this bundle TWICE
-		 * (measured — two distinct mod values 86ms apart in one pid), and a
-		 * module-level WeakSet would give each evaluation its own, so the second
-		 * would annotate again. Same reasoning as the live-instance slot above.
-		 */
-		const annotatedToolEditors = (): WeakSet<object> => {
-			const reg = singletonRegistry()
-			if (!reg.annotatedEditors) reg.annotatedEditors = new WeakSet<object>()
-			return reg.annotatedEditors
-		}
-
 		const opts = (ctx.options ?? {}) as AutoResumeOptions
 
 		const chunkTimeoutMs = opts.chunkTimeoutMs ?? DEFAULT_CHUNK_TIMEOUT_MS
@@ -3268,63 +3244,6 @@ export default define({
 		 * call, so the escalation only ever measures a genuinely stuck loop rather
 		 * than several legitimate rounds of work.
 		 */
-		/**
-		 * Tell the model that `shell` is also called `bash`.
-		 *
-		 * The v2 plugin API cannot RENAME a tool. `ToolEditor` exposes list/get/
-		 * namespace/add/update/remove; `update` mutates a tool's Info and never its
-		 * id; the `tool.execute.before` payload types `tool` as readonly; and no
-		 * message-level hook rewrites an emitted call (the exposed hooks are
-		 * create.before, execute.before/after, model.request, http.* and
-		 * experimental.ws.handshake). opencode itself ships no such alias either —
-		 * the "bash" strings in the binary are shell-completion names and a
-		 * language-detection map, not a tool mapping. So an automatic bash->shell
-		 * rewrite is not reachable from a plugin.
-		 *
-		 * What IS available is prevention at the source: `update()` the real tool so
-		 * the provider sees the old name in its description and stops inventing the
-		 * call. Cost of not doing it, measured on the live log: 20 corrections in one
-		 * session, every one reporting exactly "called 2x" — one wasted call per
-		 * request, indefinitely. Not a runaway (the correction works, the count never
-		 * passes 2), but a permanent per-request tax.
-		 *
-		 * Deliberately NOT registering a `bash` tool that refuses: that would
-		 * advertise a permanently-failing name in the tool list and teach the model
-		 * to prefer it.
-		 */
-		async function annotateShellAlias(): Promise<void> {
-			if (!ctx.tool?.transform) return
-			try {
-				await ctx.tool.transform((editor) => {
-					// Annotated already? `get()` cannot answer this — see
-					// annotatedToolEditors — so identity is the only reliable check.
-					const seen = annotatedToolEditors()
-					if (seen.has(editor)) return
-					// Nothing to point at, or `bash` is genuinely the tool here rather
-					// than an alias for it.
-					if (editor.list?.().some((t) => t.id === "bash")) return
-					if (!editor.get?.("shell")) return
-					// Belt and braces for a host that DOES hand back live state.
-					if ((editor.get("shell")?.description ?? "").includes(SHELL_ALIAS_HINT)) {
-						seen.add(editor)
-						return
-					}
-					editor.update?.("shell", (tool) => {
-						tool.description = `${tool.description ?? ""} (${SHELL_ALIAS_HINT})`.trim()
-					})
-					seen.add(editor)
-					log(
-						"info",
-						`annotated the shell tool with its v1 name (bash) so the model stops inventing the call mod=${MODULE_INSTANCE}`,
-					)
-				})
-			} catch (e) {
-				// Best effort: a registry that refuses the annotation must not block
-				// the tool registration this plugin actually depends on.
-				dbg("shell alias annotation skipped:", e instanceof Error ? e.message : String(e))
-			}
-		}
-
 		async function registerTaskCompleteTool(): Promise<void> {
 			if (!ctx.tool?.transform) {
 				dbg("tool registry unavailable — task_complete not offered")
@@ -4812,8 +4731,6 @@ export default define({
 			}
 		}
 		void pump()
-
-		await annotateShellAlias()
 
 		if (superseded) {
 			// Two mod ids under ONE boot is the evidence that separates a plugin
