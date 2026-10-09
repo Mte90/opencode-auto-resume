@@ -573,18 +573,6 @@ const SHELL_OPEN_MAX_MS = 30 * 60_000
  * already-annotated guard and the text itself cannot drift apart. */
 const SHELL_ALIAS_HINT = "In v1 sessions this tool was called `bash`; use this one."
 
-/**
- * Editors already annotated, keyed by the editor object itself.
- *
- * `editor.get()` does NOT see an earlier `update()`: two transform callbacks in
- * one host, 74ms apart (measured on deploy, pid unchanged), each annotated the
- * same live tool and the description guard could not catch the second. A
- * description-string guard is therefore the wrong instrument — it reads state
- * the callback is not shown. Keying on the editor's identity annotates each
- * distinct registry exactly once, whether the host reuses one or builds a fresh
- * one per load. Weak, so a discarded registry is collectable.
- */
-const annotatedToolEditors = new WeakSet<object>()
 /** OOC (out-of-context) errors that `continue` can never clear — recovery is locked out on these. */
 const OOC_ERROR_RE = /exceeds the available context size|context size \(\d+\)|too large to compact|too many tokens|prompt is too long/i
 /** Failures a `continue` can never clear: the model itself is gone
@@ -1338,7 +1326,11 @@ function isTaskToolCall(ev: V2Event): boolean {
  */
 const REGISTRY_KEY = `__auto_resume_singleton__:${process.pid}`
 
-type SingletonRegistry = { live?: { dispose: () => void; mod: string; startedAt: number } }
+type SingletonRegistry = {
+	live?: { dispose: () => void; mod: string; startedAt: number }
+	/** Editors already annotated with the shell alias, process-wide. */
+	annotatedEditors?: WeakSet<object>
+}
 
 function singletonRegistry(): SingletonRegistry {
 	const g = globalThis as unknown as Record<string, SingletonRegistry | undefined>
@@ -1398,6 +1390,20 @@ export default define({
 			}
 			registry.live = undefined
 		}
+		/**
+		 * Editors already annotated with the shell alias hint.
+		 *
+		 * Process-wide, not module-scope: a deploy re-evaluates this bundle TWICE
+		 * (measured — two distinct mod values 86ms apart in one pid), and a
+		 * module-level WeakSet would give each evaluation its own, so the second
+		 * would annotate again. Same reasoning as the live-instance slot above.
+		 */
+		const annotatedToolEditors = (): WeakSet<object> => {
+			const reg = singletonRegistry()
+			if (!reg.annotatedEditors) reg.annotatedEditors = new WeakSet<object>()
+			return reg.annotatedEditors
+		}
+
 		const opts = (ctx.options ?? {}) as AutoResumeOptions
 
 		const chunkTimeoutMs = opts.chunkTimeoutMs ?? DEFAULT_CHUNK_TIMEOUT_MS
@@ -3292,20 +3298,21 @@ export default define({
 				await ctx.tool.transform((editor) => {
 					// Annotated already? `get()` cannot answer this — see
 					// annotatedToolEditors — so identity is the only reliable check.
-					if (annotatedToolEditors.has(editor)) return
+					const seen = annotatedToolEditors()
+					if (seen.has(editor)) return
 					// Nothing to point at, or `bash` is genuinely the tool here rather
 					// than an alias for it.
 					if (editor.list?.().some((t) => t.id === "bash")) return
 					if (!editor.get?.("shell")) return
 					// Belt and braces for a host that DOES hand back live state.
 					if ((editor.get("shell")?.description ?? "").includes(SHELL_ALIAS_HINT)) {
-						annotatedToolEditors.add(editor)
+						seen.add(editor)
 						return
 					}
 					editor.update?.("shell", (tool) => {
 						tool.description = `${tool.description ?? ""} (${SHELL_ALIAS_HINT})`.trim()
 					})
-					annotatedToolEditors.add(editor)
+					seen.add(editor)
 					log(
 						"info",
 						`annotated the shell tool with its v1 name (bash) so the model stops inventing the call mod=${MODULE_INSTANCE}`,
