@@ -193,6 +193,10 @@ interface SessionWatch {
 
 	// Recovery budgets
 	toolTextAttempts: number
+	/** Turns ended with a tool call that never returned. Re-arms per request
+	 * like the other nudge budgets: a new user message means new work, and an
+	 * old stuck call says nothing about this one. */
+	stuckToolAttempts: number
 	continueTimestamps: number[]
 	doneClaimAttempts: number
 	/** Done-claim with todos still open. Separate from `doneClaimAttempts`: the two
@@ -1647,6 +1651,7 @@ export default define({
 					lastAssistantText: "",
 					lastAssistantMessageID: null,
 					toolTextAttempts: 0,
+					stuckToolAttempts: 0,
 					continueTimestamps: [],
 					doneClaimAttempts: 0,
 					doneClaimOpenTodosAttempts: 0,
@@ -1706,6 +1711,7 @@ export default define({
 				// hallucination-loop detector counts across busy cycles by design.
 				w.resumeAttempts = 0
 				w.toolTextAttempts = 0
+				w.stuckToolAttempts = 0
 				// Deliberately NOT resetting doneClaimAttempts / doneClaimOpenTodosAttempts.
 				// v1 moved both out of the busy-cycle reset for a reason (#26): a model
 				// that keeps re-announcing completion would get a fresh budget on every
@@ -2764,7 +2770,7 @@ export default define({
 			sid: string,
 			kind: string,
 			prompt: string,
-			budgetKey: "toolTextAttempts" | "doneClaimAttempts" | "doneClaimOpenTodosAttempts" | "todoNudgeAttempts" | "intentNudgeAttempts",
+			budgetKey: "toolTextAttempts" | "doneClaimAttempts" | "doneClaimOpenTodosAttempts" | "todoNudgeAttempts" | "intentNudgeAttempts" | "stuckToolAttempts",
 		) {
 			const w = ensureWatch(sid)
 			if (w.recovering || w.userCancelled || w.permissionPending) return
@@ -3182,6 +3188,7 @@ export default define({
 			}
 			w.unknownToolErrors.clear()
 			w.unknownToolSuggestionSent = false
+			w.stuckToolAttempts = 0
 			// Deliberately NOT clearing checkedToolPartIDs: already-reported
 			// errors must never be recounted. Clearing it made every genuine
 			// user message re-suggest the same stale errors (2026-10-04: one
@@ -3229,6 +3236,62 @@ export default define({
 		 * error lands, the `session.tool.called` event for that part is long gone,
 		 * and this code only runs on idle anyway.
 		 */
+		/**
+		 * Nudge a turn that ended with a tool call that never returned.
+		 *
+		 * The event-counted `pendingTools` only sees what the plugin observed live:
+		 * a turn that ends while a call is still in flight (compress wedging at
+		 * 13:09:44 in ses_edf403f5, a write left streaming in ses_ee14d727) parks
+		 * the session idle with `pendingTools === 0`, no failure, and no stall — so
+		 * every event-driven path reads healthy-idle and stays silent. The history
+		 * still shows the unfinished part, so this reads it instead.
+		 *
+		 * Only parts newer than the last user message count: a user message after
+		 * the call means the turn is not parked, it moved on. Only parts older
+		 * than the stall window count: a call that just went out has not had a
+		 * chance to answer yet. Anything else (completed/error) is settled.
+		 */
+		async function checkForStuckToolCalls(sid: string, w: SessionWatch): Promise<boolean> {
+			if (w.userCancelled || w.completionSignaled) return false
+			{
+				const locked = lockKind(w)
+				if (locked) {
+					dbg(`${short(sid)} locked (${locked}) — skipping stuck-tool pass`)
+					return false
+				}
+			}
+			const messages = await loadMessages(sid)
+			let lastUserAt = 0
+			for (const m of messages as Array<{ type?: string; time?: { created?: number } }>) {
+				if (m?.type === "user" && typeof m?.time?.created === "number") lastUserAt = Math.max(lastUserAt, m.time.created)
+			}
+			const cutoff = Date.now() - chunkTimeoutMs - gracePeriodMs
+			const stuck: string[] = []
+			for (const m of messages as Array<{ type?: string; time?: { created?: number }; content?: Array<{ type?: string; name?: string; state?: { status?: string }; time?: { created?: number } }> }>) {
+				if (!m || m.type !== "assistant" || !Array.isArray(m.content)) continue
+				for (const part of m.content) {
+					if (part?.type !== "tool") continue
+					const st = part?.state?.status
+					if (st === "completed" || st === "error") continue
+					const created =
+						typeof part?.time?.created === "number" ? part.time.created
+						: typeof m?.time?.created === "number" ? m.time.created
+						: 0
+					if (created <= lastUserAt) continue
+					if (created >= cutoff) continue
+					const name = typeof part?.name === "string" && part.name ? part.name : "(unnamed)"
+					if (!stuck.includes(name)) stuck.push(name)
+				}
+			}
+			if (stuck.length === 0) return false
+			const names = stuck.slice(0, 3).join('", "')
+			const prompt =
+				`A "${names}" call never returned a result and the turn went idle waiting on it. `
+				+ `Proceed without it: continue the task from where you left off and do not retry the same call.`
+			log("warn", `${short(sid)} tool call(s) "${names}" stuck unfinished — nudging to proceed without it`)
+			return targetedRecovery(sid, "stuck-tool", prompt, "stuckToolAttempts").then(() => true)
+		}
+
 		async function checkForUnknownToolCalls(sid: string, w: SessionWatch): Promise<boolean> {
 			if (w.userCancelled || w.completionSignaled) return false
 			{
@@ -3428,6 +3491,12 @@ export default define({
 			// before delivering any text is precisely the case where every
 			// text-based check below would find nothing to look at.
 			if (await recoverSilentDeadStream(sid, messages)) return
+
+			// A turn parked on a tool result that never arrives reads healthy-idle
+			// to every event-driven path (no failure, no stall, counters at zero).
+			// The history still shows the unfinished part, so check it structurally
+			// here rather than in the text-dependent pattern phase below.
+			if (await checkForStuckToolCalls(sid, w)) return
 
 			// Prefer the live delta buffer; fall back to the authoritative message
 			// history when it is empty (e.g. the plugin loaded mid-turn) or stale.
