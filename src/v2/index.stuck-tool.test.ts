@@ -62,7 +62,7 @@ const ev = (type: string, sid: string, data: Record<string, unknown> = {}) => ({
 const push = (h: any, type: string, sid: string, data: Record<string, unknown> = {}) => h.streamRef.push(ev(type, sid, data))
 
 const OLD = Date.now() - 3600_000
-const TOOLS = [{ id: "read" }, { id: "write" }, { id: "shell" }, { id: "task_complete" }]
+const TOOLS = [{ id: "read" }, { id: "write" }, { id: "shell" }, { id: "task_complete" }, { id: "compress" }]
 
 const userMessage = (text: string, at: number) => ({
 	type: "user",
@@ -71,12 +71,12 @@ const userMessage = (text: string, at: number) => ({
 	content: [{ type: "text", text }],
 })
 
-const toolPart = (id: string, name: string, status: string, at: number) => ({
+const toolPart = (id: string, name: string, status: string, at: number, err?: unknown) => ({
 	type: "tool",
 	id,
 	name,
 	time: { created: at },
-	state: { status, input: {} },
+	state: { status, input: {}, ...(err === undefined ? {} : { error: err }) },
 })
 
 const assistantWith = (at: number, ...content: unknown[]) => ({
@@ -142,6 +142,7 @@ async function goIdle(h: any) {
 }
 
 const stuckNudges = (h: any) => h.injected.filter((i: any) => /never returned a result/.test(i.text ?? ""))
+const retryNudges = (h: any) => h.injected.filter((i: any) => /Retry it now/.test(i.text ?? ""))
 
 describe("v2: turns parked on an unanswered tool call", () => {
 	test("a streaming compress call earns a proceed-without-it nudge", async () => {
@@ -235,6 +236,149 @@ describe("v2: turns parked on an unanswered tool call", () => {
 		const said = stuckNudges(h)
 		await teardown(h)
 		expect(said).toHaveLength(0)
+	})
+
+	test("a failed compress is retried promptly, with no age wait", async () => {
+		// Fresh error (seconds old, inside the 60s age gate): failures of listed
+		// tools do not wait — the session cannot proceed until compress works.
+		const now = Date.now()
+		const h = await setup(
+			[
+				userMessage("go", now - 5000),
+				assistantWith(now - 2000, toolPart("call_1", "compress", "error", now - 2000, "boom: provider hiccup")),
+			],
+			{ chunkTimeoutMs: 600_000 },
+		)
+		await goIdle(h)
+		const said = retryNudges(h)
+		await teardown(h)
+		expect(said).toHaveLength(1)
+		expect(said[0].text).toContain('"compress"')
+		expect(said[0].text).toContain("boom: provider hiccup")
+	})
+
+	test("CONTROL: an aborted compress is never retried", async () => {
+		// 13:09 ses_edf403f5: the error was the user's own interrupt landing
+		// mid-turn. Retrying it would fight the user the latch exists to obey.
+		const now = Date.now()
+		const h = await setup(
+			[
+				userMessage("go", now - 5000),
+				assistantWith(
+					now - 2000,
+					toolPart("call_1", "compress", "error", now - 2000, {
+						type: "aborted",
+						message: "Tool execution interrupted: compress",
+					}),
+				),
+			],
+			{ chunkTimeoutMs: 600_000 },
+		)
+		await goIdle(h)
+		const said = retryNudges(h)
+		await teardown(h)
+		expect(said).toHaveLength(0)
+	})
+
+	test("CONTROL: a failed unknown name belongs to the suggester, not the retrier", async () => {
+		// Telling the model to reissue a name that does not exist teaches
+		// persistence on a typo. The suggestion path owns these.
+		const now = Date.now()
+		const h = await setup(
+			[
+				userMessage("go", now - 5000),
+				assistantWith(now - 2000, toolPart("call_1", "globb", "error", now - 2000, "tool not found")),
+			],
+			{ chunkTimeoutMs: 600_000 },
+		)
+		await goIdle(h)
+		const said = retryNudges(h)
+		await teardown(h)
+		expect(said).toHaveLength(0)
+	})
+
+	test("CONTROL: an error the model already continued past is handled feedback", async () => {
+		// Text after the error in the same message means the model saw it and
+		// moved on. Nudging those would nag on every normal turn.
+		const now = Date.now()
+		const h = await setup(
+			[
+				userMessage("go", now - 5000),
+				{
+					type: "assistant",
+					id: "msg_a_x",
+					time: { created: now - 2000 },
+					content: [
+						{ type: "tool", id: "call_1", name: "write", time: { created: now - 2000 }, state: { status: "error", input: {}, error: "disk full" } },
+						{ type: "text", text: "That path failed, trying the other one." },
+					],
+				},
+			],
+			{ chunkTimeoutMs: 600_000 },
+		)
+		await goIdle(h)
+		const said = retryNudges(h)
+		await teardown(h)
+		expect(said).toHaveLength(0)
+	})
+
+	test("CONTROL: an error in an earlier message with later model output is handled", async () => {
+		const now = Date.now()
+		const h = await setup(
+			[
+				userMessage("go", now - 5000),
+				assistantWith(now - 4000, toolPart("call_1", "write", "error", now - 4000, "disk full")),
+				assistantWith(now - 2000, toolPart("call_2", "read", "completed", now - 2000)),
+			],
+			{ chunkTimeoutMs: 600_000 },
+		)
+		await goIdle(h)
+		const said = retryNudges(h)
+		await teardown(h)
+		expect(said).toHaveLength(0)
+	})
+
+	test("CONTROL: a trailing error with another call still in flight waits", async () => {
+		// The in-flight call may yet resolve the turn on its own; the stall and
+		// dead-stream paths own that case, not this one.
+		const now = Date.now()
+		const h = await setup(
+			[
+				userMessage("go", now - 5000),
+				{
+					type: "assistant",
+					id: "msg_a_x",
+					time: { created: now - 2000 },
+					content: [
+						{ type: "tool", id: "call_1", name: "write", time: { created: now - 2000 }, state: { status: "error", input: {}, error: "disk full" } },
+						{ type: "tool", id: "call_2", name: "shell", time: { created: now - 1500 }, state: { status: "running", input: {} } },
+					],
+				},
+			],
+			{ chunkTimeoutMs: 600_000 },
+		)
+		await goIdle(h)
+		const said = retryNudges(h)
+		await teardown(h)
+		expect(said).toHaveLength(0)
+	})
+
+	test("a trailing failed write is retried", async () => {
+		// The upstream job's failed write: turn ended on the error, nothing
+		// after it. Known tool, non-abort error, newer than the user message.
+		const now = Date.now()
+		const h = await setup(
+			[
+				userMessage("go", now - 5000),
+				assistantWith(now - 2000, toolPart("call_1", "write", "error", now - 2000, "permission denied")),
+			],
+			{ chunkTimeoutMs: 600_000 },
+		)
+		await goIdle(h)
+		const said = retryNudges(h)
+		await teardown(h)
+		expect(said).toHaveLength(1)
+		expect(said[0].text).toContain('"write"')
 	})
 
 	test("the nudge names the tool and tells the model not to retry it", async () => {

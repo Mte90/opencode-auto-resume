@@ -150,6 +150,22 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		expect(attempts.filter((a: string | null) => a === "1").length).toBeGreaterThanOrEqual(2)
 	})
 
+	test("tool completions alone do not restart the ladder", async () => {
+		// ses_edf403f5, 2026-10-09: three dead-stream stalls 60s apart all read
+		// 1/3 because a tool completion sat between each pair. A completion with
+		// no model text is the stall loop wearing a hat, not a new episode —
+		// counting it makes gaveUp unreachable. Only text growth restarts.
+		const h = await setup()
+		push(h, "session.execution.started", SID)
+		await wait(10)
+		await waitFor(() => h.injected.length >= 1)
+		push(h, "session.tool.success", SID, { tool: "shell", id: "call_9" })
+		await waitFor(() => h.injected.length >= 2)
+		const attempts = h.injected.map((i: any) => attemptOf(i.text))
+		await teardown(h)
+		expect(attempts.slice(0, 2)).toEqual(["1", "2"])
+	})
+
 	test("CONTROL: silence without progress keeps climbing across injections", async () => {
 		// The regression this pins: after a successful stall injection the session
 		// is idle again when the next stall timer fires, so markBusy transitions it

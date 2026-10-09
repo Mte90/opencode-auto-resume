@@ -678,7 +678,7 @@ const SELF_ABORT_TTL_MS = 30_000
  * `{type:"aborted", message:"Step interrupted"}`, which the older
  * `("interrupted by user" | type contains "cancel")` filter never matched. */
 const ABORT_ERROR_TYPE_RE = /^(abort|aborted|cancel|cancelled|canceled|interrupted)$/i
-const ABORT_ERROR_MSG_RE = /step interrupted|interrupted by user|request cancelled|request canceled/i
+const ABORT_ERROR_MSG_RE = /step interrupted|interrupted by user|request cancelled|request canceled|execution interrupted/i
 /** Hard cap on plugin-initiated interrupts. An interrupt persists an errored
  * assistant message that the UI surfaces as a send failure, so it is a last
  * resort, not a routine recovery step. */
@@ -716,6 +716,18 @@ const TEXT_BUFFER_TRIM_LEN = 20_000
  * that tested for it literally could never fire on v2.
  */
 const TOOL_STATE_RUNNING = "running"
+/** Readable text out of a tool part error/result payload, which arrives as a
+ * string or as `{type, message}` depending on the producer. "" when absent. */
+function toolErrorText(state: { error?: unknown; output?: unknown } | undefined): string {
+	const e = state?.error ?? state?.output
+	if (typeof e === "string") return e
+	if (e && typeof e === "object") {
+		const t = e as { type?: unknown; message?: unknown }
+		const parts = [t.type, t.message].filter((x): x is string => typeof x === "string" && x.length > 0)
+		if (parts.length > 0) return parts.join(" ")
+	}
+	return ""
+}
 /** Kept for v1-shaped payloads; harmless on v2. */
 const TOOL_STATE_PENDING = "pending"
 const TOOL_STATE_COMPLETED = "completed"
@@ -2559,11 +2571,15 @@ export default define({
 			}
 			// A stall after fresh model output is a NEW episode, not a deeper
 			// one: restart the ladder so it reads attempt 1/3 again
-			// (ses_ee7dade1 — 2/3 landed after real work). Text growth since
-			// our last prod, or tool completions since it, both count. Silent
-			// consecutive prods keep climbing toward gaveUp. gaveUp itself is
-			// left alone: only a fresh turn (markBusy) clears that latch.
-			if (w.lastProdText !== "" && (w.lastAssistantText !== w.prodAssistantSnapshot || w.completedSinceProd > 0)) {
+			// (ses_ee7dade1 — 2/3 landed after real work). Only assistant TEXT
+			// growth counts, deliberately not tool completions: a completion
+			// between stalls is the stall loop itself wearing a hat, and counting
+			// it makes gaveUp unreachable — every cycle reads 1/3 forever
+			// (ses_edf403f5, 2026-10-09: three dead-stream 1/3s 60s apart, each
+			// preceded by a tool completion). Silent consecutive prods keep
+			// climbing toward gaveUp. gaveUp itself is left alone: only a fresh
+			// turn (markBusy) clears that latch.
+			if (w.lastProdText !== "" && w.lastAssistantText !== w.prodAssistantSnapshot) {
 				w.resumeAttempts = 0
 			}
 			recordContinue(sid)
@@ -3252,7 +3268,8 @@ export default define({
 		 * and this code only runs on idle anyway.
 		 */
 		/**
-		 * Nudge a turn that ended with a tool call that never returned.
+		 * Nudge a turn that ended with a tool call that never returned, or retry
+		 * one that failed at end of turn.
 		 *
 		 * The event-counted `pendingTools` only sees what the plugin observed live:
 		 * a turn that ends while a call is still in flight (compress wedging at
@@ -3282,20 +3299,68 @@ export default define({
 			}
 			const cutoff = Date.now() - stuckToolAgeMs
 			const stuck: string[] = []
-			for (const m of messages as Array<{ type?: string; time?: { created?: number }; content?: Array<{ type?: string; name?: string; state?: { status?: string }; time?: { created?: number } }> }>) {
+			// A failed call is retried only when the turn ENDED on it: the error
+			// is the trailing part of the latest assistant content, with nothing
+			// after it. An error the model already continued past (later text or
+			// later calls) is handled feedback, not abandonment — nudging those
+			// would nag on every normal turn. Unknown names belong to the
+			// suggester, not the retrier: telling the model to reissue a name
+			// that does not exist teaches persistence on a typo.
+			let trailing: { name: string; err: string; created: number } | null = null
+			let anythingInFlight = false
+			for (const m of messages as Array<{ type?: string; time?: { created?: number }; content?: Array<{ type?: string; name?: string; state?: { status?: string; error?: unknown; output?: unknown }; time?: { created?: number } }> }>) {
 				if (!m || m.type !== "assistant" || !Array.isArray(m.content)) continue
 				for (const part of m.content) {
-					if (part?.type !== "tool") continue
+					if (part?.type !== "tool") {
+						trailing = null
+						continue
+					}
 					const st = part?.state?.status
-					if (st === "completed" || st === "error") continue
+					const name = typeof part?.name === "string" && part.name ? part.name : "(unnamed)"
 					const created =
 						typeof part?.time?.created === "number" ? part.time.created
 						: typeof m?.time?.created === "number" ? m.time.created
 						: 0
+					if (st === "error") {
+						const rawErr =
+							part?.state && typeof part.state === "object"
+								? (part.state as { error?: unknown }).error
+								: undefined
+						const eType =
+							rawErr && typeof rawErr === "object" && typeof (rawErr as { type?: unknown }).type === "string"
+								? ((rawErr as { type?: string }).type as string)
+								: ""
+						const eMsg = toolErrorText(part?.state)
+						// Abort-shaped errors are never retried: that path fights a
+						// user interrupt (ses_edf403f5 13:09: the error WAS the
+						// user's own stop landing mid-turn).
+						if (isAbortError(eType, eMsg)) {
+							trailing = null
+							continue
+						}
+						trailing = { name, err: eMsg.slice(0, 160), created }
+						continue
+					}
+					if (st === "completed") {
+						trailing = null
+						continue
+					}
 					if (created <= lastUserAt) continue
+					anythingInFlight = true
 					if (created >= cutoff) continue
-					const name = typeof part?.name === "string" && part.name ? part.name : "(unnamed)"
 					if (!stuck.includes(name)) stuck.push(name)
+				}
+			}
+			// A call still in flight (any age) means the turn may yet resolve on
+			// its own — the stall and dead-stream paths own that case, not this one.
+			if (trailing && !anythingInFlight && trailing.created > lastUserAt) {
+				const available = await getAvailableToolIds()
+				if (available.length > 0 && available.includes(trailing.name)) {
+					const prompt =
+						`The "${trailing.name}" call failed${trailing.err ? ` with: ${trailing.err}` : ""}. ` +
+						`Retry it now — reissue the same call.`
+					log("warn", `${short(sid)} "${trailing.name}" failed at end of turn, retrying promptly (attempt ${(w.stuckToolAttempts ?? 0) + 1}/${maxRetries})`)
+					return targetedRecovery(sid, "stuck-tool", prompt, "stuckToolAttempts").then(() => true)
 				}
 			}
 			if (stuck.length === 0) return false
