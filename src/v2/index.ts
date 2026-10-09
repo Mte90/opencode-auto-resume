@@ -148,6 +148,12 @@ interface SessionWatch {
 	resumeAttempts: number
 	lastRetryAt: number
 	gaveUp: boolean
+	/** Newest genuine (non-own-prompt) user message observed, by timestamp. Our
+	 * own injections travel as user messages but carry no new instructions, so
+	 * they must not read as the user taking over (see noteInboundUserMessage).
+	 * Compared against lastInjectAt to tell our episode continuing from the
+	 * user starting a new one. */
+	lastGenuineUserAt: number
 	/** Consecutive failure-driven recoveries with no model output between them.
 	 * A dead backend turns every injected continue into the next failure, so
 	 * without this the ladder cycles 1/3, 2/3, 3/3, gaveUp, abort+resume,
@@ -1683,6 +1689,7 @@ export default define({
 					resumeAttempts: 0,
 					lastRetryAt: 0,
 					gaveUp: false,
+					lastGenuineUserAt: 0,
 					consecFailureRecovers: 0,
 					failureLoopLatched: false,
 					aborting: false,
@@ -1763,7 +1770,13 @@ export default define({
 				// Fresh busy cycle: reset per-turn budgets.
 				// NOTE: continueTimestamps is intentionally preserved — the
 				// hallucination-loop detector counts across busy cycles by design.
-				w.resumeAttempts = 0
+				// NOTE 2: resumeAttempts is deliberately NOT reset here. Lifecycle
+				// transitions are plumbing, and an interleaving idle event between
+				// our send and the model's start made every other stall read 1/3
+				// forever (ses_ee14d727). Episode boundaries live where they can
+				// be observed: a genuine user message (execution.started,
+				// noteInboundUserMessage), model text growth (recover), and the
+				// abort+resume escalation. Nowhere else.
 				w.toolTextAttempts = 0
 				w.stuckToolAttempts = 0
 				// Deliberately NOT resetting doneClaimAttempts / doneClaimOpenTodosAttempts.
@@ -2728,13 +2741,7 @@ export default define({
 					if (ok) {
 						w.lastRetryAt = Date.now()
 						touch(sid)
-						// Preserve the attempt count across markBusy. The stall timer
-						// fires while the session is idle, so markBusy transitions it to
-						// busy and zeroes resumeAttempts — every stall then reads 1/3 and
-						// the ladder never climbs (ses_ee14d727, 2026-10-09).
-						const attempts = w.resumeAttempts
 						markBusy(sid)
-						w.resumeAttempts = attempts
 					} else if (attempt >= maxRetries) {
 						await tryAbortAndResume(sid, w)
 					}
@@ -3307,6 +3314,19 @@ export default define({
 			w.unknownToolErrors.clear()
 			w.unknownToolSuggestionSent = false
 			w.stuckToolAttempts = 0
+			// A genuine user message is a new episode for the stall ladder too
+			// (the reset lives here, on genuine execution.started, and in the
+			// progress check — never on lifecycle transitions). Recorded
+			// separately from lastUserMessageSeenAt, which our own prompts also
+			// advance: only non-own messages mark a user takeover.
+			w.lastGenuineUserAt = typeof latest.at === "number" ? latest.at : Date.now()
+			// A genuine user message is a new episode for the stall ladder too
+			// (the reset lives here, on genuine execution.started, and in the
+			// progress check — never on lifecycle transitions).
+			if (w.resumeAttempts > 0) {
+				dbg(`${short(sid)} new user message — restarting the stall ladder`)
+			}
+			w.resumeAttempts = 0
 			// Deliberately NOT clearing checkedToolPartIDs: already-reported
 			// errors must never be recounted. Clearing it made every genuine
 			// user message re-suggest the same stale errors (2026-10-04: one
@@ -4710,6 +4730,15 @@ export default define({
 						w.rateLimitedAt = 0
 						w.rateLimitAttempts = 0
 						w.awaitingQuotaRetry = false
+						// A genuine turn is also a new episode for the stall
+						// ladder (the reset lives here and in the progress check,
+						// never on lifecycle transitions) — unless our inject is
+						// newer than any genuine user message, in which case the
+						// turn continues our episode (interleaving idle events do
+						// not end it).
+						if (!(w.lastInjectAt > 0 && w.lastInjectAt >= w.lastGenuineUserAt)) {
+							w.resumeAttempts = 0
+						}
 					}
 					markBusy(sid)
 					return

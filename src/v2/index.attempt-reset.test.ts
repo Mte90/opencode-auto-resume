@@ -166,6 +166,27 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		expect(attempts.slice(0, 2)).toEqual(["1", "2"])
 	})
 
+	test("an idle between our send and the model's start does not restart the ladder", async () => {
+		// ses_ee14d727, 2026-10-09: 1/3, one script, 1/3 again. Resets live only
+		// where a new episode is observable — a genuine user message newer than
+		// our last inject, or model text growth — never on lifecycle transitions
+		// like the idle->busy one here. Our inject stays the newest causative
+		// event, so the ladder climbs.
+		const h = await setup()
+		push(h, "session.execution.started", SID)
+		await wait(10)
+		await waitFor(() => h.injected.length >= 1)
+		push(h, "session.idle", SID)
+		await wait(10)
+		push(h, "session.execution.started", SID)
+		await wait(10)
+		push(h, "session.tool.success", SID, { tool: "shell", id: "call_9" })
+		await waitFor(() => h.injected.length >= 2)
+		const attempts = h.injected.map((i: any) => attemptOf(i.text))
+		await teardown(h)
+		expect(attempts.slice(0, 2)).toEqual(["1", "2"])
+	})
+
 	test("CONTROL: silence without progress keeps climbing across injections", async () => {
 		// The regression this pins: after a successful stall injection the session
 		// is idle again when the next stall timer fires, so markBusy transitions it
