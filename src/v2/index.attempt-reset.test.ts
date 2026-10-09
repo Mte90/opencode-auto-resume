@@ -206,4 +206,21 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		expect(text).toContain("idle ")
 	})
 
+	test("failure stalls carry no idle field at all", async () => {
+		// A failure just happened: "idle 2s" next to the reason is noise, not
+		// news. Reason + attempt + timestamp only.
+		const h = await setup()
+		push(h, "session.execution.started", SID)
+		await wait(10)
+		push(h, "session.step.failed", SID, {
+			error: { type: "provider.invalid-request", message: "Error from the provider: 400 Bad Request" },
+		})
+		await wait(400)
+		const text = h.injected[0]?.text ?? ""
+		await teardown(h)
+		expect(text).toContain("session.step.failed")
+		expect(text).not.toContain("idle ")
+		expect(text).toMatch(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/)
+	})
+
 })
