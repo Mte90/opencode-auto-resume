@@ -571,21 +571,14 @@ const SHELL_OPEN_MAX_MS = 30 * 60_000
 
 /** OOC (out-of-context) errors that `continue` can never clear — recovery is locked out on these. */
 const OOC_ERROR_RE = /exceeds the available context size|context size \(\d+\)|too large to compact|too many tokens|prompt is too long/i
-/** Failures a `continue` can never clear: the model itself is gone
- * (deprecated/retired/removed) or the provider does not know it. Matched on
- * the MESSAGE, never the error type — `provider.invalid-request` also carries
- * transient 400s (ses_…a48FZxYX, 2026-10-07), and latching those would mute
- * recovery for a session that just needs one more try. ses_ee46693e
- * (2026-10-08): "Model exo-free has been deprecated" matched no recovery
- * category and fell into generic stall recovery, retrying a dead model. */
 /** Exact `error.type` values a `continue` can never clear. These ARE opencode's
  * own taxonomy (packages/llm/src/schema/errors.ts), read off the running binary's
  * type->tag switch — not guesses. Each maps to a reason class whose
  * `get retryable()` returns false there: Authentication:69, NoRoute:53,
- * UnknownProvider:155, ContentPolicy:104. UnsupportedOperation is in the shipped
- * binary but absent from the dev union, so its retryable getter is unverified; it
- * is gated on class semantics instead (the model cannot perform the operation, so
- * repeating the request cannot change that).
+ * UnknownProvider:155, ContentPolicy:104. UnsupportedOperation and Unknown are NOT
+ * here — both proved broader than their names (transient aborts arrive as
+ * provider.unknown; ses_ee14d727 locked out 5+ min). They live in
+ * INDETERMINATE_ERROR_TYPES below: one retry, then latch.
  *
  * Exact strings, never a `provider.*` prefix: the same file marks RateLimit (:82)
  * and ProviderInternal (:117) retryable, and Transport (:129) plus
@@ -2104,9 +2097,12 @@ export default define({
 			// answer at all (observed: the unknown-tool suggestion landing on a session
 			// whose provider had just latched). The stall callers already checked; this
 			// closes the other three and every future path.
-			if (w.permLocked || w.oocLocked) {
-				dbg(`${short(sid)} locked (${w.permLocked ? "permanent" : "ooc"}) — injection refused on every path`)
-				return false
+			{
+				const kind = lockKind(w)
+				if (kind) {
+					dbg(`${short(sid)} locked (${kind}) — injection refused on every path`)
+					return false
+				}
 			}
 			if (!allowDuringSelfAbort && selfAbortActive(w)) {
 				dbg(`${short(sid)} injection refused — inside our own abort window`)
@@ -2339,13 +2335,12 @@ export default define({
 				return false
 			}
 			if (w.aborting || selfAbortActive(w)) return false
-			if (w.permLocked) {
-				dbg(`${short(sid)} permanently locked — refusing abort+resume escalation`)
-				return false
-			}
-			if (w.oocLocked) {
-				dbg(`${short(sid)} oocLocked — refusing abort+resume escalation`)
-				return false
+			{
+				const kind = lockKind(w)
+				if (kind) {
+					dbg(`${short(sid)} ${kind} locked — refusing abort+resume escalation`)
+					return false
+				}
 			}
 			if (w.compacting) {
 				dbg(`${short(sid)} mid-compaction — refusing abort+resume escalation`)
@@ -2434,6 +2429,38 @@ export default define({
 			return true
 		}
 
+		/** Central lock query: which lock (if any) holds this watch.
+		 * Every injection-path guard calls this instead of testing the two flags
+		 * inline, so a third lock class means editing here, not N call sites. */
+		function lockKind(w: SessionWatch): "permanent" | "ooc" | null {
+			if (w.permLocked) return "permanent"
+			if (w.oocLocked) return "ooc"
+			return null
+		}
+
+		/** Human-readable lock reason for log lines. */
+		function lockReason(w: SessionWatch): string {
+			const kind = lockKind(w)
+			if (kind === "permanent") return w.permLockReason?.slice(0, 80) ?? "n/a"
+			if (kind === "ooc") return w.oocLockReason?.slice(0, 80) ?? "n/a"
+			return "n/a"
+		}
+
+		/** Central lock release, called on a genuine turn. */
+		function clearLocks(w: SessionWatch, sid: string): void {
+			if (w.oocLocked) {
+				w.oocLocked = false
+				w.oocLockReason = null
+				log("info", `${short(sid)} genuine execution — clearing OOC lock mod=${MODULE_INSTANCE}`)
+			}
+			w.indeterminateStrikes = 0
+			if (w.permLocked) {
+				w.permLocked = false
+				w.permLockReason = null
+				log("info", `${short(sid)} genuine execution — clearing permanent-failure lock mod=${MODULE_INSTANCE}`)
+			}
+		}
+
 		function maybeLockOoc(sid: string, errMsg: string) {
 			const w = ensureWatch(sid)
 			if (w.oocLocked) return
@@ -2471,12 +2498,12 @@ export default define({
 				// Best effort: a todo-read failure must never block recovery.
 			}
 			const now = new Date().toISOString()
-		const elapsed = w.lastActivityAt ? Math.round((Date.now() - w.lastActivityAt) / 1000) : 0
-		const hms = (n: number) =>
-			n < 60 ? `${n}s` : n < 3600 ? `${Math.floor(n / 60)}m ${n % 60}s` : `${Math.floor(n / 3600)}h ${Math.floor((n % 3600) / 60)}m`
-		return (
-			`continue — stalled (${reason}; attempt ${attempt}/${maxRetries}; idle ${hms(elapsed)}; ${now}).\n${suffix}`
-		).slice(0, 2000)
+			const elapsed = w.lastActivityAt ? Math.round((Date.now() - w.lastActivityAt) / 1000) : 0
+			const hms = (n: number) =>
+				n < 60 ? `${n}s` : n < 3600 ? `${Math.floor(n / 60)}m ${n % 60}s` : `${Math.floor(n / 3600)}h ${Math.floor((n % 3600) / 60)}m`
+			return (
+				`continue — stalled (${reason}; attempt ${attempt}/${maxRetries}; idle ${hms(elapsed)}; ${now}).\n${suffix}`
+			).slice(0, 2000)
 		}
 
 		/**
@@ -2486,13 +2513,12 @@ export default define({
 		async function recover(sid: string, reason: string) {
 			const w = ensureWatch(sid)
 			if (w.recovering || w.aborting || w.gaveUp || w.userCancelled || w.permissionPending) return
-			if (w.permLocked) {
-				dbg(`${short(sid)} permanently locked — refusing recovery (reason: ${w.permLockReason?.slice(0, 80)})`)
-				return
-			}
-			if (w.oocLocked) {
-				dbg(`${short(sid)} oocLocked — refusing recovery (reason: ${w.oocLockReason?.slice(0, 80)})`)
-				return
+			{
+				const kind = lockKind(w)
+				if (kind) {
+					dbg(`${short(sid)} ${kind} locked — refusing recovery (reason: ${lockReason(w)})`)
+					return
+				}
 			}
 			if (w.compacting) {
 				dbg(`${short(sid)} mid-compaction — refusing recovery (reason: ${reason})`)
@@ -2747,9 +2773,12 @@ export default define({
 			// marks its parts examined and sets its one-shot flag BEFORE sending, so a
 			// refused nudge would leave the feature dead until the next user message.
 			// Bailing here keeps the budget intact for when the lock clears.
-			if (w.permLocked || w.oocLocked) {
-				dbg(`${short(sid)} locked (${w.permLocked ? "permanent" : "ooc"}) — skipping ${kind} nudge`)
-				return
+			{
+				const locked = lockKind(w)
+				if (locked) {
+					dbg(`${short(sid)} locked (${locked}) — skipping ${kind} nudge`)
+					return
+				}
 			}
 			if (w.compacting) {
 				dbg(`${short(sid)} mid-compaction — skipping ${kind} nudge`)
@@ -3202,9 +3231,12 @@ export default define({
 		 */
 		async function checkForUnknownToolCalls(sid: string, w: SessionWatch): Promise<boolean> {
 			if (w.userCancelled || w.completionSignaled) return false
-			if (w.permLocked || w.oocLocked) {
-				dbg(`${short(sid)} locked (${w.permLocked ? "permanent" : "ooc"}) — skipping unknown-tool pass`)
-				return false
+			{
+				const locked = lockKind(w)
+				if (locked) {
+					dbg(`${short(sid)} locked (${locked}) — skipping unknown-tool pass`)
+					return false
+				}
 			}
 			try {
 				const messages = await loadMessages(sid)
@@ -4334,17 +4366,7 @@ export default define({
 					if (w.selfRecovery) {
 						w.selfRecovery = false
 					} else {
-						if (w.oocLocked) {
-							w.oocLocked = false
-							w.oocLockReason = null
-							log("info", `${short(sid)} genuine execution — clearing OOC lock mod=${MODULE_INSTANCE}`)
-						}
-						w.indeterminateStrikes = 0
-						if (w.permLocked) {
-							w.permLocked = false
-							w.permLockReason = null
-							log("info", `${short(sid)} genuine execution — clearing permanent-failure lock mod=${MODULE_INSTANCE}`)
-						}
+						clearLocks(w, sid)
 						// A genuine turn is activity, and activity means quota is
 						// available again: the rate-limit ladder starts over. Our
 						// own recovery turns (selfRecovery) do not reset it.
