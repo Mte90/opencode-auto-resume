@@ -150,14 +150,31 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		expect(attempts.filter((a: string | null) => a === "1").length).toBeGreaterThanOrEqual(2)
 	})
 
-	test("CONTROL: silence without progress keeps climbing", async () => {
+	test("CONTROL: silence without progress keeps climbing across injections", async () => {
+		// The regression this pins: after a successful stall injection the session
+		// is idle again when the next stall timer fires, so markBusy transitions it
+		// to busy and zeroed resumeAttempts — every stall read 1/3 and the ladder
+		// never climbed (ses_ee14d727, 2026-10-09: two occurrences, both 1/3).
 		const h = await setup()
 		push(h, "session.execution.started", SID)
 		await wait(10)
 		await wait(650)
 		const attempts = h.injected.map((i: any) => attemptOf(i.text))
+		await teardown(h)
 		expect(attempts.length).toBeGreaterThanOrEqual(2)
 		expect(attempts[attempts.length - 1]).not.toBe("1")
-		await teardown(h)
+		// And it must have grown, not repeated: 1/3 then 2/3 (or deeper).
+		expect(attempts.some((a: string | null) => a === "2")).toBe(true)
 	})
+
+	test("the stall message carries a timestamp and idle duration", async () => {
+		const h = await setup()
+		push(h, "session.execution.started", SID)
+		await wait(250)
+		const text = h.injected[0]?.text ?? ""
+		await teardown(h)
+		expect(text).toContain("idle ")
+		expect(text).toMatch(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/)
+	})
+
 })

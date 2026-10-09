@@ -2451,6 +2451,7 @@ export default define({
 		 * guards either way — only the content changes.
 		 */
 		async function buildStallContinueText(sid: string, reason: string, attempt: number): Promise<string> {
+			const w = ensureWatch(sid)
 			if (opts.continuePrompt !== undefined && opts.continuePrompt !== "") return opts.continuePrompt
 			if (!richContinuePrompt) return CONTINUE_PROMPT
 			let suffix = "Todo list unavailable."
@@ -2469,7 +2470,13 @@ export default define({
 			} catch {
 				// Best effort: a todo-read failure must never block recovery.
 			}
-			return `continue — stalled (${reason}; attempt ${attempt}/${maxRetries}).\n${suffix}`.slice(0, 2000)
+			const now = new Date().toISOString()
+		const elapsed = w.lastActivityAt ? Math.round((Date.now() - w.lastActivityAt) / 1000) : 0
+		const hms = (n: number) =>
+			n < 60 ? `${n}s` : n < 3600 ? `${Math.floor(n / 60)}m ${n % 60}s` : `${Math.floor(n / 3600)}h ${Math.floor((n % 3600) / 60)}m`
+		return (
+			`continue — stalled (${reason}; attempt ${attempt}/${maxRetries}; idle ${hms(elapsed)}; ${now}).\n${suffix}`
+		).slice(0, 2000)
 		}
 
 		/**
@@ -2571,7 +2578,13 @@ export default define({
 					if (ok) {
 						w.lastRetryAt = Date.now()
 						touch(sid)
+						// Preserve the attempt count across markBusy. The stall timer
+						// fires while the session is idle, so markBusy transitions it to
+						// busy and zeroes resumeAttempts — every stall then reads 1/3 and
+						// the ladder never climbs (ses_ee14d727, 2026-10-09).
+						const attempts = w.resumeAttempts
 						markBusy(sid)
+						w.resumeAttempts = attempts
 					} else if (attempt >= maxRetries) {
 						await tryAbortAndResume(sid, w)
 					}
