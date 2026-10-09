@@ -180,6 +180,11 @@ interface SessionWatch {
 	 * duplicate skip promises 'zero model progress' but text growth
 	 * plus in-flight tools cannot see a tool that ran silently. */
 	completedSinceProd: number
+	/** Successful tool/shell completions since the last successful prod.
+	 * Success-only on purpose: failures increment completedSinceProd but
+	 * must keep the ladder climbing (failure-loop latch owns that path).
+	 * Reset on every own-inject next to completedSinceProd. */
+	succeededSinceProd: number
 	/** Texts this plugin injected (visible channel posts them as real user
 	 * messages). `noteInboundUserMessage` must not read them as new user
 	 * instructions, or every injection re-arms the budgets it just spent and
@@ -271,6 +276,11 @@ interface SessionWatch {
 	rateLimitedAt: number
 	rateLimitAttempts: number
 	awaitingQuotaRetry: boolean
+	/** Which cooldown ladder this episode waits on: null selects the quota
+	 * ladder, a set array the slot-busy one. Chosen at classify time,
+	 * honoured by the handler, the watchdog tick and quota-restore, cleared
+	 * on a genuine turn next to the other ladder state. */
+	rateLimitLadder: number[] | null
 	unknownToolErrors: Map<string, number>
 	/** Set once a suggestion has been injected, so it is sent at most once per
 	 * user message rather than on every idle. */
@@ -420,6 +430,14 @@ export interface AutoResumeOptions {
 	 * until a genuine user turn. Default spans ~12h for overnight coverage.
 	 */
 	rateLimitCooldownsMs?: number[]
+	/**
+	 * Per-attempt cooldowns (ms) before a slot-busy (HTTP 503) session may be
+	 * retried. Inverted economics vs the quota ladder: a 503 rejects
+	 * pre-prefill (cheap — no wasted work) while coder occupancy runs minutes
+	 * to hours, so patience is cheap and giving up is expensive. Default ramps
+	 * 1m→30m and holds 30m for ~4h total, then stands down like quota.
+	 */
+	slotBusyCooldownsMs?: number[]
 	/** Bound (ms) on any single recovery send; see DEFAULT_SEND_TIMEOUT_MS. */
 	sendTimeoutMs?: number
 	/**
@@ -687,6 +705,9 @@ const RATE_LIMIT_RE = /rate limit exceeded|too many requests|\b429\b|quota excee
  * 30m, 1h, then 2h out to ~12h of unattended coverage. Past the ladder the
  * session stays silent until a genuine user turn. */
 const DEFAULT_RATE_LIMIT_COOLDOWNS_MS = [15, 30, 60, 120, 120, 120, 120, 120].map((m) => m * 60_000)
+const DEFAULT_SLOT_BUSY_COOLDOWNS_MS = [60, 120, 300, 600, 900, 1800, 1800, 1800, 1800, 1800, 1800, 1800].map(
+	(s) => s * 1000,
+)
 /** Bound on any single recovery send (prompt/synthetic). A transport
  * await that never settles stacks cascades that flush together as twins
  * (ses_ee7dade1, 2026-10-07: two texts 5ms apart, one wedged minutes).
@@ -1209,6 +1230,13 @@ function backoffMs(attempt: number, base: number, max: number): number {
 	return Math.min(base * Math.pow(2, attempt - 1), max)
 }
 
+/** Silence-watchdog recover reasons look like "no activity for 186s". Shared
+ * by the stall-text builder (idle-field dedup) and recover (episode reset):
+ * only a silence stall can forgive tool progress, never a failure one. */
+function isSilenceReason(reason: string): boolean {
+	return /^no activity for \d+s/i.test(reason)
+}
+
 function isStreamingFailure(message: string, patterns: string[] = STREAMING_FAILURE_MESSAGE_PATTERNS): boolean {
 	const lower = message.toLowerCase()
 	if (!lower) return false
@@ -1476,6 +1504,11 @@ export default define({
 			opts.rateLimitCooldownsMs.every((n) => typeof n === "number" && n > 0)
 				? (opts.rateLimitCooldownsMs as number[])
 				: DEFAULT_RATE_LIMIT_COOLDOWNS_MS
+		const slotBusyCooldownsMs =
+			Array.isArray(opts.slotBusyCooldownsMs) && opts.slotBusyCooldownsMs.length > 0 &&
+			opts.slotBusyCooldownsMs.every((n) => typeof n === "number" && n > 0)
+				? (opts.slotBusyCooldownsMs as number[])
+				: DEFAULT_SLOT_BUSY_COOLDOWNS_MS
 		const sendTimeoutMs = opts.sendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS
 		// Inert probe: proves `plugins[].options` reaches `ctx.options` without
 		// touching a live knob. Echoed in the `ready` line only.
@@ -1599,6 +1632,7 @@ export default define({
 			"doneWithoutWorkPrompt",
 			"logFile",
 			"rateLimitCooldownsMs",
+			"slotBusyCooldownsMs",
 			"sendTimeoutMs",
 			"stuckToolAgeMs",
 			"configProbe",
@@ -1700,6 +1734,7 @@ export default define({
 					lastProdText: "",
 					prodAssistantSnapshot: "",
 					completedSinceProd: 0,
+					succeededSinceProd: 0,
 					ownPromptTexts: [],
 					recovering: false,
 					oocLocked: false,
@@ -1732,6 +1767,7 @@ export default define({
 					toolsInFlightAtIdle: 0,
 					rateLimitedAt: 0,
 					rateLimitAttempts: 0,
+					rateLimitLadder: null,
 					awaitingQuotaRetry: false,
 					unknownToolErrors: new Map(),
 					unknownToolSuggestionSent: false,
@@ -1887,6 +1923,23 @@ export default define({
 		}
 
 		/**
+		 * Slot-busy backpressure: HTTP 503 (numeric status, or the 503 token in
+		 * prose when the shape carries no status). Slot-limited servers
+		 * (edl3/exl3: 2 slots, overflow is 503 by design) reject pre-prefill,
+		 * so this is queueing information, not breakage — it must never count
+		 * toward the failure-loop latch. TabbyAPI-specific prose shapes get
+		 * pinned here after live capture.
+		 */
+		function isSlotBusyFailure(status: unknown, errType: string, errMsg: string): boolean {
+			if (status === 503) return true
+			return /\b503\b/.test(`${errType} ${errMsg}`)
+		}
+
+		function ladderTag(ladder: number[]): string {
+			return ladder === slotBusyCooldownsMs ? "slot-busy" : "rate-limit"
+		}
+
+		/**
 		 * Stand down on quota/rate-limit failures instead of retrying into the
 		 * ban. Gates, not timers: the decision is re-evaluated on each failure
 		 * and each watchdog tick against `rateLimitedAt`, so nothing is lost
@@ -1894,13 +1947,14 @@ export default define({
 		 * (budgets, loop guard and inject guards all apply); past the ladder
 		 * the session stays silent until a genuine user turn.
 		 */
-		function handleRateLimitFailure(sid: string, w: SessionWatch, errType: string, errMsg: string): void {
-			const ladder = rateLimitCooldownsMs
+		function handleRateLimitFailure(sid: string, w: SessionWatch, errType: string, errMsg: string, ladder: number[] = rateLimitCooldownsMs): void {
+			w.rateLimitLadder = ladder
+			const tag = ladderTag(ladder)
 			const n = w.rateLimitAttempts
 			markIdle(sid)
 			if (n >= ladder.length) {
 				w.awaitingQuotaRetry = false
-				log("warn", `${short(sid)} rate-limit budget exhausted (${ladder.length} attempts) — standing down until user turn`)
+				log("warn", `${short(sid)} ${tag} budget exhausted (${ladder.length} attempts) — standing down until user turn`)
 				return
 			}
 			const now = Date.now()
@@ -1909,19 +1963,24 @@ export default define({
 				w.rateLimitedAt = now
 				w.awaitingQuotaRetry = false
 				w.pendingRecoveryArmed = true
-				log("info", `${short(sid)} rate-limit cooldown served — retrying (attempt ${n + 1}/${ladder.length})`)
-				void recover(sid, "rate-limit cooldown served")
+				log("info", `${short(sid)} ${tag} cooldown served — retrying (attempt ${n + 1}/${ladder.length})`)
+				// Slot-busy serves restart the stall ladder (fresh turn, fresh
+				// episode) via their own reason — otherwise maxRetries caps the
+				// 12-rung ladder at 3 serves. Quota serves keep the old reason
+				// and behaviour exactly.
+				void recover(sid, tag === "slot-busy" ? "slot-busy cooldown served" : "rate-limit cooldown served")
 				return
 			}
 			if (w.rateLimitedAt === 0) w.rateLimitedAt = now
 			w.awaitingQuotaRetry = true
 			const waitMs = Math.max(0, ladder[n] - (now - w.rateLimitedAt))
-			log("warn", `${short(sid)} rate limited (${errType || "error"}) — standing down, next attempt in ${Math.ceil(waitMs / 1000)}s (${n + 1}/${ladder.length})`)
+			log("warn", `${short(sid)} ${tag === "slot-busy" ? "slot busy" : "rate limited"} (${errType || "error"}) — standing down, next attempt in ${Math.ceil(waitMs / 1000)}s (${n + 1}/${ladder.length})`)
 			// Machine-readable arm record so a later evaluation can re-arm after a
 			// reload wipes this in-memory gate (ses_ef72c5f3, 2026-10-09: armed at
 			// 14:31:49, plugin reloaded 14:37:28, gate due 14:46:49 never fired).
 			// Full sid: short() truncates and suffixes can collide across sessions.
-			log("warn", `quota-armed sid=${sid} at=${now} rung=${n} ladder=${ladder.length}`)
+			// kind=slotbusy selects the slot ladder on restore; absent means quota.
+			log("warn", `quota-armed sid=${sid} at=${now} rung=${n} ladder=${ladder.length}${tag === "slot-busy" ? " kind=slotbusy" : ""}`)
 		}
 
 		/** Remaining plugin-initiated interrupts allowed in the current window. */
@@ -2229,6 +2288,7 @@ export default define({
 			if (sent) {
 				w.lastProdText = text
 				w.completedSinceProd = 0
+				w.succeededSinceProd = 0
 				w.prodAssistantSnapshot = w.lastAssistantText
 				w.ownPromptTexts.push(text)
 				if (w.ownPromptTexts.length > 10) w.ownPromptTexts.shift()
@@ -2608,11 +2668,13 @@ export default define({
 			// idle is only news for silence stalls: a dead stream is seconds old
 			// by construction and a failure just happened, so in both cases the
 			// field reads as noise next to the reason. Timestamp always stays.
-			const isSilenceReason = /^no activity for \d+s/i.test(reason)
+			// (Predicate hoisted to module scope: recover reuses it for the
+			// success-progress episode reset.)
+			const isSilence = isSilenceReason(reason)
 			const head = [
-				isSilenceReason ? null : reason,
+				isSilence ? null : reason,
 				`attempt ${attempt}/${maxRetries}`,
-				isSilenceReason ? `idle ${hms(elapsed)}` : null,
+				isSilence ? `idle ${hms(elapsed)}` : null,
 				now,
 			]
 				.filter((x): x is string => typeof x === "string" && x.length > 0)
@@ -2671,15 +2733,22 @@ export default define({
 			}
 			// A stall after fresh model output is a NEW episode, not a deeper
 			// one: restart the ladder so it reads attempt 1/3 again
-			// (ses_ee7dade1 — 2/3 landed after real work). Only assistant TEXT
-			// growth counts, deliberately not tool completions: a completion
-			// between stalls is the stall loop itself wearing a hat, and counting
-			// it makes gaveUp unreachable — every cycle reads 1/3 forever
-			// (ses_edf403f5, 2026-10-09: three dead-stream 1/3s 60s apart, each
-			// preceded by a tool completion). Silent consecutive prods keep
-			// climbing toward gaveUp. gaveUp itself is left alone: only a fresh
-			// turn (markBusy) clears that latch.
+			// (ses_ee7dade1 — 2/3 landed after real work). Assistant TEXT growth
+			// always counts. Successful tool/shell work counts only for
+			// silence-triggered stalls (ses_ede9b725 — 1/3 woke the model, it
+			// read a file, then went quiet): a wake-up that produced work is a
+			// new episode. Failure/dead-stream triggers never reset on tool
+			// progress (ses_edf403f5 — tool completion between dead-stream
+			// stalls must keep climbing toward gaveUp, else every cycle reads
+			// 1/3 forever). gaveUp itself is left alone: only a fresh turn
+			// (markBusy) clears that latch.
 			if (w.lastProdText !== "" && w.lastAssistantText !== w.prodAssistantSnapshot) {
+				w.resumeAttempts = 0
+			} else if (isSilenceReason(reason) && w.succeededSinceProd > 0) {
+				log("info", `${short(sid)} progress since last prod — restarting the stall ladder`)
+				w.resumeAttempts = 0
+			} else if (reason === "slot-busy cooldown served") {
+				// A served slot retry is a fresh turn, not a deeper stall.
 				w.resumeAttempts = 0
 			}
 			recordContinue(sid)
@@ -4329,20 +4398,22 @@ export default define({
 			// its own budget, loop and inject guards on top.
 			for (const [rsid, rw] of sessions) {
 				if (!rw.awaitingQuotaRetry) continue
+				const ladder = rw.rateLimitLadder ?? rateLimitCooldownsMs
+				const tag = ladderTag(ladder)
 				const rn = rw.rateLimitAttempts
-				if (rn >= rateLimitCooldownsMs.length) {
+				if (rn >= ladder.length) {
 					rw.awaitingQuotaRetry = false
 					continue
 				}
 				if (rw.userCancelled || rw.gaveUp || rw.compacting || rw.permissionPending) continue
 				if (selfAbortActive(rw)) continue
-				if (Date.now() - rw.rateLimitedAt < rateLimitCooldownsMs[rn]) continue
+				if (Date.now() - rw.rateLimitedAt < ladder[rn]) continue
 				rw.awaitingQuotaRetry = false
 				rw.rateLimitAttempts = rn + 1
 				rw.rateLimitedAt = Date.now()
 				rw.pendingRecoveryArmed = true
-				log("info", `${short(rsid)} rate-limit cooldown served — retrying (attempt ${rn + 1}/${rateLimitCooldownsMs.length}) mod=${MODULE_INSTANCE}`)
-				void recover(rsid, "rate-limit cooldown served")
+				log("info", `${short(rsid)} ${tag} cooldown served — retrying (attempt ${rn + 1}/${ladder.length}) mod=${MODULE_INSTANCE}`)
+				void recover(rsid, tag === "slot-busy" ? "slot-busy cooldown served" : "rate-limit cooldown served")
 			}
 			cleanupIdleSessions()
 		}
@@ -4678,10 +4749,10 @@ export default define({
 			} catch {
 				return
 			}
-			const marks = new Map<string, { at: number; rung: number }>()
+			const marks = new Map<string, { at: number; rung: number; slotBusy: boolean }>()
 			for (const line of text.split("\n").slice(-3000)) {
 				const m = /quota-armed sid=(ses_\S+) at=(\d+) rung=(\d+)/.exec(line)
-				if (m) marks.set(m[1], { at: Number(m[2]), rung: Number(m[3]) })
+				if (m) marks.set(m[1], { at: Number(m[2]), rung: Number(m[3]), slotBusy: /kind=slotbusy/.test(line) })
 			}
 			if (marks.size === 0) return
 			let listed: Set<string>
@@ -4690,7 +4761,10 @@ export default define({
 			} catch {
 				return
 			}
-			const horizon = rateLimitCooldownsMs.reduce((a, b) => a + b, 0)
+			const horizon = Math.max(
+				rateLimitCooldownsMs.reduce((a, b) => a + b, 0),
+				slotBusyCooldownsMs.reduce((a, b) => a + b, 0),
+			)
 			for (const [sid, mark] of marks) {
 				if (!listed.has(sid)) continue
 				const w = ensureWatch(sid)
@@ -4704,6 +4778,7 @@ export default define({
 				if (lastUserAt > mark.at) continue
 				w.rateLimitedAt = mark.at
 				w.rateLimitAttempts = mark.rung
+				w.rateLimitLadder = mark.slotBusy ? slotBusyCooldownsMs : null
 				w.awaitingQuotaRetry = true
 				log("warn", `${short(sid)} quota ladder restored (armed ${Math.round((Date.now() - mark.at) / 1000)}s ago, rung ${mark.rung}) — retry due on schedule`)
 			}
@@ -4729,6 +4804,7 @@ export default define({
 						// own recovery turns (selfRecovery) do not reset it.
 						w.rateLimitedAt = 0
 						w.rateLimitAttempts = 0
+						w.rateLimitLadder = null
 						w.awaitingQuotaRetry = false
 						// A genuine turn is also a new episode for the stall
 						// ladder (the reset lives here and in the progress check,
@@ -5022,6 +5098,7 @@ export default define({
 					openShells.delete(id)
 					const wsh = ensureWatch(sid)
 					wsh.completedSinceProd++
+					wsh.succeededSinceProd++
 					touch(sid)
 					return
 				}
@@ -5032,6 +5109,7 @@ export default define({
 					w.lastWasTaskTool = false
 					w.pendingTools = Math.max(0, w.pendingTools - 1)
 					w.completedSinceProd++
+					w.succeededSinceProd++
 					touch(sid)
 					return
 				}
@@ -5105,6 +5183,15 @@ export default define({
 					if (isAbortError(errType, errMsg)) {
 						dbg(`${short(sid)} failure was an interrupt (${errType || "error"}) — not recovering`)
 						w.pendingRecoveryArmed = false
+						return
+					}
+					// Slot-busy 503s queue on their own ladder — an immediate continue
+					// retries straight into a full slot pool, and counting them as
+					// failures latches the failure loop after 3 (edl3/exl3: 2 slots,
+					// overflow is 503 by design). Checked before rate-limit: a busy
+					// slot is the more specific signal.
+					if (isSlotBusyFailure(ev.data?.error?.status, errType, errMsg)) {
+						handleRateLimitFailure(sid, w, errType, errMsg, slotBusyCooldownsMs)
 						return
 					}
 					// Quota/rate-limit failures stand down on the gate ladder — an

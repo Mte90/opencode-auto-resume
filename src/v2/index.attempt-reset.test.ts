@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test"
-import { rmSync } from "node:fs"
+import { existsSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "./index"
@@ -57,7 +57,7 @@ function makeEventStream() {
 
 const ev = (type: string, sid: string, data: Record<string, unknown> = {}) => ({ type, data: { sessionID: sid, ...data } })
 
-async function setup(): Promise<any> {
+async function setup(extraOpts: Record<string, unknown> = {}): Promise<any> {
 	const injected: Array<{ text?: string }> = []
 	const stream = makeEventStream()
 	const logFile = join(tmpdir(), `auto-resume-attemptreset-${process.pid}-${counter++}.log`)
@@ -81,6 +81,7 @@ async function setup(): Promise<any> {
 			// indistinguishable from a reload storm.
 			logFile,
 			debug: true,
+			...extraOpts,
 		},
 		session: {
 			context: async () => [],
@@ -150,28 +151,90 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		expect(attempts.filter((a: string | null) => a === "1").length).toBeGreaterThanOrEqual(2)
 	})
 
-	test("tool completions alone do not restart the ladder", async () => {
-		// ses_edf403f5, 2026-10-09: three dead-stream stalls 60s apart all read
-		// 1/3 because a tool completion sat between each pair. A completion with
-		// no model text is the stall loop wearing a hat, not a new episode —
-		// counting it makes gaveUp unreachable. Only text growth restarts.
-		const h = await setup()
+	test("tool completions between failure-driven recovers do not restart the ladder", async () => {
+		// ses_edf403f5, 2026-10-09: dead-stream stalls where a tool completion sat
+		// between recovers must keep climbing toward gaveUp — a completion with
+		// no model text on a FAILED turn is the stall loop wearing a hat, not a
+		// new episode. Only silence + success-progress (next test) restarts.
+		// chunkTimeout is parked so no silence stall can interleave: every
+		// inject here is failure-driven by construction.
+		const h = await setup({ chunkTimeoutMs: 600_000 })
+		const FAIL = { error: { type: "provider.invalid-request", message: "Error from the provider: 400 Bad Request" } }
 		push(h, "session.execution.started", SID)
 		await wait(10)
+		push(h, "session.step.failed", SID, FAIL)
 		await waitFor(() => h.injected.length >= 1)
 		push(h, "session.tool.success", SID, { tool: "shell", id: "call_9" })
+		await wait(10)
+		push(h, "session.step.failed", SID, FAIL)
 		await waitFor(() => h.injected.length >= 2)
 		const attempts = h.injected.map((i: any) => attemptOf(i.text))
 		await teardown(h)
 		expect(attempts.slice(0, 2)).toEqual(["1", "2"])
 	})
 
+	test("a successful tool between silence stalls restarts the ladder at 1/3", async () => {
+		// ses_ede9b725 (pulse review, 2026-10-09): 1/3 woke the model, it read a
+		// file (tool success, no text), then went quiet; the next stall read 2/3.
+		// A wake-up that produced successful work is a NEW episode, not a deeper
+		// stall — silence + success-progress restarts at 1/3. Failure-triggered
+		// recovers never reset on tool progress (previous test).
+		const h = await setup()
+		push(h, "session.execution.started", SID)
+		await wait(10)
+		await waitFor(() => h.injected.length >= 1)
+		push(h, "session.tool.success", SID, { tool: "read", id: "call_1" })
+		await waitFor(() => h.injected.length >= 2)
+		const attempts = h.injected.map((i: any) => attemptOf(i.text))
+		const logs = existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : ""
+		await teardown(h)
+		expect(attempts.slice(0, 2)).toEqual(["1", "1"])
+		expect(logs).toContain("restarting the stall ladder")
+	})
+
+	test("a failed tool between silence stalls does not restart the ladder", async () => {
+		// Failures are the stall loop wearing a different hat: only successful
+		// work marks a wake-up as productive. The failure-loop latch owns the
+		// failure path; the ladder must keep climbing through it.
+		const h = await setup()
+		push(h, "session.execution.started", SID)
+		await wait(10)
+		await waitFor(() => h.injected.length >= 1)
+		push(h, "session.tool.failed", SID, { tool: "read", id: "call_1" })
+		await waitFor(() => h.injected.length >= 2)
+		const attempts = h.injected.map((i: any) => attemptOf(i.text))
+		await teardown(h)
+		expect(attempts.slice(0, 2)).toEqual(["1", "2"])
+	})
+
+	test("a successful shell between silence stalls restarts the ladder at 1/3", async () => {
+		// Shell completions are successful work too (same sid attribution via
+		// openShells). server: shell.created carries NO top-level sessionID —
+		// it nests at data.info.metadata.sessionID; exits carry only the id.
+		const h = await setup()
+		push(h, "session.execution.started", SID)
+		await wait(10)
+		await waitFor(() => h.injected.length >= 1)
+		h.streamRef.push({
+			type: "shell.created",
+			data: { info: { id: "sh_1", command: "sleep 1", status: "running", metadata: { sessionID: SID } } },
+		})
+		await wait(10)
+		h.streamRef.push({ type: "shell.exited", data: { id: "sh_1", status: "exited", exit: 0 } })
+		await waitFor(() => h.injected.length >= 2)
+		const attempts = h.injected.map((i: any) => attemptOf(i.text))
+		await teardown(h)
+		expect(attempts.slice(0, 2)).toEqual(["1", "1"])
+	})
+
 	test("an idle between our send and the model's start does not restart the ladder", async () => {
-		// ses_ee14d727, 2026-10-09: 1/3, one script, 1/3 again. Resets live only
+		// ses_ee14d727, 2026-10-09: 1/3, then 1/3 again. Resets live only
 		// where a new episode is observable — a genuine user message newer than
-		// our last inject, or model text growth — never on lifecycle transitions
-		// like the idle->busy one here. Our inject stays the newest causative
-		// event, so the ladder climbs.
+		// our last inject, model text growth, or silence + successful tool work
+		// (next tests) — never on lifecycle transitions like the idle->busy
+		// one here. Our inject stays the newest causative event, so the ladder
+		// climbs. NOTE: this test carries no tool.success on purpose — a
+		// successful tool between silence stalls IS a new episode now.
 		const h = await setup()
 		push(h, "session.execution.started", SID)
 		await wait(10)
@@ -179,8 +242,6 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		push(h, "session.idle", SID)
 		await wait(10)
 		push(h, "session.execution.started", SID)
-		await wait(10)
-		push(h, "session.tool.success", SID, { tool: "shell", id: "call_9" })
 		await waitFor(() => h.injected.length >= 2)
 		const attempts = h.injected.map((i: any) => attemptOf(i.text))
 		await teardown(h)

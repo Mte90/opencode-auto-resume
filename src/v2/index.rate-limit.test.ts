@@ -64,6 +64,8 @@ const ev = (type: string, data: Record<string, unknown> = {}) => ({ type, data: 
 
 const QUOTA = { error: { type: "provider.quota", message: "Rate limit exceeded. Please try again later." } }
 const STREAM_ERR = { error: { type: "StreamError", message: "connection reset" } }
+const SLOT503 = { error: { type: "provider.http", message: "Request failed with status 503", status: 503 } }
+const SLOT503_TEXT = { error: { type: "provider.transport", message: "upstream returned 503 Service Unavailable" } }
 
 const userTurn = () => ({
 	type: "user",
@@ -227,6 +229,77 @@ describe("v2: rate-limit failures stand down on a ladder", () => {
 		await wait(200)
 		const logs = readLogs(h)
 		expect(logs.filter((l) => l.includes("next attempt in")).length).toBeGreaterThanOrEqual(2)
+		h.cleanup?.()
+	})
+
+	test("a 503 slot-busy stands down on its own ladder, not the failure loop", async () => {
+		// edl3/exl3 (2026-10-09): 2 slots, overflow is 503 by design. A 503 is
+		// backpressure, not breakage: it must queue on cooldowns instead of
+		// counting toward the failure-loop latch (3 strikes → catatonic).
+		const h = await replay({ slotBusyCooldownsMs: [60_000] })
+		await h.startTurn()
+		await h.failStep(SLOT503)
+		await wait(300)
+		expect(h.injected).toEqual([])
+		const logs = readLogs(h)
+		expect(logs.some((l) => l.includes("slot busy") && l.includes("standing down"))).toBe(true)
+		expect(logs.some((l) => l.includes("next attempt in"))).toBe(true)
+		expect(logs.some((l) => l.includes("failure loop latched"))).toBe(false)
+		h.cleanup?.()
+	})
+
+	test("a 503 told only in prose still routes to slot-busy", async () => {
+		// No numeric status on the error: the 503 token in the message must
+		// still classify. TabbyAPI-shape prose is pinned after live capture.
+		const h = await replay({ slotBusyCooldownsMs: [60_000] })
+		await h.startTurn()
+		await h.failStep(SLOT503_TEXT)
+		await wait(300)
+		expect(h.injected).toEqual([])
+		const logs = readLogs(h)
+		expect(logs.some((l) => l.includes("slot busy"))).toBe(true)
+		h.cleanup?.()
+	})
+
+	test("a served slot-busy cooldown retries through the normal path", async () => {
+		const h = await replay({ slotBusyCooldownsMs: [50], loopMaxContinues: 99 })
+		await h.failTurn(SLOT503)
+		await wait(500)
+		expect(h.injected).toHaveLength(1)
+		const logs = readLogs(h)
+		expect(logs.some((l) => l.includes("slot-busy cooldown served"))).toBe(true)
+		h.cleanup?.()
+	})
+
+	test("repeated 503s never latch the failure loop", async () => {
+		// Five slot-busy hits: every rung serves, nothing counts as a failure
+		// recovery, so the latch that would fire on the 4th generic failure
+		// stays quiet. Patience is cheap here — 503s reject pre-prefill.
+		const h = await replay({ slotBusyCooldownsMs: [20, 20, 20, 20, 20, 20], loopMaxContinues: 99 })
+		await h.startTurn()
+		for (let i = 0; i < 5; i++) {
+			await h.failStep(SLOT503)
+			await wait(150)
+		}
+		const logs = readLogs(h)
+		expect(logs.some((l) => l.includes("failure loop latched"))).toBe(false)
+		expect(logs.some((l) => l.includes("consecutive failure recoveries"))).toBe(false)
+		expect(h.injected).toHaveLength(5)
+		h.cleanup?.()
+	})
+
+	test("past the slot-busy ladder the session goes silent until a user turn", async () => {
+		const h = await replay({ slotBusyCooldownsMs: [20], loopMaxContinues: 99 })
+		await h.startTurn()
+		await h.failStep(SLOT503)
+		await wait(300)
+		expect(h.injected).toHaveLength(1)
+		// Budget spent (1 rung): the next hit serves nothing.
+		await h.failStep(SLOT503)
+		await wait(300)
+		expect(h.injected).toHaveLength(1)
+		const logs = readLogs(h)
+		expect(logs.some((l) => l.includes("budget exhausted"))).toBe(true)
 		h.cleanup?.()
 	})
 })
