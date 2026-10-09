@@ -179,6 +179,10 @@ interface SessionWatch {
 	 * stops a retry loop that spans restarts. */
 	permLocked: boolean
 	permLockReason: string | null
+	/** Occurrences of an indeterminate failure seen this turn; see
+	 * INDETERMINATE_ERROR_TYPES. Reset only by a genuine turn, so our own
+	 * recovery turns cannot keep clearing the count. */
+	indeterminateStrikes: number
 	/** True while one of our own recovery continues is in flight — distinguishes a self-caused execution.started from a genuine turn. */
 	selfRecovery: boolean
 
@@ -597,8 +601,20 @@ const PERMANENT_ERROR_TYPES = new Set([
 	"provider.no-route",
 	"provider.unknown",
 	"provider.content-filter",
-	"provider.unsupported-operation",
 ])
+/** Types whose permanence is NOT established upstream, so they are not hard
+ * gates. `provider.unsupported-operation` is present in the shipped binary but
+ * absent from the dev union of packages/llm/src/schema/errors.ts, so no
+ * `get retryable()` was ever observable for it — unlike every other entry above,
+ * which can point at a line. Gating it on the first occurrence bets on a
+ * semantics nobody has read; never gating it would retry a wall forever. So: ONE
+ * recovery attempt, then latch. A genuinely transient condition survives the
+ * single retry, a permanent one costs one wasted turn instead of three, and the
+ * first occurrence is logged so a real `retryable` value can promote it to a hard
+ * gate. */
+const INDETERMINATE_ERROR_TYPES = new Set(["provider.unsupported-operation"])
+/** Occurrences of an indeterminate failure tolerated before latching. */
+const INDETERMINATE_STRIKES = 2
 /** HTTP statuses that are permanent whatever type is reported. 401/403 only:
  * opencode's own text for them is "your authentication token may be missing or
  * expired — try running `opencode auth login`" (provider/error.ts:61,64).
@@ -1633,6 +1649,7 @@ export default define({
 					oocLockReason: null,
 					permLocked: false,
 					permLockReason: null,
+					indeterminateStrikes: 0,
 					selfRecovery: false,
 					textParts: new Map(),
 					lastAssistantText: "",
@@ -2372,8 +2389,7 @@ export default define({
 			return ok
 		}
 
-		/** Latch the OOC lock when a failure carries an out-of-context error (which `continue` can never clear). */
-				/** Classify one failure as permanent or not. Type first (opencode's own
+		/** Classify one failure as permanent or not. Type first (opencode's own
 		 * taxonomy), then status, then message — the type is the strongest signal
 		 * and the message the weakest, so an unknown type carrying a known message
 		 * still gates. Returns the reason for the log line, or null. */
@@ -2394,7 +2410,21 @@ export default define({
 		function maybeLockPermanent(sid: string, errMsg: string, errType?: string, status?: unknown): boolean {
 			const w = ensureWatch(sid)
 			if (w.permLocked) return true
-			const why = permanentFailureReason(errMsg, errType, status)
+			let why = permanentFailureReason(errMsg, errType, status)
+			if (why === null && errType && INDETERMINATE_ERROR_TYPES.has(errType)) {
+				// Deliberately AFTER the message patterns: an unsupported-operation
+				// type carrying a permanent message (a deprecated model, a dead
+				// session id) still hard-gates on the message.
+				w.indeterminateStrikes++
+				if (w.indeterminateStrikes < INDETERMINATE_STRIKES) {
+					log(
+						"info",
+						`${short(sid)} indeterminate failure (${errType}) ${w.indeterminateStrikes}/${INDETERMINATE_STRIKES} — one recovery attempt before latching mod=${MODULE_INSTANCE}`,
+					)
+					return false
+				}
+				why = `type ${errType} (${INDETERMINATE_STRIKES} strikes)`
+			}
 			if (why === null) return false
 			w.permLocked = true
 			w.permLockReason = why
@@ -4297,6 +4327,7 @@ export default define({
 							w.oocLockReason = null
 							log("info", `${short(sid)} genuine execution — clearing OOC lock mod=${MODULE_INSTANCE}`)
 						}
+						w.indeterminateStrikes = 0
 						if (w.permLocked) {
 							w.permLocked = false
 							w.permLockReason = null

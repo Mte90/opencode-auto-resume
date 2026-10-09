@@ -137,7 +137,6 @@ const GATED: Array<[string, string, number | undefined]> = [
 	["provider.no-route", "No LLM route for openai/gpt-5 using default", undefined],
 	["provider.unknown", "Model not found: exo-free", 404],
 	["provider.content-filter", "Your request was blocked by content policy", undefined],
-	["provider.unsupported-operation", "Model does not support tool use", undefined],
 	// message-keyed (type too broad to gate on)
 	["provider.invalid-request", "Model exo-free has been deprecated.", undefined],
 	// 404 does NOT rescue a gone model — only the "unknown catalog entry" shape.
@@ -179,6 +178,63 @@ describe("v2: permanent-failure gate set", () => {
 			expect(latched).toBe(false)
 		})
 	}
+
+	test("an indeterminate type gets ONE recovery attempt, then latches", async () => {
+		// provider.unsupported-operation is the only gated-looking type with no
+		// upstream verdict: in the shipped binary, absent from the dev union, so
+		// no `retryable` getter was ever observable for it. Hard-gating on the
+		// first occurrence bets on unread semantics; never gating retries a wall
+		// forever. One attempt, then latch.
+		const h = await setup()
+		push(h, "session.execution.started")
+		await wait(20)
+		push(h, "session.step.failed", {
+			error: { type: "provider.unsupported-operation", message: "Model does not support tool use" },
+		})
+		await wait(300)
+		const afterFirst = h.injected.length
+		const latchedAfterFirst = logsOf(h).includes("permanent failure latched")
+
+		// Second occurrence: the ladder is spent.
+		push(h, "session.step.failed", {
+			error: { type: "provider.unsupported-operation", message: "Model does not support tool use" },
+		})
+		await wait(300)
+		const log = logsOf(h)
+		await teardown(h)
+
+		expect(afterFirst).toBeGreaterThanOrEqual(1)
+		expect(latchedAfterFirst).toBe(false)
+		expect(h.injected.length).toBe(afterFirst)
+		expect(log).toContain("permanent failure latched")
+		expect(log).toContain("2 strikes")
+	})
+
+	test("CONTROL: a genuine turn clears the strike count", async () => {
+		// Without the reset, the second occurrence below would latch and the
+		// session would lose recovery it should still have.
+		const h = await setup()
+		push(h, "session.execution.started")
+		await wait(20)
+		const unsupported = { error: { type: "provider.unsupported-operation", message: "nope" } }
+		push(h, "session.step.failed", unsupported)
+		await wait(150)
+		// Two starts, deliberately. Our recovery continue produces its own
+		// execution.started, which spends the selfRecovery flag; the user's
+		// arrival is the next one. Pushing only one lets our own turn masquerade
+		// as the user's, and the reset never runs.
+		push(h, "session.execution.started")
+		await wait(20)
+		push(h, "session.execution.started")
+		await wait(20)
+		push(h, "session.step.failed", unsupported)
+		await wait(300)
+		const log = logsOf(h)
+		await teardown(h)
+		expect(log).toContain("indeterminate failure")
+		expect(log).not.toContain("permanent failure latched")
+		expect(log).toContain("1/2")
+	})
 
 	test("quota stays on the cooldown ladder, not the permanent latch", async () => {
 		const h = await setup()
