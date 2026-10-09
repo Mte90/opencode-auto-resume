@@ -363,6 +363,30 @@ describe("v2: turns parked on an unanswered tool call", () => {
 		expect(said).toHaveLength(0)
 	})
 
+	test("CONTROL: a policy-blocked call is never retried", async () => {
+		// ses_edf403f5 15:59: shell blocked on secret.home, turn ended on it.
+		// The guardrail text forbids retry outright — reissuing teaches
+		// circumvention. Verdict, not failure.
+		const now = Date.now()
+		const h = await setup(
+			[
+				userMessage("go", now - 5000),
+				assistantWith(
+					now - 2000,
+					toolPart("call_1", "shell", "error", now - 2000, {
+						type: "unknown",
+						message: "BLOCKED by CC Safety Net\n\nReason: Access to a sensitive path is not allowed.",
+					}),
+				),
+			],
+			{ chunkTimeoutMs: 600_000 },
+		)
+		await goIdle(h)
+		const said = retryNudges(h)
+		await teardown(h)
+		expect(said).toHaveLength(0)
+	})
+
 	test("a trailing failed write is retried", async () => {
 		// The upstream job's failed write: turn ended on the error, nothing
 		// after it. Known tool, non-abort error, newer than the user message.

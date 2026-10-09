@@ -716,6 +716,11 @@ const TEXT_BUFFER_TRIM_LEN = 20_000
  * that tested for it literally could never fire on v2.
  */
 const TOOL_STATE_RUNNING = "running"
+/** Error text that must never be retried: policy guardrails, not failures. The
+ * safety net's own verdict ("Do not retry this operation or attempt any
+ * workaround") is authoritative — reissuing the call teaches circumvention
+ * (ses_edf403f5 15:59: shell blocked on secret.home, turn ended on it). */
+const NEVER_RETRY_RE = /blocked by cc safety net|do not retry|access to a sensitive path/i
 /** Readable text out of a tool part error/result payload, which arrives as a
  * string or as `{type, message}` depending on the producer. "" when absent. */
 function toolErrorText(state: { error?: unknown; output?: unknown } | undefined): string {
@@ -3337,6 +3342,13 @@ export default define({
 						// user interrupt (ses_edf403f5 13:09: the error WAS the
 						// user's own stop landing mid-turn).
 						if (isAbortError(eType, eMsg)) {
+							trailing = null
+							continue
+						}
+						// Policy blocks are verdicts, not failures: the guardrail
+						// text forbids retry outright, and reissuing the call
+						// teaches circumvention (ses_edf403f5 15:59 shell block).
+						if (NEVER_RETRY_RE.test(eMsg)) {
 							trailing = null
 							continue
 						}

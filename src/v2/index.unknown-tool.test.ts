@@ -107,7 +107,7 @@ async function setup(
 		parentID?: string
 	},
 ): Promise<any> {
-	const injected: Array<{ text?: string }> = []
+	const injected: Array<{ kind?: string; text?: string }> = []
 	const stream = makeEventStream()
 	const logFile = join(tmpdir(), `auto-resume-ut-${process.pid}-${counter++}.log`)
 	rmSync(logFile, { force: true })
