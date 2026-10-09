@@ -572,6 +572,19 @@ const SHELL_OPEN_MAX_MS = 30 * 60_000
 /** Appended to the `shell` tool's description. One constant so the
  * already-annotated guard and the text itself cannot drift apart. */
 const SHELL_ALIAS_HINT = "In v1 sessions this tool was called `bash`; use this one."
+
+/**
+ * Editors already annotated, keyed by the editor object itself.
+ *
+ * `editor.get()` does NOT see an earlier `update()`: two transform callbacks in
+ * one host, 74ms apart (measured on deploy, pid unchanged), each annotated the
+ * same live tool and the description guard could not catch the second. A
+ * description-string guard is therefore the wrong instrument — it reads state
+ * the callback is not shown. Keying on the editor's identity annotates each
+ * distinct registry exactly once, whether the host reuses one or builds a fresh
+ * one per load. Weak, so a discarded registry is collectable.
+ */
+const annotatedToolEditors = new WeakSet<object>()
 /** OOC (out-of-context) errors that `continue` can never clear — recovery is locked out on these. */
 const OOC_ERROR_RE = /exceeds the available context size|context size \(\d+\)|too large to compact|too many tokens|prompt is too long/i
 /** Failures a `continue` can never clear: the model itself is gone
@@ -3277,16 +3290,22 @@ export default define({
 			if (!ctx.tool?.transform) return
 			try {
 				await ctx.tool.transform((editor) => {
+					// Annotated already? `get()` cannot answer this — see
+					// annotatedToolEditors — so identity is the only reliable check.
+					if (annotatedToolEditors.has(editor)) return
 					// Nothing to point at, or `bash` is genuinely the tool here rather
 					// than an alias for it.
 					if (editor.list?.().some((t) => t.id === "bash")) return
 					if (!editor.get?.("shell")) return
-					// The transform re-runs on every reload; a doubled hint is noise
-					// the model has to read past.
-					if ((editor.get("shell")?.description ?? "").includes(SHELL_ALIAS_HINT)) return
+					// Belt and braces for a host that DOES hand back live state.
+					if ((editor.get("shell")?.description ?? "").includes(SHELL_ALIAS_HINT)) {
+						annotatedToolEditors.add(editor)
+						return
+					}
 					editor.update?.("shell", (tool) => {
 						tool.description = `${tool.description ?? ""} (${SHELL_ALIAS_HINT})`.trim()
 					})
+					annotatedToolEditors.add(editor)
 					log(
 						"info",
 						`annotated the shell tool with its v1 name (bash) so the model stops inventing the call mod=${MODULE_INSTANCE}`,

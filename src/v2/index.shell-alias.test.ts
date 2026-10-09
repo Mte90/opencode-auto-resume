@@ -5,20 +5,20 @@ import { join } from "node:path"
 import plugin from "./index"
 
 /**
- * v2: the `shell` tool is annotated with its v1 name.
+ * v2: the `shell` tool is annotated with its v1 name — exactly once.
  *
- * The unknown-tool suggester has been correcting this for 20 logged events and
- * the correction works — every one reported exactly "called 2x", so the model
- * stops after being told. But the tax is per request: one wasted call every time
- * the model invents `bash`, indefinitely.
+ * Two things were learned the hard way while building this, and both are pinned
+ * here because neither is observable from inside the process:
  *
- * A plugin cannot fix that by rewriting the call. Read from the shipped
- * `@opencode/plugin` types: `ToolEditor` exposes list/get/namespace/add/update/
- * remove, `update` mutates a tool's Info and never its id, `tool.execute.before`
- * types `tool` as readonly, and there is no message-level hook that rewrites an
- * emitted call. opencode ships no bash alias either. So these tests pin the one
- * move the API does allow — annotate the real tool so the model stops inventing
- * the name — plus the three cases where it must NOT fire.
+ * 1. A plugin cannot rewrite the call. From the shipped `@opencode/plugin`
+ *    types: `ToolEditor` is list/get/namespace/add/update/remove, `update` mutates
+ *    a tool's Info and never its id, `tool.execute.before` types `tool` as
+ *    readonly, and no message-level hook rewrites an emitted call. opencode ships
+ *    no alias either. So this annotates the real tool instead.
+ * 2. `editor.get()` does NOT see an earlier `editor.update()`. On deploy, two
+ *    transform callbacks ran 74ms apart in one host and both annotated — so a
+ *    guard that reads the description cannot work, and the hint grows by one copy
+ *    per reload. Editor identity can: a WeakSet of already-annotated editors.
  */
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
@@ -56,7 +56,7 @@ interface Registered {
 	description: string
 }
 
-/** Build a tool editor over a fixed registry, recording every update(). */
+/** A tool editor over a fixed registry, recording every update(). */
 function makeEditor(tools: Registered[]) {
 	const updates: Array<{ id: string; description: string }> = []
 	const editor = {
@@ -70,14 +70,19 @@ function makeEditor(tools: Registered[]) {
 			updates.push({ id, description: t.description })
 		},
 	}
-	return { editor, updates }
+	return { editor, updates, tools }
 }
 
-async function setup(tools: Registered[] | null, opts: { toolRegistry?: false } = {}): Promise<any> {
+async function setup(
+	tools: Registered[] | null,
+	opts: { toolRegistry?: false; editor?: unknown } = {},
+): Promise<any> {
 	const stream = makeEventStream()
 	const logFile = join(tmpdir(), `auto-resume-alias-${process.pid}-${counter++}.log`)
 	rmSync(logFile, { force: true })
-	const { editor, updates } = tools ? makeEditor(tools) : { editor: null, updates: [] as never[] }
+	const built = tools ? makeEditor(tools) : null
+	const editor = opts.editor ?? built?.editor ?? null
+	const updates = built?.updates ?? []
 
 	const ctx: any = {
 		event: stream,
@@ -111,6 +116,8 @@ async function teardown(h: any) {
 	rmSync(h.logFile, { force: true })
 }
 
+const HINT = /was called `bash`/g
+
 describe("v2: shell tool carries its v1 name", () => {
 	test("shell gets the alias hint", async () => {
 		const tools: Registered[] = [
@@ -127,8 +134,8 @@ describe("v2: shell tool carries its v1 name", () => {
 	})
 
 	test("CONTROL: no annotation when `bash` is the real tool", async () => {
-		// In v1 `bash` IS the tool. Renaming the hint the other way would be wrong,
-		// and this plugin also ships a v1 build.
+		// In v1 `bash` IS the tool. Hinting the other way would be wrong, and this
+		// plugin also ships a v1 build.
 		const tools: Registered[] = [
 			{ id: "bash", description: "Run a shell command." },
 			{ id: "shell", description: "Also a shell." },
@@ -187,19 +194,44 @@ describe("v2: shell tool carries its v1 name", () => {
 		await teardown(h)
 	})
 
-	test("the hint is not doubled when the transform runs again", async () => {
-		// Reloads re-run the transform. Run the same registry through a second
-		// setup and assert the description still carries exactly one hint.
-		const tools: Registered[] = [{ id: "shell", description: "Run a shell command." }]
-		const first = await setup(tools)
-		expect(first.updates).toHaveLength(1)
+	test("an editor whose get() is stale annotates once, not twice", async () => {
+		// The measured failure: two transform callbacks 74ms apart in one host
+		// both annotated. Faithfully modelled here — one editor object handed out
+		// twice, whose update() writes the live tool but whose get() never reflects
+		// it. A shared tools array would NOT model this: it would let a
+		// description guard pass and prove nothing about identity.
+		const live: Registered = { id: "shell", description: "Run a shell command." }
+		const updates: string[] = []
+		const staleEditor = {
+			list: () => [{ id: "shell" }],
+			get: () => ({ description: "Run a shell command." }), // stale forever
+			add: () => {},
+			update: (id: string, fn: (t: { description?: string }) => void) => {
+				fn(live)
+				updates.push(id)
+			},
+		}
+
+		const first = await setup([live], { editor: staleEditor })
+		expect(updates).toHaveLength(1)
 		await teardown(first)
-		// Second setup, same registry object — the hint is already present.
-		const second = await setup(tools)
-		expect(second.updates).toHaveLength(0)
-		// Same substring the plugin guards on — asserted here so the two cannot
-		// drift apart, which is exactly the bug this test was written after.
-		expect(tools[0].description.match(/was called `bash`/g)).toHaveLength(1)
+
+		const second = await setup([live], { editor: staleEditor })
+		expect(updates).toHaveLength(1)
+		expect(live.description.match(HINT)).toHaveLength(1)
 		await teardown(second)
+	})
+
+	test("a fresh registry is annotated again — a new editor needs the hint", async () => {
+		const first: Registered[] = [{ id: "shell", description: "Run a shell command." }]
+		const h1 = await setup(first)
+		expect(h1.updates).toHaveLength(1)
+		await teardown(h1)
+
+		const second: Registered[] = [{ id: "shell", description: "Run a shell command." }]
+		const h2 = await setup(second)
+		expect(h2.updates).toHaveLength(1)
+		expect(second[0].description.match(HINT)).toHaveLength(1)
+		await teardown(h2)
 	})
 })
