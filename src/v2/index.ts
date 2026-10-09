@@ -315,6 +315,9 @@ interface SessionWatch {
 	 * into or interrupted. `undefined` = not yet resolved. */
 	isSubAgent?: boolean
 	idleSince: number | null
+	/** Last time the silent-reasoning sweep examined this session. Bounds the
+	 * history read to ~one per stall window per idle session. */
+	lastSilentReasoningCheck: number
 	/** Set while the session is mid native compaction — recovery must never interrupt it. */
 	compacting: boolean
 	/** Timestamp of the latest `session.compaction.started` (stale-guard for the flag). */
@@ -1773,6 +1776,7 @@ export default define({
 					unknownToolSuggestionSent: false,
 					checkedToolPartIDs: new Set(),
 					lastUserMessageSeenAt: 0,
+					lastSilentReasoningCheck: 0,
 					lastTokenTotal: 0,
 					contextWrapupAttempts: 0,
 					pendingRecoveryArmed: false,
@@ -3555,6 +3559,61 @@ export default define({
 			return targetedRecovery(sid, "stuck-tool", prompt, "stuckToolAttempts").then(() => true)
 		}
 
+		/**
+		 * Nudge a turn that thought without producing anything.
+		 *
+		 * The parked shape from ses_edd1eb519/ses_edd1e39c3 (2026-10-09): a user
+		 * question, then assistant turn(s) with reasoning but zero text and zero
+		 * tool calls, then idle indefinitely. No failure fires, the stall path
+		 * needs a busy session, and the targeted patterns need text — so every
+		 * event-driven path reads healthy-idle and stays silent.
+		 *
+		 * Deliberately narrow: any text or any tool part since the last user
+		 * message means the turn produced or delegated — only the total void
+		 * counts (reasoning with no output and nothing delegated). Tool-
+		 * completing turns leave results the next turn consumes; text turns
+		 * speak. Fires on the structural idle pass for fresh parkings and on
+		 * the watchdog idle sweep for already-parked sessions (which emit no
+		 * further events). History-only: no HTTP dependency.
+		 */
+		async function checkForSilentReasoningTurn(sid: string, w: SessionWatch): Promise<boolean> {
+			if (w.userCancelled || w.completionSignaled) return false
+			{
+				const locked = lockKind(w)
+				if (locked) {
+					dbg(`${short(sid)} locked (${locked}) — skipping silent-reasoning pass`)
+					return false
+				}
+			}
+			const messages = await loadMessages(sid)
+			let lastUserAt = 0
+			for (const m of messages as Array<{ type?: string; time?: { created?: number } }>) {
+				if (m?.type === "user" && typeof m?.time?.created === "number") lastUserAt = Math.max(lastUserAt, m.time.created)
+			}
+			let newestPostUserAt = 0
+			let sawReasoning = false
+			for (const m of messages as Array<{ type?: string; time?: { created?: number }; content?: Array<{ type?: string; text?: string }> }>) {
+				if (!m || m.type !== "assistant" || !Array.isArray(m.content)) continue
+				const at = typeof m?.time?.created === "number" ? m.time.created : 0
+				if (at <= lastUserAt) continue
+				if (at > newestPostUserAt) newestPostUserAt = at
+				for (const part of m.content) {
+					const t = part?.type ?? ""
+					if (t === "text" && typeof part?.text === "string" && part.text.length > 0) return false
+					if (t === "tool_use" || t === "tool" || t === "tool_call" || t.startsWith("tool")) return false
+					if (t === "reasoning" && typeof part?.text === "string" && part.text.length > 0) sawReasoning = true
+				}
+			}
+			if (!sawReasoning) return false
+			// Fresh turns get the stall window before being judged parked.
+			if (Date.now() - newestPostUserAt < chunkTimeoutMs) return false
+			const prompt =
+				`Your last turn produced reasoning but no visible output and no tool calls. ` +
+				`Continue the task: produce the answer or the next tool call.`
+			log("warn", `${short(sid)} reasoning-only turn with no output — nudging to continue`)
+			return targetedRecovery(sid, "silent-reasoning", prompt, "stuckToolAttempts").then(() => true)
+		}
+
 		async function checkForUnknownToolCalls(sid: string, w: SessionWatch): Promise<boolean> {
 			if (w.userCancelled || w.completionSignaled) return false
 			{
@@ -3765,6 +3824,7 @@ export default define({
 			// The history still shows the unfinished part, so check it structurally
 			// here rather than in the text-dependent pattern phase below.
 			if (await checkForStuckToolCalls(sid, w)) return
+			if (await checkForSilentReasoningTurn(sid, w)) return
 
 			// Prefer the live delta buffer; fall back to the authoritative message
 			// history when it is empty (e.g. the plugin loaded mid-turn) or stale.
@@ -4289,6 +4349,18 @@ export default define({
 					if (w.status === "busy" && w.userCancelled) {
 						noteInboundUserMessage(sid, w, await loadMessages(sid))
 						if (w.userCancelled) continue
+					} else if (w.status === "idle" && !w.userCancelled) {
+						// Already-parked sessions emit no further events, so the
+						// event-driven idle pass never revisits them. Sweep here,
+						// throttled to ~one history read per stall window: a
+						// reasoning-only turn with no output means parked, and
+						// only the watchdog can still see it.
+						const idleFor = now - (w.idleSince ?? w.lastActivityAt)
+						if (idleFor > chunkTimeoutMs && now - w.lastSilentReasoningCheck > chunkTimeoutMs) {
+							w.lastSilentReasoningCheck = now
+							await checkForSilentReasoningTurn(sid, w)
+						}
+						continue
 					} else {
 						continue
 					}
