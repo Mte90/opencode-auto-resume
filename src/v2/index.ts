@@ -146,6 +146,14 @@ interface SessionWatch {
 	 * simply hadn't observed yet would clear a latch it postdates. */
 	userCancelledAt: number
 	resumeAttempts: number
+	/**
+	 * Consecutive ladder restarts driven by trickled progress with no genuine
+	 * user message in between (ses_ed975114, 2026-10-10: 1/3 every ~3.5min
+	 * forever). Each refire doubles the silence fuse (cap x8) so slow
+	 * workers decay to patience instead of nagging on a fixed clock. Cleared
+	 * only by a genuine user message — never by lifecycle transitions.
+	 */
+	episodeRefires: number
 	lastRetryAt: number
 	gaveUp: boolean
 	/** Newest genuine (non-own-prompt) user message observed, by timestamp. Our
@@ -1785,6 +1793,7 @@ export default define({
 					userCancelled: false,
 					userCancelledAt: 0,
 					resumeAttempts: 0,
+					episodeRefires: 0,
 					lastRetryAt: 0,
 					gaveUp: false,
 					lastGenuineUserAt: 0,
@@ -2819,9 +2828,13 @@ export default define({
 			// 1/3 forever). gaveUp itself is left alone: only a fresh turn
 			// (markBusy) clears that latch.
 			if (w.lastProdText !== "" && w.lastAssistantText !== w.prodAssistantSnapshot) {
+				// Only count mid-ladder restarts: a first fire after genuine
+				// work (attempts still 0) is a fresh episode, not a refire.
+				if (w.resumeAttempts > 0) w.episodeRefires++
 				w.resumeAttempts = 0
 			} else if (isSilenceReason(reason) && w.succeededSinceProd > 0) {
 				log("info", `${short(sid)} progress since last prod — restarting the stall ladder`)
+				if (w.resumeAttempts > 0) w.episodeRefires++
 				w.resumeAttempts = 0
 			} else if (reason === "slot-busy cooldown served") {
 				// A served slot retry is a fresh turn, not a deeper stall.
@@ -3488,6 +3501,9 @@ export default define({
 				dbg(`${short(sid)} new user message — restarting the stall ladder`)
 			}
 			w.resumeAttempts = 0
+			// A genuine user message also closes any refire episode: the next
+			// stall starts back at the base fuse.
+			w.episodeRefires = 0
 			// Deliberately NOT clearing checkedToolPartIDs: already-reported
 			// errors must never be recounted. Clearing it made every genuine
 			// user message re-suggest the same stale errors (2026-10-04: one
@@ -4513,7 +4529,13 @@ export default define({
 					continue
 				}
 				const silence = now - w.lastActivityAt
-				if (silence < chunkTimeoutMs + gracePeriodMs) continue
+				// Episode backoff: each progress-restarted refire without
+				// genuine user input doubles the fuse (cap x8), so a
+				// slow-trickling session decays to patience instead of
+				// nagging on a fixed 3-minute clock (ses_ed975114).
+				// Genuine user input resets episodeRefires to 0.
+				const fuseMult = Math.min(8, 2 ** Math.max(0, w.episodeRefires))
+				if (silence < (chunkTimeoutMs + gracePeriodMs) * fuseMult) continue
 				// A quiet turn that already declared completion, but no idle
 				// inspection ever latched it: no session.idle event arrived, or a
 				// take-over landed mid-silence. Judge the tail from history
