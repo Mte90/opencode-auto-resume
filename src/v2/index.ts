@@ -1250,7 +1250,14 @@ function isUserHandoff(text: string): boolean {
 	}
 	if (!last) return false
 	if (last.endsWith("?") || last.endsWith("？")) return true
-	const patterns = [/let\s+me\s+know/i, /your\s+call/i, /up\s+to\s+you/i, /which\s+(would|do\s+you|option)/i, /should\s+I/i, /want\s+me\s+to/i, /would\s+you\s+like/i]
+	const patterns = [/let\s+me\s+know/i, /your\s+call/i, /up\s+to\s+you/i, /which\s+(would|do\s+you|option)/i, /should\s+I/i, /want\s+me\s+to/i, /would\s+you\s+like/i,
+		// ses_ed9e2ef9 (2026-10-10): an offer awaiting approval reads as a
+		// go-ahead once a bare continue lands behind it ("I can delete all
+		// the stopped containers…" + continue = deletion). Bare capability
+		// statements with no ask are deliberately NOT covered — "I can X."
+		// with nothing after it is ambiguous, and the scoped continue text
+		// above is what protects those.
+		/say\s+the\s+word/i, /give\s+the\s+go-?ahead/i, /if\s+you'?d\s+like/i]
 	return patterns.some((p) => p.test(last))
 }
 
@@ -2717,7 +2724,17 @@ export default define({
 			} catch {
 				// Best effort: a todo-read failure must never block recovery.
 			}
-			const now = new Date().toISOString()
+			// User-facing timestamp in the operator's own timezone (system
+			// local), not UTC: "2026-10-10T09:12Z" reads as wrong o'clock next
+			// to a 05:12 EDT wall clock (ses_ed9e2ef9, 2026-10-10). Log lines
+			// and boot markers stay ISO — machines read those, people read this.
+			const now = new Date().toLocaleString("en-US", {
+				month: "short",
+				day: "numeric",
+				hour: "numeric",
+				minute: "2-digit",
+				timeZoneName: "short",
+			})
 			const elapsed = w.lastActivityAt ? Math.round((Date.now() - w.lastActivityAt) / 1000) : 0
 			const hms = (n: number) =>
 				n < 60 ? `${n}s` : n < 3600 ? `${Math.floor(n / 60)}m ${n % 60}s` : `${Math.floor(n / 3600)}h ${Math.floor((n % 3600) / 60)}m`
@@ -2737,7 +2754,8 @@ export default define({
 			]
 				.filter((x): x is string => typeof x === "string" && x.length > 0)
 				.join("; ")
-			return (`continue — stalled (${head}).\n${suffix}`).slice(0, 2000)
+			return (`continue — stalled (${head}).\nOnly continue work already in progress. ` +
+				`Do not start anything new, and do not take destructive or irreversible actions without explicit user approval.\n${suffix}`).slice(0, 2000)
 		}
 
 		/**
@@ -3118,9 +3136,14 @@ export default define({
 			for (let i = messages.length - 1; i >= 0; i--) {
 				const msg = messages[i] as {
 					type?: string
+					role?: string
 					content?: Array<{ type?: string; text?: string }>
 				}
-				if (!msg || msg.type !== "assistant" || !Array.isArray(msg.content)) continue
+				// Prod history carries role, the harness carries type — read both.
+				// ses_edbb4e67 (2026-10-10): type-only read returned "" in prod,
+				// so a "TASK COMPLETE" delivery never latched and the stall fired.
+				const msgRole = msg?.type ?? msg?.role
+				if (!msg || msgRole !== "assistant" || !Array.isArray(msg.content)) continue
 				const text = msg.content
 					.filter((part) => part?.type === "text" && typeof part.text === "string")
 					.map((part) => part.text as string)
@@ -3146,9 +3169,12 @@ export default define({
 			for (let i = messages.length - 1; i >= 0; i--) {
 				const msg = messages[i] as {
 					type?: string
+					role?: string
 					content?: Array<{ type?: string; text?: string }>
 				}
-				if (!msg || msg.type !== "assistant" || !Array.isArray(msg.content)) continue
+				// Same prod/harness split as lastAssistantTextFrom: role vs type.
+				const msgRole = msg?.type ?? msg?.role
+				if (!msg || msgRole !== "assistant" || !Array.isArray(msg.content)) continue
 				const reasoning = msg.content
 					.filter((part) => part?.type === "reasoning" && typeof part.text === "string")
 					.map((part) => part.text as string)
@@ -4499,6 +4525,14 @@ export default define({
 				// and so the history read happens at most once per stall window.
 				{
 					const histText = lastAssistantTextFrom(await loadMessages(sid))
+					// Hand-off turns wait on the user the same way completed ones
+					// are finished: nudging either talks over someone. A hand-off
+					// is not latched (no completion claimed) — it is only
+					// skipped while its text is still the tail.
+					if (histText && isUserHandoff(histText)) {
+						dbg(`${short(sid)} quiet turn ends with a hand-off — waiting on user, not stalled`)
+						continue
+					}
 					if (histText && turnEndsWithCompletionClaim(histText)) {
 						const open = getOpenTodos(await readTodos(sid))
 						if (open.length > 0) {

@@ -138,6 +138,19 @@ describe("v2: stall-continue channel", () => {
 		expect(injected.every((i) => i.kind === "prompt")).toBe(true)
 	})
 
+	test("rich stall text scopes the continue against new/destructive work", async () => {
+		// ses_ed9e2ef9 (2026-10-10): a bare "continue" behind an offer reads
+		// as approval ("I can delete…" + continue = deletion). The rich
+		// template carries the scope guard so a missed hand-off still cannot
+		// authorize new or destructive work.
+		const { injected } = await replay(busyStallEvents, { maxRetries: 1 })
+		expect(injected.length).toBeGreaterThan(0)
+		expect(injected[0].text).toContain("destructive or irreversible")
+		// Timestamp reads in the operator's timezone, not Zulu.
+		expect(injected[0].text).toMatch(/[AP]M [A-Z]{2,4}/)
+		expect(injected[0].text).not.toMatch(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/)
+	})
+
 	test("visibleContinue:false restores hidden synthetic", async () => {
 		const { injected } = await replay(busyStallEvents, { maxRetries: 1, visibleContinue: false })
 		expect(injected.length).toBeGreaterThan(0)

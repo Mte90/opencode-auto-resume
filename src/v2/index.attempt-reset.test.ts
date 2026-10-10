@@ -272,7 +272,9 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		const text = h.injected[0]?.text ?? ""
 		await teardown(h)
 		expect(text).toContain("idle ")
-		expect(text).toMatch(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/)
+		// Local operator time, not Zulu (see the ed9e2ef9 timezone note).
+		expect(text).toMatch(/[AP]M [A-Z]{2,4}/)
+		expect(text).not.toMatch(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/)
 	})
 
 	test("no-activity stalls state the silence once, not twice", async () => {
@@ -302,7 +304,9 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		await teardown(h)
 		expect(text).toContain("session.step.failed")
 		expect(text).not.toContain("idle ")
-		expect(text).toMatch(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/)
+		// Local operator time (see ed9e2ef9 note on the sibling test above).
+		expect(text).toMatch(/[AP]M [A-Z]{2,4}/)
+		expect(text).not.toMatch(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/)
 	})
 
 })

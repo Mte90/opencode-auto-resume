@@ -275,6 +275,12 @@ describe("v2: rate-limit failures stand down on a ladder", () => {
 		// Five slot-busy hits: every rung serves, nothing counts as a failure
 		// recovery, so the latch that would fire on the 4th generic failure
 		// stays quiet. Patience is cheap here — 503s reject pre-prefill.
+		// All five rungs are served (log), but only the first is delivered:
+		// same-minute repeats carry identical text (human-readable timestamps
+		// have minute precision by design — see the ed9e2ef9 timezone note),
+		// so delivery-once dedupes the rest instead of spamming five
+		// identical nudges inside a second. In prod rungs land minutes apart
+		// and each carries its own timestamp.
 		const h = await replay({ slotBusyCooldownsMs: [20, 20, 20, 20, 20, 20], loopMaxContinues: 99 })
 		await h.startTurn()
 		for (let i = 0; i < 5; i++) {
@@ -284,7 +290,9 @@ describe("v2: rate-limit failures stand down on a ladder", () => {
 		const logs = readLogs(h)
 		expect(logs.some((l) => l.includes("failure loop latched"))).toBe(false)
 		expect(logs.some((l) => l.includes("consecutive failure recoveries"))).toBe(false)
-		expect(h.injected).toHaveLength(5)
+		expect(logs.filter((l) => l.includes("cooldown served")).length).toBeGreaterThanOrEqual(5)
+		expect(h.injected).toHaveLength(1)
+		expect(logs.some((l) => l.includes("duplicate continue suppressed"))).toBe(true)
 		h.cleanup?.()
 	})
 
