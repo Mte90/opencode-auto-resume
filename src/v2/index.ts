@@ -3150,18 +3150,32 @@ export default define({
 				const msg = messages[i] as {
 					type?: string
 					role?: string
+					text?: string
+					info?: { content?: string }
 					content?: Array<{ type?: string; text?: string }>
 				}
 				// Prod history carries role, the harness carries type — read both.
 				// ses_edbb4e67 (2026-10-10): type-only read returned "" in prod,
 				// so a "TASK COMPLETE" delivery never latched and the stall fired.
 				const msgRole = msg?.type ?? msg?.role
-				if (!msg || msgRole !== "assistant" || !Array.isArray(msg.content)) continue
-				const text = msg.content
-					.filter((part) => part?.type === "text" && typeof part.text === "string")
-					.map((part) => part.text as string)
-					.join("")
-				if (text) return text
+				if (!msg || msgRole !== "assistant") continue
+				// Prod shape carries flat text; harness shape carries parts.
+				// Mirror userTextsOf: check both, or history reads go blind.
+				// ses_ed93e258 (2026-10-10): parts-only read missed flat-text
+				// deliveries and the latch never engaged despite the fix live.
+				if (Array.isArray(msg.content)) {
+					const text = msg.content
+						.filter((part) => part?.type === "text" && typeof part.text === "string")
+						.map((part) => part.text as string)
+						.join("")
+					if (text) return text
+					continue
+				}
+				const flat =
+					(typeof msg.text === "string" && msg.text) ||
+					(typeof msg.info?.content === "string" && msg.info.content) ||
+					""
+				if (flat) return flat
 			}
 			return ""
 		}

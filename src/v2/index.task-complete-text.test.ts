@@ -171,4 +171,24 @@ describe("v2: bare TASK COMPLETE latches completion", () => {
 		expect(h.injected.filter((i: any) => i.sid === SID).length).toBeGreaterThan(0)
 		await teardown(h)
 	})
+
+	test("flat-text history (prod shape) latches like parts", async () => {
+		// ses_ed93e258 (2026-10-10): prod transcripts carry text flat, not
+		// in content parts. A parts-only reader went blind and the latch
+		// never engaged despite the fix being live.
+		const h = await setup({
+			messages: [
+				{
+					role: "assistant",
+					id: "msg_a",
+					time: { created: Date.now() - 60_000 },
+					text: "Report written.\n\nTASK COMPLETE\n",
+				},
+			],
+		})
+		push(h, "session.execution.started", SID)
+		await wait(1200)
+		expect(h.injected.filter((i: any) => i.sid === SID)).toHaveLength(0)
+		await teardown(h)
+	}, 20000)
 })
