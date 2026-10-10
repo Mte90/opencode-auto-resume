@@ -123,13 +123,15 @@ const push = (h: any, type: string, sid: string, data: Record<string, unknown> =
 // Action-intent text (colon ending): fires the intent path once evaluated.
 const INTENT_TEXT = "Reading the full summary (everything before the title list):"
 const userMsg = (ageMs: number) => ({
-	type: "user",
+	// Prod shape: role, not type (see assistantMsg note above).
+	role: "user",
 	id: "msg_u",
 	time: { created: Date.now() - ageMs },
 	content: [{ type: "text", text: "go" }],
 })
 const assistantMsg = (text: string, ageMs: number) => ({
-	type: "assistant",
+	// Prod shape: role, not type (see task-complete-text note above).
+	role: "assistant",
 	id: "msg_a",
 	time: { created: Date.now() - ageMs },
 	content: [{ type: "text", text }],

@@ -123,7 +123,11 @@ async function teardown(h: any) {
 const push = (h: any, type: string, sid: string, data: Record<string, unknown> = {}) => h.streamRef.push(ev(type, sid, data))
 
 const assistantMsg = (text: string) => ({
-	type: "assistant",
+	// Prod shape carries role, not type (session.messages API). The harness
+	// convention is type-shaped; these tests deliberately use role-shaped
+	// messages because the ses_edbb4e67 incident was a type-only reader
+	// returning "" in prod while every test stayed green.
+	role: "assistant",
 	id: "msg_a",
 	time: { created: Date.now() - 60_000 },
 	content: [{ type: "text", text }],
