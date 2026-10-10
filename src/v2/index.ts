@@ -3312,6 +3312,27 @@ export default define({
 			return false
 		}
 
+	/**
+	 * Newest inbound user message timestamp, or undefined. Shared by the
+	 * stand-down check and the stand-down recheck scheduler so both agree on
+	 * when the activity window expires.
+	 */
+	function lastUserMessageAt(messages: unknown[]): number | undefined {
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const m = messages[i] as {
+				type?: string
+				role?: string
+				time?: { created?: number }
+				info?: { time?: { created?: number }; role?: string }
+			}
+			const isUser = m?.type === "user" || m?.role === "user" || m?.info?.role === "user"
+			if (!isUser) continue
+			const ts = m.time?.created ?? m.info?.time?.created
+			return typeof ts === "number" ? ts : undefined
+		}
+		return undefined
+	}
+
 		async function shouldStandDownForUser(
 			sid: string,
 			messages: unknown[],
@@ -3328,20 +3349,7 @@ export default define({
 		// newest message a user message?", which at idle time is essentially never
 		// true — the newest message is the assistant turn that just finished — so
 		// the whole window was dead. Walk back for the most recent user message.
-		let lastUserAt: number | undefined
-		for (let i = messages.length - 1; i >= 0; i--) {
-			const m = messages[i] as {
-				type?: string
-				role?: string
-				time?: { created?: number }
-				info?: { time?: { created?: number }; role?: string }
-			}
-			const isUser = m?.type === "user" || m?.role === "user" || m?.info?.role === "user"
-			if (!isUser) continue
-			const ts = m.time?.created ?? m.info?.time?.created
-			if (typeof ts === "number") lastUserAt = ts
-			break
-		}
+		const lastUserAt = lastUserMessageAt(messages)
 		if (lastUserAt !== undefined && Date.now() - lastUserAt < activeUserWindowMs) return true
 		return false
 	} catch {
@@ -3897,6 +3905,29 @@ export default define({
 
 			if (await shouldStandDownForUser(sid, messages, activeUserWindowMs)) {
 				dbg(`${short(sid)} user has pending input or was recently active — standing down`)
+				// ...but only for now. This evaluation is the only one this idle
+				// gets, so standing down without a follow-up makes the session
+				// invisible until the next event (ses_edbb4e67, 2026-10-10: two
+				// manual continues on an action-intent stall). Re-arm one
+				// deferred pattern pass for when the activity window expires. A
+				// new turn replaces it through the toolTextTimer slot (markBusy
+				// clears); a hand-off never reaches here (returned above), so an
+				// awaited user reply is never nagged.
+				{
+					const lastUser = lastUserMessageAt(messages)
+					const waitMs =
+						(lastUser === undefined ? activeUserWindowMs : Math.max(0, lastUser + activeUserWindowMs - Date.now())) + 1000
+					if (w.toolTextTimer) clearTimeout(w.toolTextTimer)
+					w.toolTextTimer = setTimeout(() => {
+						w.toolTextTimer = null
+						if (w.status !== "idle") {
+							dbg(`${short(sid)} stand-down recheck skipped — session is ${w.status}, not idle`)
+							return
+						}
+						if (w.userCancelled) return
+						void inspectOnIdle(sid, "pattern")
+					}, waitMs)
+				}
 				return
 			}
 
