@@ -86,7 +86,7 @@ const OPTIONS = {
 	debug: true,
 }
 
-type Harness = { injected: Array<{ text?: string }>; logs: string[]; stream: any; cleanup?: () => void; logFile: string; failTurn: (err: unknown) => Promise<void>; startTurn: () => Promise<void>; failStep: (err: unknown) => Promise<void>; idleTurn: () => Promise<void> }
+type Harness = { injected: Array<{ text?: string; resume?: boolean; synth?: boolean }>; logs: string[]; stream: any; cleanup?: () => void; logFile: string; failTurn: (err: unknown) => Promise<void>; startTurn: () => Promise<void>; failStep: (err: unknown) => Promise<void>; idleTurn: () => Promise<void> }
 
 async function replay(opts: Record<string, unknown> = {}): Promise<Harness> {
 	const injected: Harness["injected"] = []
@@ -102,7 +102,7 @@ async function replay(opts: Record<string, unknown> = {}): Promise<Harness> {
 			active: async () => ({}),
 			interrupt: async () => ({}),
 			synthetic: async (a: any) => {
-				injected.push({ text: a?.text })
+				injected.push({ text: a?.text, resume: a?.resume, synth: true })
 				return {}
 			},
 			prompt: async (a: any) => {
@@ -164,24 +164,70 @@ describe("v2: rate-limit failures stand down on a ladder", () => {
 		readLogs(h)
 	})
 
-	test("a quota hit injects nothing inside the cooldown", async () => {
+	test("a quota hit injects nothing inside the cooldown except the notice", async () => {
 		const h = await replay({ rateLimitCooldownsMs: [60_000] })
 		await h.failTurn(QUOTA)
 		await wait(300)
-		expect(h.injected).toEqual([])
+		// Only the quota notice — no recovery prompt while cooling down.
+		expect(h.injected.length).toBe(1)
+		expect(h.injected[0].text).toMatch(/Rate limited, retrying in/)
 		const logs = readLogs(h)
 		expect(logs.some((l) => l.includes("rate limited") && l.includes("standing down"))).toBe(true)
 		expect(logs.some((l) => l.includes("session.step.failed") && l.includes("resume attempt"))).toBe(false)
 		h.cleanup?.()
 	})
 
-	test("a second quota hit inside the cooldown still injects nothing", async () => {
+	test("quota stand-down posts one visible notice with wait + attempt", async () => {
+		// ses_edd3d940 (2026-10-10): standing down silently reads as dead.
+		// One synthetic notice (resume:false — never kicks a turn), then
+		// quiet: a second failure inside the cooldown adds no second notice.
+		const h = await replay({ rateLimitCooldownsMs: [60_000] })
+		await h.failTurn(QUOTA)
+		await wait(300)
+		const notices = () => h.injected.filter((i) => /Rate limited, retrying in/.test(i.text ?? ""))
+		expect(notices()).toHaveLength(1)
+		expect(notices()[0].text).toMatch(/attempt 1\/1/)
+		expect(notices()[0].text).toMatch(/~1m|~60m|~1h/)
+		expect(notices()[0].resume).toBeFalsy()
+		expect(notices()[0].synth).toBe(true)
+		await h.failStep(QUOTA)
+		await wait(300)
+		expect(notices()).toHaveLength(1)
+		h.cleanup?.()
+	})
+
+	test("quota budget exhaustion posts the standing-down notice once", async () => {
+		const h = await replay({ rateLimitCooldownsMs: [30, 30] })
+		// No new turns between failures: same episode climbs the ladder to
+		// exhaustion (a fresh startTurn would reset it — see next test).
+		await h.startTurn()
+		for (let i = 0; i < 3; i++) {
+			await h.failStep(QUOTA)
+			await wait(200)
+		}
+		const endNotices = h.injected.filter((i) => /standing down until you return/.test(i.text ?? ""))
+		expect(endNotices).toHaveLength(1)
+		expect(endNotices[0].resume).toBeFalsy()
+		h.cleanup?.()
+	})
+
+	test("CONTROL: non-quota failure posts no quota notice", async () => {
+		const h = await replay({ rateLimitCooldownsMs: [60_000] })
+		await h.failTurn(STREAM_ERR)
+		await wait(300)
+		expect(h.injected.some((i) => /Rate limited/.test(i.text ?? ""))).toBe(false)
+		h.cleanup?.()
+	})
+
+	test("a second quota hit inside the cooldown adds no second notice", async () => {
 		const h = await replay({ rateLimitCooldownsMs: [60_000] })
 		await h.startTurn()
 		await h.failStep(QUOTA)
 		await h.failStep(QUOTA)
 		await wait(300)
-		expect(h.injected).toEqual([])
+		// Exactly the one first-arm notice; the second hit stays silent.
+		expect(h.injected.length).toBe(1)
+		expect(h.injected[0].text).toMatch(/Rate limited, retrying in/)
 		h.cleanup?.()
 		readLogs(h)
 	})
@@ -190,22 +236,27 @@ describe("v2: rate-limit failures stand down on a ladder", () => {
 		const h = await replay({ rateLimitCooldownsMs: [50] })
 		await h.failTurn(QUOTA)
 		await wait(500)
-		expect(h.injected).toHaveLength(1)
+		// The first-arm notice plus the served recovery prompt.
+		expect(h.injected.length).toBe(2)
+		expect(h.injected.some((i) => /Rate limited, retrying in/.test(i.text ?? ""))).toBe(true)
 		const logs = readLogs(h)
 		expect(logs.some((l) => l.includes("cooldown served"))).toBe(true)
 		h.cleanup?.()
 	})
 
-	test("past the ladder the session goes silent until a user turn", async () => {
+	test("past the ladder the exhausted notice fires once, then silence", async () => {
 		const h = await replay({ rateLimitCooldownsMs: [20] })
 		await h.startTurn()
 		await h.failStep(QUOTA)
 		await wait(300)
-		expect(h.injected).toHaveLength(1)
-		// Budget spent (1 rung): the next hit must not inject.
+		// Armed notice + served recovery inside the wait.
+		expect(h.injected).toHaveLength(2)
+		// Budget spent (1 rung): the next hit moves to exhausted (notice +
+		// recovery + exhausted notice), then silence.
 		await h.failStep(QUOTA)
 		await wait(300)
-		expect(h.injected).toHaveLength(1)
+		expect(h.injected).toHaveLength(3)
+		expect(h.injected[2].text).toMatch(/standing down until you return/)
 		const logs = readLogs(h)
 		expect(logs.some((l) => l.includes("budget exhausted"))).toBe(true)
 		h.cleanup?.()
@@ -216,7 +267,8 @@ describe("v2: rate-limit failures stand down on a ladder", () => {
 		await h.startTurn()
 		await h.failStep(QUOTA)
 		await wait(300)
-		expect(h.injected).toHaveLength(1)
+		// Notice + served recovery (20ms ladder serves inside the wait).
+		expect(h.injected).toHaveLength(2)
 		await h.failStep(QUOTA)
 		await wait(200)
 		// New turn = activity = quota available again: fresh ladder, so the

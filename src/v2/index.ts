@@ -155,6 +155,11 @@ interface SessionWatch {
 	 */
 	episodeRefires: number
 	lastRetryAt: number
+	/** Last wall-clock a user-visible quota notice was sent (first arm +
+	 * budget-exhausted). One notice per episode: the stand-down itself is
+	 * silent by design, but a session that looks dead for hours with no
+	 * explanation reads as broken (ses_edd3d940, 2026-10-10). */
+	quotaNoticedAt: number
 	gaveUp: boolean
 	/** Newest genuine (non-own-prompt) user message observed, by timestamp. Our
 	 * own injections travel as user messages but carry no new instructions, so
@@ -1773,6 +1778,7 @@ export default define({
 					resumeAttempts: 0,
 					episodeRefires: 0,
 					lastRetryAt: 0,
+					quotaNoticedAt: 0,
 					gaveUp: false,
 					lastGenuineUserAt: 0,
 					consecFailureRecovers: 0,
@@ -1982,6 +1988,24 @@ export default define({
 		 * (budgets, loop guard and inject guards all apply); past the ladder
 		 * the session stays silent until a genuine user turn.
 		 */
+		/**
+		 * User-visible quota notice. The stand-down itself is silent by design
+		 * (retrying into a ban helps nothing), but an unexplained silent
+		 * session reads as dead. resume:false shows it in the timeline without
+		 * kicking a turn, re-arming budgets, or tripping own-prompt guards
+		 * (text never matches an injected continue). Best-effort: a failed
+		 * notice must never block recovery.
+		 */
+		async function sendQuotaNotice(sid: string, text: string): Promise<void> {
+			try {
+				await sendBound("quota-notice", sid, () =>
+					ctx.session.synthetic({ sessionID: sid, text, description: "auto-resume: quota notice", resume: false }),
+				)
+			} catch (e) {
+				log("warn", `${short(sid)} quota notice failed: ${e instanceof Error ? e.message : String(e)}`)
+			}
+		}
+
 		function handleRateLimitFailure(sid: string, w: SessionWatch, errType: string, errMsg: string): void {
 			const ladder = rateLimitCooldownsMs
 			const tag = "rate-limit"
@@ -1990,6 +2014,10 @@ export default define({
 			if (n >= ladder.length) {
 				w.awaitingQuotaRetry = false
 				log("warn", `${short(sid)} ${tag} budget exhausted (${ladder.length} attempts) — standing down until user turn`)
+				if (!w.quotaNoticedAt) {
+					w.quotaNoticedAt = Date.now()
+					void sendQuotaNotice(sid, `Rate limited — standing down until you return (budget exhausted after ${ladder.length} attempts).`)
+				}
 				return
 			}
 			const now = Date.now()
@@ -1998,6 +2026,10 @@ export default define({
 				w.rateLimitedAt = now
 				w.awaitingQuotaRetry = false
 				w.pendingRecoveryArmed = true
+				// A served rung ends the quiet spell: clear the notice flag
+				// so the next arm (or exhaustion) announces itself afresh.
+				// Each rung then carries at most one notice.
+				w.quotaNoticedAt = 0
 				log("info", `${short(sid)} ${tag} cooldown served — retrying (attempt ${n + 1}/${ladder.length})`)
 				void recover(sid, "rate-limit cooldown served")
 				return
@@ -2006,6 +2038,15 @@ export default define({
 			w.awaitingQuotaRetry = true
 			const waitMs = Math.max(0, ladder[n] - (now - w.rateLimitedAt))
 			log("warn", `${short(sid)} rate limited (${errType || "error"}) — standing down, next attempt in ${Math.ceil(waitMs / 1000)}s (${n + 1}/${ladder.length})`)
+			// User-visible twin of the stand-down: silence reads as dead
+			// (ses_edd3d940). One notice per episode (first arm only);
+			// resume:false so it never kicks a turn or re-arms budgets.
+			if (!w.quotaNoticedAt) {
+				w.quotaNoticedAt = Date.now()
+				const mins = Math.max(1, Math.round(waitMs / 60000))
+				const when = mins >= 60 ? `~${Math.floor(mins / 60)}h ${mins % 60}m` : `~${mins}m`
+				void sendQuotaNotice(sid, `Rate limited, retrying in ${when} (attempt ${n + 1}/${ladder.length}).`)
+			}
 			// Machine-readable arm record so a later evaluation can re-arm after a
 			// reload wipes this in-memory gate (ses_ef72c5f3, 2026-10-09: armed at
 			// 14:31:49, plugin reloaded 14:37:28, gate due 14:46:49 never fired).
@@ -4637,6 +4678,10 @@ export default define({
 				rw.rateLimitAttempts = rn + 1
 				rw.rateLimitedAt = Date.now()
 				rw.pendingRecoveryArmed = true
+				// Same notice-flag reset as the handler path: a served rung
+				// ends the quiet spell, so the next arm (or exhaustion)
+				// announces itself afresh.
+				rw.quotaNoticedAt = 0
 				log("info", `${short(rsid)} ${tag} cooldown served — retrying (attempt ${rn + 1}/${ladder.length}) mod=${MODULE_INSTANCE}`)
 				void recover(rsid, "rate-limit cooldown served")
 			}
@@ -5025,6 +5070,7 @@ export default define({
 						// own recovery turns (selfRecovery) do not reset it.
 						w.rateLimitedAt = 0
 						w.rateLimitAttempts = 0
+						w.quotaNoticedAt = 0
 						w.awaitingQuotaRetry = false
 						// A genuine turn is also a new episode for the stall
 						// ladder (the reset lives here and in the progress check,
