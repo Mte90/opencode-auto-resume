@@ -2828,6 +2828,10 @@ export default define({
 			// 1/3 forever). gaveUp itself is left alone: only a fresh turn
 			// (markBusy) clears that latch.
 			if (w.lastProdText !== "" && w.lastAssistantText !== w.prodAssistantSnapshot) {
+				// Every reset logs: silent restarts hid the endless-1/3 loop
+				// for weeks (ses_ef3a2ba2 — resets visible only once in six
+				// fires). Observability before economy here.
+				log("info", `${short(sid)} text growth since last prod — restarting the stall ladder`)
 				// Only count mid-ladder restarts: a first fire after genuine
 				// work (attempts still 0) is a fresh episode, not a refire.
 				if (w.resumeAttempts > 0) w.episodeRefires++
@@ -2838,6 +2842,7 @@ export default define({
 				w.resumeAttempts = 0
 			} else if (reason === "slot-busy cooldown served") {
 				// A served slot retry is a fresh turn, not a deeper stall.
+				log("info", `${short(sid)} slot-busy cooldown served — restarting the stall ladder`)
 				w.resumeAttempts = 0
 			}
 			recordContinue(sid)

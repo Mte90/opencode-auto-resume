@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test"
-import { rmSync } from "node:fs"
+import { existsSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "./index"
@@ -157,8 +157,7 @@ describe("v2: refire backoff across one episode", () => {
 		expect(late).toBeGreaterThan(early * 2)
 	}, 30000)
 
-	test("genuine user message resets the fuse to base", async () => {
-		const msgs: unknown[] = [userMsg("go", Date.now() - 60_000, "msg_u0"), assistantMsg("Working through the list.")]
+	test("genuine user message resets the fuse to base", async () => {		const msgs: unknown[] = [userMsg("go", Date.now() - 60_000, "msg_u0"), assistantMsg("Working through the list.")]
 		const h = await setup(msgs)
 		push(h, "session.execution.started", SID)
 		await wait(60)
@@ -185,5 +184,17 @@ describe("v2: refire backoff across one episode", () => {
 		// Base fuse again (~150ms), not the backed-off one.
 		expect(after.length).toBeGreaterThan(0)
 		expect((after[0].t as number) - t1).toBeLessThan(450)
+	}, 20000)
+
+	test("every ladder reset is logged (no silent branches)", async () => {
+		const msgs: unknown[] = [userMsg("go", Date.now() - 60_000, "msg_u0"), assistantMsg("Working through the list.")]
+		const h = await setup(msgs)
+		push(h, "session.execution.started", SID)
+		await wait(60)
+		push(h, "session.tool.success", SID)
+		await wait(1200)
+		const logs = existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : ""
+		await teardown(h)
+		expect(logs).toMatch(/restarting the stall ladder/)
 	}, 20000)
 })
