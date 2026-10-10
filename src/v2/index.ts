@@ -401,6 +401,10 @@ export interface AutoResumeOptions {
 	toolTextCheckDelayMs?: number
 	/** Wait for a subagent to report before treating it as stalled. */
 	subagentWaitMs?: number
+	/** Successor setups inherit the watch map instead of starting blank.
+	 * Off by default (test files share one process); prod opts in so
+	 * session attach/restore stops restoring amnesia. */
+	shareWatchState?: boolean
 	/** Outer bound: quiet past this with no error evidence reads as dead. */
 	subagentDeadMs?: number
 	/** Token floor for the silent-dead-stream heuristic. */
@@ -544,6 +548,11 @@ const DEFAULT_ACTIVE_USER_WINDOW_MS = 5 * 60_000
 const DEFAULT_DISCOVERY_DELAY_MS = 5_000
 const DEFAULT_SESSION_DISCOVERY_INTERVAL_MS = 60_000
 const DEFAULT_WARMUP_MS = 15_000
+// Off by default: bun runs every test file in one process, so unconditional
+// sharing leaks watch state across tests (165 failures on record). Prod opts
+// in to sharing — sequential setups in one server process must inherit stall
+// memory, or every session attach restores amnesia (2026-10-09).
+const DEFAULT_SHARE_WATCH_STATE = false
 const DEFAULT_MIN_ACTIVITY_GAP_MS = 1_000
 const DEFAULT_TOOL_TEXT_CHECK_DELAY_MS = 3_000
 const DEFAULT_SUBAGENT_WAIT_MS = 15_000
@@ -974,11 +983,27 @@ const STOP_STATEMENT_PATTERNS: RegExp[] = [
 	/stopping (here|there)[.!]*$/i,
 	/nothing (further |else )?(to do|left|remaining|needed)[.!]*$/i,
 	/no further action[.!]*$/i,
+	// ses_edd1eb51 (2026-10-09): the model ended two deliveries with a bare
+	// trailing "TASK COMPLETE" and the stall ladder fired 186s later — the
+	// system's own completion vocabulary written as text latched nothing.
+	// End-anchored like the stop patterns so mid-text mentions don't fire.
+	/\btask completed?\s*[.!]*\s*$/i,
 ]
 function containsStopStatement(text: string): boolean {
 	const lines = text.split("\n")
 	const lastLines = lines.slice(-3).join("\n")
 	return STOP_STATEMENT_PATTERNS.some((pat) => pat.test(lastLines))
+}
+
+/**
+ * One predicate for "this turn declares itself finished", shared by the idle
+ * inspection and the busy-stall watchdog. ses_edd1eb51 (2026-10-09): a
+ * "TASK COMPLETE" delivery went quiet with no session.idle event, so the
+ * idle latch never ran and the stall ladder fired 186s later. The busy path
+ * must judge the same tail from history before firing.
+ */
+function turnEndsWithCompletionClaim(text: string): boolean {
+	return endsWithCelebration(text) || containsStopStatement(text)
 }
 
 /**
@@ -1417,6 +1442,13 @@ const REGISTRY_KEY = `__auto_resume_singleton__:${process.pid}`
 
 type SingletonRegistry = {
 	live?: { dispose: () => void; mod: string; startedAt: number }
+	// Watch state shared across setup re-runs in one process. The loader
+	// re-evaluates this bundle on session attach/restore (bursts of several
+	// setups/second plus singles every ~25-40min on record 2026-10-09), and
+	// every setup used to start with a blank sessions map, making
+	// multi-minute stalls unobservable. Successors inherit the map instead;
+	// see the adoption below and the no-clear in dispose.
+	sessions?: Map<string, SessionWatch>
 }
 
 function singletonRegistry(): SingletonRegistry {
@@ -1534,6 +1566,10 @@ export default define({
 		// mistaken for live behaviour.
 		const resumeOnActionIntent = opts.resumeOnActionIntent !== false
 		const warmupMs = opts.warmupMs ?? DEFAULT_WARMUP_MS
+		// Successor setups inherit the watch map instead of starting blank.
+		// Off unless prod opts in: test files share one process, so sharing
+		// by default leaks state across tests.
+		const shareWatchState = opts.shareWatchState ?? DEFAULT_SHARE_WATCH_STATE
 		// Live since the v2 discovery sweep landed (see discoverSessions).
 		const discoveryDelayMs = opts.discoveryDelayMs ?? DEFAULT_DISCOVERY_DELAY_MS
 		const minActivityGapMs = opts.minActivityGapMs ?? DEFAULT_MIN_ACTIVITY_GAP_MS
@@ -1624,6 +1660,7 @@ export default define({
 			"minActivityGapMs",
 			"toolTextCheckDelayMs",
 			"subagentWaitMs",
+			"shareWatchState",
 			"subagentDeadMs",
 			"silentDeadStreamMinTokens",
 			"streamingFailureErrorNames",
@@ -1680,7 +1717,24 @@ export default define({
 		// State
 		// ---------------------------------------------------------------------
 
-		const sessions = new Map<string, SessionWatch>()
+		// Adopted, not fresh: see SingletonRegistry.sessions. A successor setup
+		// inherits the predecessor's watch map (stall clocks, ladders, latches)
+		// instead of starting blank. openShells stays per-instance: shells are
+		// transient and a stale entry would wrongly block nudges.
+		// Gated on shareWatchState: test files share one process, and
+		// unconditional sharing leaks watch state across tests.
+		const registryForState = singletonRegistry()
+		let adoptedSessions = 0
+		let sessions: Map<string, SessionWatch>
+		if (shareWatchState) {
+			if (!(registryForState.sessions instanceof Map)) {
+				registryForState.sessions = new Map<string, SessionWatch>()
+			}
+			sessions = registryForState.sessions
+			adoptedSessions = sessions.size
+		} else {
+			sessions = new Map<string, SessionWatch>()
+		}
 
 		/**
 		 * Open shells from the process-registry event family, keyed by shell id
@@ -4403,6 +4457,30 @@ export default define({
 				}
 				const silence = now - w.lastActivityAt
 				if (silence < chunkTimeoutMs + gracePeriodMs) continue
+				// A quiet turn that already declared completion, but no idle
+				// inspection ever latched it: no session.idle event arrived, or a
+				// take-over landed mid-silence. Judge the tail from history
+				// rather than firing the stall. ses_edd1eb51 (2026-10-09) fired
+				// resume attempt 1/3 186s after a "TASK COMPLETE" delivery
+				// exactly this way. Same reminder-or-latch semantics as the idle
+				// stop path. Placed past the silence gate so a partial stream
+				// (still emitting deltas) can never match an end-anchored claim,
+				// and so the history read happens at most once per stall window.
+				{
+					const histText = lastAssistantTextFrom(await loadMessages(sid))
+					if (histText && turnEndsWithCompletionClaim(histText)) {
+						const open = getOpenTodos(await readTodos(sid))
+						if (open.length > 0) {
+							await targetedRecovery(sid, "stop-open-todos", buildOpenTodosReminder(open), "todoNudgeAttempts")
+						} else if (!w.completionSignaled) {
+							w.completionSignaled = true
+							log("info", `${short(sid)} quiet turn ends with a completion claim and no open todos — latching completion, not nudging`)
+						} else {
+							dbg(`${short(sid)} completion already latched — skipping`)
+						}
+						continue
+					}
+				}
 				if (busyStallStrategy === "off") {
 					dbg(`stall on ${short(sid)} ignored (busyStallStrategy=off)`)
 					continue
@@ -5332,6 +5410,9 @@ export default define({
 				`superseded live instance mod=${superseded.mod} (age ${Math.round((Date.now() - superseded.startedAt) / 1000)}s) by mod=${MODULE_INSTANCE} boot=${HOST_BOOT}`,
 			)
 		}
+		if (adoptedSessions > 0) {
+			log("info", `adopted ${adoptedSessions} watched session(s) from previous instance (stall memory retained) mod=${MODULE_INSTANCE}`)
+		}
 
 		log(
 			"info",
@@ -5354,7 +5435,9 @@ export default define({
 				if (w.recoverTimer) clearTimeout(w.recoverTimer)
 				w.recoverTimer = null
 			}
-			sessions.clear()
+			// NOTE: the sessions map is intentionally NOT cleared — it is
+			// registry-owned (see adoption in State) so stall memory survives
+			// setup churn. Only this instance's timers and loops are torn down.
 			// Only clear the registry slot if it is still OURS: a later setup may
 			// already have superseded us, and unregistering it would strand a live
 			// watchdog. The identity check matters across copies too, since they
