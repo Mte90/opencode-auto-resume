@@ -2052,6 +2052,28 @@ export default define({
 			}
 		}
 
+		/**
+		 * Serve one rung of the rate-limit cooldown ladder: advance the rung,
+		 * re-arm recovery, and reset the notice flag so the next arm (or
+		 * exhaustion) announces itself afresh. Shared by the failure handler
+		 * (cooldown already served when the failure arrives) and the watchdog
+		 * gate (cooldown served while stood down) — one shape, one place, so
+		 * the two can never drift apart again.
+		 */
+		function serveQuotaRung(sid: string, w: SessionWatch, rung: number, ladder: number[]): void {
+			w.rateLimitAttempts = rung + 1
+			w.rateLimitedAt = Date.now()
+			w.awaitingQuotaRetry = false
+			w.pendingRecoveryArmed = true
+			// A served rung ends the quiet spell: clear the notice flag
+			// so the next arm (or exhaustion) announces itself afresh.
+			// Each rung then carries at most one notice.
+			w.quotaNoticedAt = 0
+			log("info", `${short(sid)} rate-limit cooldown served — retrying (attempt ${rung + 1}/${ladder.length}) mod=${MODULE_INSTANCE}`)
+			void syncQuotaState(sid, w)
+			void recover(sid, "rate-limit cooldown served")
+		}
+
 		function handleRateLimitFailure(sid: string, w: SessionWatch, errType: string, errMsg: string): void {
 			const ladder = rateLimitCooldownsMs
 			const tag = "rate-limit"
@@ -2068,17 +2090,7 @@ export default define({
 			}
 			const now = Date.now()
 			if (w.rateLimitedAt > 0 && now - w.rateLimitedAt >= ladder[n]) {
-				w.rateLimitAttempts = n + 1
-				w.rateLimitedAt = now
-				w.awaitingQuotaRetry = false
-				w.pendingRecoveryArmed = true
-				// A served rung ends the quiet spell: clear the notice flag
-				// so the next arm (or exhaustion) announces itself afresh.
-				// Each rung then carries at most one notice.
-				w.quotaNoticedAt = 0
-				log("info", `${short(sid)} ${tag} cooldown served — retrying (attempt ${n + 1}/${ladder.length})`)
-				void syncQuotaState(sid, w)
-				void recover(sid, "rate-limit cooldown served")
+				serveQuotaRung(sid, w, n, ladder)
 				return
 			}
 			if (w.rateLimitedAt === 0) w.rateLimitedAt = now
@@ -4722,7 +4734,6 @@ export default define({
 			for (const [rsid, rw] of sessions) {
 				if (!rw.awaitingQuotaRetry) continue
 				const ladder = rateLimitCooldownsMs
-				const tag = "rate-limit"
 				const rn = rw.rateLimitAttempts
 				if (rn >= ladder.length) {
 					rw.awaitingQuotaRetry = false
@@ -4731,17 +4742,7 @@ export default define({
 				if (rw.userCancelled || rw.gaveUp || rw.compacting || rw.permissionPending) continue
 				if (selfAbortActive(rw)) continue
 				if (Date.now() - rw.rateLimitedAt < ladder[rn]) continue
-				rw.awaitingQuotaRetry = false
-				rw.rateLimitAttempts = rn + 1
-				rw.rateLimitedAt = Date.now()
-				rw.pendingRecoveryArmed = true
-				// Same notice-flag reset as the handler path: a served rung
-				// ends the quiet spell, so the next arm (or exhaustion)
-				// announces itself afresh.
-				rw.quotaNoticedAt = 0
-				log("info", `${short(rsid)} ${tag} cooldown served — retrying (attempt ${rn + 1}/${ladder.length}) mod=${MODULE_INSTANCE}`)
-				void syncQuotaState(rsid, rw)
-				void recover(rsid, "rate-limit cooldown served")
+				serveQuotaRung(rsid, rw, rn, ladder)
 			}
 			cleanupIdleSessions()
 		}
