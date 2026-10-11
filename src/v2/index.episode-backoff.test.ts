@@ -1,4 +1,4 @@
-import { describe, test, expect } from "bun:test"
+import { describe, test, expect, setDefaultTimeout } from "bun:test"
 import { existsSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -21,6 +21,16 @@ const LOG_SALT = "IndexEpisodeBackoffTest"
  */
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+/**
+ * Poll budgets sized for the environment, not for isolation: `bun test` runs
+ * 79 files in parallel and this file's events are watchdog-driven, so a
+ * condition that is microseconds away with every mock in place can still take
+ * seconds of wall clock under contention. A poll budget only costs time when
+ * the condition never arrives, which is a real failure and should fail.
+ */
+const POLL_MS = 10_000
+setDefaultTimeout(30_000)
 const SID = "ses_parent"
 
 let counter = 9800
@@ -138,7 +148,7 @@ async function teardown(h: any) {
 const push = (h: any, type: string, sid: string, data: Record<string, unknown> = {}) => h.streamRef.push(ev(type, sid, data))
 
 /** Poll until the predicate holds; resolves false on timeout. */
-async function waitFor(fn: () => boolean, timeoutMs = 6000): Promise<boolean> {
+async function waitFor(fn: () => boolean, timeoutMs = POLL_MS): Promise<boolean> {
 	const deadline = Date.now() + timeoutMs
 	while (Date.now() < deadline) {
 		if (fn()) return true

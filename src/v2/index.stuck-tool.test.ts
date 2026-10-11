@@ -35,7 +35,8 @@ const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
  * simply starved. Bun's 5s default leaves no room for that, so the six tests
  * that wait on a nudge get a real budget instead of racing one.
  */
-setDefaultTimeout(20_000)
+const POLL_MS = 8_000
+setDefaultTimeout(30_000)
 const SID = "ses_parent"
 
 let counter = 17000
@@ -170,7 +171,7 @@ async function goIdle(h: any, expectNudge = false) {
 		await wait(300)
 		return
 	}
-	const deadline = Date.now() + 8000
+	const deadline = Date.now() + POLL_MS
 	while (Date.now() < deadline) {
 		if (h.injected.some((i: any) => /never returned a result|Retry it now/.test(i.text ?? ""))) return
 		await wait(25)

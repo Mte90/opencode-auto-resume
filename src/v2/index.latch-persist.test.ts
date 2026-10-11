@@ -1,4 +1,4 @@
-import { describe, test, expect } from "bun:test"
+import { describe, test, expect, setDefaultTimeout } from "bun:test"
 import { rmSync, readFileSync, existsSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -30,6 +30,22 @@ const LOG_SALT = "IndexLatchPersistTest"
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_latch"
+
+/**
+ * Poll budgets are sized for the environment, not for isolation.
+ *
+ * This suite runs while `bun test` runs 79 files in parallel, and under that
+ * contention a condition that resolves in microseconds with every mock in
+ * place can still take seconds of wall clock — the process is simply starved.
+ * Five separate tests here and in the sibling files failed this way on
+ * 2026-10-10/11, each on a different budget, all passing in isolation.
+ *
+ * A poll budget only ever costs time when the condition NEVER arrives, which
+ * is a real failure and should fail — slowly, and with the assertion saying
+ * so. So these are generous on purpose.
+ */
+const POLL_MS = 10_000
+setDefaultTimeout(30_000)
 
 let counter = 41000
 
@@ -172,7 +188,7 @@ const freshLog = () => {
  * which is how these tests came to be flaky (a fixed `wait(600)` here failed
  * roughly one run in three, while passing every time on its own).
  */
-async function waitForLog(h: any, needle: string, timeoutMs = 4000): Promise<string> {
+async function waitForLog(h: any, needle: string, timeoutMs = POLL_MS): Promise<string> {
 	const deadline = Date.now() + timeoutMs
 	let text = h.logs()
 	while (!text.includes(needle) && Date.now() < deadline) {
@@ -183,7 +199,7 @@ async function waitForLog(h: any, needle: string, timeoutMs = 4000): Promise<str
 }
 
 /** Poll until the predicate holds; resolves true/false. */
-async function until(fn: () => boolean, timeoutMs = 4000): Promise<boolean> {
+async function until(fn: () => boolean, timeoutMs = POLL_MS): Promise<boolean> {
 	const deadline = Date.now() + timeoutMs
 	while (Date.now() < deadline) {
 		if (fn()) return true
@@ -245,7 +261,7 @@ describe("v2: durable quota state across a restart", () => {
 		// the restore the only possible outcome; the arm is real either way, and
 		// the rung it reaches is not what this test is about.
 		const h2 = await setup(logFile, [], store, { rateLimitCooldownsMs: [4000, 4000] })
-		const log = await waitForLog(h2, "cooldown served", 8000)
+		const log = await waitForLog(h2, "cooldown served")
 		;(h2.cleanup as (() => void) | undefined)?.()
 		rmSync(logFile, { force: true })
 
