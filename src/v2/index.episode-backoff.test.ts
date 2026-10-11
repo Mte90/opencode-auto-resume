@@ -137,38 +137,60 @@ async function teardown(h: any) {
 
 const push = (h: any, type: string, sid: string, data: Record<string, unknown> = {}) => h.streamRef.push(ev(type, sid, data))
 
+/** Poll until the predicate holds; resolves false on timeout. */
+async function waitFor(fn: () => boolean, timeoutMs = 6000): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs
+	while (Date.now() < deadline) {
+		if (fn()) return true
+		await wait(25)
+	}
+	return fn()
+}
+
 describe("v2: refire backoff across one episode", () => {
 	test("fuse doubles per refire without user input", async () => {
 		const msgs: unknown[] = [userMsg("go", Date.now() - 60_000, "msg_u0"), assistantMsg("Working through the list.")]
 		const h = await setup(msgs)
-		const t0 = Date.now()
 		push(h, "session.execution.started", SID)
-		// Eight stall cycles, each restarted by one tool success. Early gaps
-		// ride the base fuse (~150ms); the episode counter doubles it per
-		// refire (300/600/1200, cap x8), so late gaps run several times wider.
-		for (let i = 0; i < 8; i++) {
-			await wait(60)
+		await wait(60)
+		let lastFire = 0
+		// One tool success immediately after each fire: that is the "progress"
+		// the ladder needs to restart (resumeAttempts -> 0, episodeRefires++)
+		// without ending the episode. PUSH-AFTER-FIRE is the whole point — the
+		// old fixed 900ms period was shorter than the 8x rung, so the push landed
+		// mid-rung and the late rungs could never be observed.
+		//
+		// The interval between consecutive fires IS the rung: markBusy resets
+		// lastActivityAt on injection and the push resets it again a moment
+		// later, so the next fire waits out silence >= chunkTimeout * fuseMult
+		// from here. Fires are watchdog-driven (the recover backoff timer is
+		// cleared as it fires), so a fire is never a straggler of the push.
+		const gaps: number[] = []
+		const fires = () => h.injected.filter((x: any) => x.sid === SID)
+		for (let i = 0; i < 5; i++) {
+			const before = fires().length
+			await waitFor(() => fires().length > before)
+			const at = fires()[before].t as number
+			if (i > 0) gaps.push(at - lastFire)
+			lastFire = at
 			push(h, "session.tool.success", SID)
-			await wait(900)
 		}
-		const times = h.injected.filter((x: any) => x.sid === SID).map((x: any) => x.t as number)
 		await teardown(h)
-		expect(times.length).toBeGreaterThanOrEqual(6)
-		// The backoff itself: late gaps dwarf early ones (nominal ~160 vs ~600+).
-		// This is a RATIO between two intervals the plugin itself scheduled, so it
-		// survives scheduler noise.
-		const early = times[1] - times[0]
-		const late = times[times.length - 1] - times[times.length - 2]
-		expect(late).toBeGreaterThan(early * 2)
-		// The first fire must be prompt, i.e. still on the BASE fuse rather than
-		// already backed off. Expressed relative to the late gap so it survives
-		// scheduler noise: the old absolute bound (`< 450` against a real clock)
-		// failed on load regardless of correct behaviour, and a bound derived
-		// from baseBackoffMs was simply wrong -- the real floor is the configured
-		// chunkTimeoutMs, since a stall cannot be declared before that silence
-		// elapses. If the first fire were already backed off it would be within
-		// reach of `late`, and this trips.
-		expect(times[0] - t0).toBeLessThan(late)
+		// The contract: each refire without genuine user input doubles the
+		// silence the next fire demands, so a slow-trickling session decays to
+		// patience instead of nagging on a fixed clock (ses_ed975114).
+		//
+		// Gaps grow monotonically and roughly double. Bounds are BELOW the
+		// nominal rung on purpose: a delayed watchdog tick can only push a fire
+		// later, never earlier, so every gap has a hard floor at chunkTimeout
+		// (150ms) and the growth factors are what actually carry the assertion.
+		expect(gaps.length).toBe(4)
+		for (const g of gaps) {
+			expect(g).toBeGreaterThanOrEqual(140)
+		}
+		expect(gaps[1]).toBeGreaterThan(gaps[0] * 1.5)
+		expect(gaps[2]).toBeGreaterThan(gaps[1] * 1.5)
+		expect(gaps[3]).toBeGreaterThan(gaps[2] * 1.5)
 	}, 30000)
 
 	test("genuine user message resets the fuse to base", async () => {		const msgs: unknown[] = [userMsg("go", Date.now() - 60_000, "msg_u0"), assistantMsg("Working through the list.")]

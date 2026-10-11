@@ -109,13 +109,14 @@ async function setup(
 	logFile: string,
 	history: unknown[] = [],
 	storage: any = durableStorage(),
+	opts: Record<string, unknown> = {},
 ): Promise<any> {
 	const injected: Array<{ text?: string }> = []
 	const stream = makeEventStream()
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTS, logFile },
+		options: { ...OPTS, logFile, ...opts },
 		session: {
 			context: async () => history,
 			active: async () => ({}),
@@ -227,8 +228,7 @@ describe("v2: durable quota state across a restart", () => {
 
 		const h1 = await setup(logFile, [], store)
 		await h1.failTurn(QUOTA)
-		await wait(200)
-		expect(h1.logs()).toContain("quota-armed")
+		expect(await waitForLog(h1, "quota-armed")).toContain("quota-armed")
 		;(h1.cleanup as (() => void) | undefined)?.()
 
 		// Destroy the log: the log-grep fallback cannot help, so this passes
@@ -236,13 +236,21 @@ describe("v2: durable quota state across a restart", () => {
 		rmSync(logFile, { force: true })
 		writeFileSync(logFile, "")
 
-		const h2 = await setup(logFile, [], store)
-		const log = await waitForLog(h2, "cooldown served")
+		// The second instance reads the record at `restoreQuotaLadders`, which
+		// drops any arm older than `horizon` = sum(ladder) — the point past which
+		// serving another rung could not help. With the file's default [120,120]
+		// that horizon is 240ms, and the arm expires DURING this test's own
+		// teardown + setup: it passed in isolation and failed under the suite's
+		// parallel load (one run in three). A ladder whose horizon is ~5s makes
+		// the restore the only possible outcome; the arm is real either way, and
+		// the rung it reaches is not what this test is about.
+		const h2 = await setup(logFile, [], store, { rateLimitCooldownsMs: [4000, 4000] })
+		const log = await waitForLog(h2, "cooldown served", 8000)
 		;(h2.cleanup as (() => void) | undefined)?.()
 		rmSync(logFile, { force: true })
 
 		expect(log).toContain("cooldown served")
-	}, 20000)
+	}, 30000)
 
 	test("a genuine turn drops the durable arm", async () => {
 		// The point of moving the ladder out of the log: the record is deleted
