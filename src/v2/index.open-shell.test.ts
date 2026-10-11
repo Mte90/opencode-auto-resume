@@ -112,6 +112,7 @@ async function replay(events: any[], messages?: any[]): Promise<Injected[]> {
 		event: stream,
 		app: { log: () => {} },
 		options: {
+			registryScope: LOG_SALT,
 			toolTextCheckDelayMs: 0,
 			// Without this the test writes into the PRODUCTION log
 			// (~/.local/state/opencode-v2/auto-resume.log), which corrupts the

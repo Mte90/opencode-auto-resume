@@ -109,7 +109,7 @@ async function setup(msgs: unknown[]) {
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile },
+		options: { ...OPTIONS, logFile, registryScope: LOG_SALT },
 		session: {
 			context: async () => msgs,
 			active: async () => ({}),

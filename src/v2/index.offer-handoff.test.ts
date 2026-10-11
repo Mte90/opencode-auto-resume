@@ -89,7 +89,7 @@ async function setup(text: string): Promise<any> {
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile },
+		options: { ...OPTIONS, logFile, registryScope: LOG_SALT },
 		session: {
 			// Prod shape: role, not type.
 			context: async () => [

@@ -98,7 +98,7 @@ async function replay(
 
 	const ctx: any = {
 		event: stream,
-		options: { ...FAST, ...opts, logFile, debug: true },
+		options: { ...FAST, ...opts, logFile, debug: true, registryScope: LOG_SALT },
 		session: {
 			active: async () => ({}),
 			interrupt: async () => ({}),

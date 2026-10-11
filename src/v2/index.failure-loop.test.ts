@@ -76,6 +76,7 @@ async function setup(): Promise<any> {
 	const ctx: any = {
 		event: stream,
 		options: {
+			registryScope: LOG_SALT,
 			// High chunk timeout: the silence path must not interleave here.
 			// What this pins is failure stalls only; with a 50ms window every
 			// driven failure is followed by a silence stall and the counts

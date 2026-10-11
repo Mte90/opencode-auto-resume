@@ -88,6 +88,7 @@ async function setup(opts: { text?: string | null; toolTextCheckDelayMs?: number
 	const ctx: any = {
 		event: stream,
 		options: {
+			registryScope: LOG_SALT,
 			chunkTimeoutMs: 600_000,
 			checkIntervalMs: 20,
 			gracePeriodMs: 0,

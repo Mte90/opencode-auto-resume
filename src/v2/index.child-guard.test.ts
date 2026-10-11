@@ -120,6 +120,7 @@ async function setup(opts: {
 	const ctx: any = {
 		event: stream,
 		options: {
+			registryScope: LOG_SALT,
 			...OPTIONS,
 			logFile,
 			...(opts.backoffMs ? { baseBackoffMs: opts.backoffMs, maxBackoffMs: opts.backoffMs } : {}),

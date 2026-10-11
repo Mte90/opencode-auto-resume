@@ -125,7 +125,7 @@ async function run(
 
 	const ctx: any = {
 		event: stream,
-		options: { warmupMs: 0, discoveryDelayMs: 20, toolTextCheckDelayMs: 0, logFile, ...opts },
+		options: { warmupMs: 0, discoveryDelayMs: 20, toolTextCheckDelayMs: 0, logFile, ...opts, registryScope: LOG_SALT },
 		session,
 	}
 	if (client) ctx.client = client
@@ -182,7 +182,7 @@ describe("v2: session discovery sweep", () => {
 		const rows = [{ id: "not-a-session" }, { id: 42 }, {}, null]
 		const ctx: any = {
 			event: stream,
-			options: { warmupMs: 0, discoveryDelayMs: 20, toolTextCheckDelayMs: 0, logFile },
+			options: { warmupMs: 0, discoveryDelayMs: 20, toolTextCheckDelayMs: 0, logFile, registryScope: LOG_SALT },
 			session: {
 				context: async () => [],
 				active: async () => ({}),
@@ -202,7 +202,7 @@ describe("v2: session discovery sweep", () => {
 		const stream = makeEventStream()
 		const ctx: any = {
 			event: stream,
-			options: { warmupMs: 0, discoveryDelayMs: 20, toolTextCheckDelayMs: 0, logFile },
+			options: { warmupMs: 0, discoveryDelayMs: 20, toolTextCheckDelayMs: 0, logFile, registryScope: LOG_SALT },
 			session: {
 				context: async () => [],
 				active: async () => ({ [RUNNING]: { type: "running" } }),
@@ -222,7 +222,7 @@ describe("v2: session discovery sweep", () => {
 		const ctx: any = {
 			event: stream,
 			// Tight watchdog so a leaked interval is visible inside the wait.
-			options: { warmupMs: 0, discoveryDelayMs: 20, checkIntervalMs: 20, chunkTimeoutMs: 10_000, toolTextCheckDelayMs: 0, logFile },
+			options: { warmupMs: 0, discoveryDelayMs: 20, checkIntervalMs: 20, chunkTimeoutMs: 10_000, toolTextCheckDelayMs: 0, logFile, registryScope: LOG_SALT },
 			session: {
 				context: async () => [],
 				active: async () => {

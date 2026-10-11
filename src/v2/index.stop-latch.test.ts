@@ -97,7 +97,7 @@ async function setup(opts: {
 	const messages = opts.messages ?? []
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile },
+		options: { ...OPTIONS, logFile, registryScope: LOG_SALT },
 		session: {
 			context: async () => messages,
 			// Prod has no active-session surface: always empty, so busy

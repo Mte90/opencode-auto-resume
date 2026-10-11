@@ -70,6 +70,7 @@ async function setup(extraEvents: Array<{ at: number; event: any }>, waitMs: num
 	const ctx: any = {
 		event: stream,
 		options: {
+			registryScope: LOG_SALT,
 			chunkTimeoutMs: 50,
 			gracePeriodMs: 0,
 			checkIntervalMs: 20,

@@ -132,7 +132,7 @@ async function setup(
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTS, logFile, ...opts },
+		options: { ...OPTS, logFile, ...opts, registryScope: LOG_SALT },
 		session: {
 			context: async () => history,
 			active: async () => ({}),

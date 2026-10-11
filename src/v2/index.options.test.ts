@@ -119,7 +119,7 @@ async function replay(
 		// Before the spread, so it applies to every test here unless one asks for a
 		// different value. The deferred pattern pass defaults to 3s, which is not what
 		// these tests measure — the nudge they assert on would land after the wait.
-		options: { toolTextCheckDelayMs: 0, ...opts, logFile },
+		options: { toolTextCheckDelayMs: 0, ...opts, logFile, registryScope: LOG_SALT },
 		session: {
 			context: async () => [oldUserTurn(), assistantTurn(text)],
 			// Empty: no other session is active, so the `lastWasTaskTool` branch

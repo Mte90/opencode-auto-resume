@@ -423,6 +423,20 @@ export interface AutoResumeOptions {
 	 * Off by default (test files share one process); prod opts in so
 	 * session attach/restore stops restoring amnesia. */
 	shareWatchState?: boolean
+
+	/**
+	 * Which process-wide registry slot this instance owns.
+	 *
+	 * Unset (the production case) means the pid-wide slot, where a fresh setup
+	 * disposes its predecessor — that is what stops a reload storm stacking six
+	 * live instances. Set it, and this instance neither disposes nor is
+	 * disposed by instances using a different scope.
+	 *
+	 * Required for test harnesses: `bun test` runs every file in one process, so
+	 * without a per-file scope each file's setup kills the file before it.
+	 * Test-only; production has one instance per process.
+	 */
+	registryScope?: string
 	/** Outer bound: quiet past this with no error evidence reads as dead. */
 	subagentDeadMs?: number
 	/** Token floor for the silent-dead-stream heuristic. */
@@ -1484,11 +1498,34 @@ function isTaskToolCall(ev: V2Event): boolean {
  * counter exist however often the loader reloads us. Disposal cannot be left to
  * the host, because the storms prove it does not always happen.
  *
- * Keyed by pid + plugin id: two servers in one process cannot happen, but two
- * config trees (v1 and v2) can load different builds, and they must not dispose
- * each other.
+ * Keyed by pid alone, and that was the claim to be wrong about: this comment
+ * read "Keyed by pid + plugin id ... two config trees (v1 and v2) ... must not
+ * dispose each other", but the key carried no plugin id, so two builds sharing
+ * a pid DID dispose each other. Nothing above ever needed a plugin id because
+ * a process hosts one build; `registryScope` is what makes the split real, for
+ * the test process that hosts many instances at once (see registryKeyFor).
  */
 const REGISTRY_KEY = `__auto_resume_singleton__:${process.pid}`
+
+/**
+ * The registry slot this build instance owns.
+ *
+ * `registryScope` splits the slot. Without it the key is pid-wide, which is
+ * right for production (one config tree, one build: a fresh setup disposes
+ * its predecessor and the reload storm cannot stack instances) but WRONG for
+ * any process that holds two unrelated instances at once — a test suite most
+ * plainly. `bun test` runs all 79 files in ONE process, so file A's setup
+ * disposed file B's in-flight instance: `running = false`, event pump
+ * aborted, watchdog cleared. B's plugin was dead, and its assertions could
+ * never pass — they waited 10s for an event no longer being delivered, and
+ * every one of those tests passed in isolation (2026-10-10/11).
+ *
+ * The same hazard is real outside tests: two builds (v1 and v2) sharing a pid
+ * would silence each other, since only one can hold the pid-wide slot.
+ */
+function registryKeyFor(scope?: string): string {
+	return scope ? `${REGISTRY_KEY}:${scope}` : REGISTRY_KEY
+}
 
 type SingletonRegistry = {
 	live?: { dispose: () => void; mod: string; startedAt: number }
@@ -1501,12 +1538,13 @@ type SingletonRegistry = {
 	sessions?: Map<string, SessionWatch>
 }
 
-function singletonRegistry(): SingletonRegistry {
+function singletonRegistry(scope?: string): SingletonRegistry {
 	const g = globalThis as unknown as Record<string, SingletonRegistry | undefined>
-	let reg = g[REGISTRY_KEY]
+	const key = registryKeyFor(scope)
+	let reg = g[key]
 	if (!reg) {
 		reg = {}
-		g[REGISTRY_KEY] = reg
+		g[key] = reg
 	}
 	return reg
 }
@@ -1539,11 +1577,16 @@ export default define({
 	id: "auto-resume.v2",
 
 	setup: async (ctx: AutoResumePluginInput) => {
+		const opts = (ctx.options ?? {}) as AutoResumeOptions
 		// Supersede any instance the loader left running — found through the
 		// process-wide registry, so it also catches instances belonging to OTHER
 		// evaluations of this bundle. Wrapped: a throwing predecessor must not
 		// block the new one from arming.
-		const registry = singletonRegistry()
+		//
+		// Read before the registry: `registryScope` selects WHICH slot this
+		// instance owns, and instances in different slots never dispose each
+		// other (see registryKeyFor).
+		const registry = singletonRegistry(opts.registryScope)
 		// A second live instance means the host re-evaluated this bundle without
 		// disposing the first — the reload-storm signature. The predecessor's
 		// identity and age are captured HERE and logged later, because `log`
@@ -1559,7 +1602,7 @@ export default define({
 			}
 			registry.live = undefined
 		}
-		const opts = (ctx.options ?? {}) as AutoResumeOptions
+		const registryScope = opts.registryScope
 
 		const chunkTimeoutMs = opts.chunkTimeoutMs ?? DEFAULT_CHUNK_TIMEOUT_MS
 		const checkIntervalMs = opts.checkIntervalMs ?? DEFAULT_CHECK_INTERVAL_MS
@@ -1706,6 +1749,7 @@ export default define({
 			"toolTextCheckDelayMs",
 			"subagentWaitMs",
 			"shareWatchState",
+			"registryScope",
 			"subagentDeadMs",
 			"silentDeadStreamMinTokens",
 			"streamingFailureErrorNames",
@@ -1767,7 +1811,7 @@ export default define({
 		// transient and a stale entry would wrongly block nudges.
 		// Gated on shareWatchState: test files share one process, and
 		// unconditional sharing leaks watch state across tests.
-		const registryForState = singletonRegistry()
+		const registryForState = singletonRegistry(registryScope)
 		let adoptedSessions = 0
 		let sessions: Map<string, SessionWatch>
 		if (shareWatchState) {
@@ -5727,7 +5771,7 @@ export default define({
 			// already have superseded us, and unregistering it would strand a live
 			// watchdog. The identity check matters across copies too, since they
 			// share one registry.
-			const reg = singletonRegistry()
+			const reg = singletonRegistry(registryScope)
 			if (reg.live?.dispose === dispose) reg.live = undefined
 			log("info", `stopped mod=${MODULE_INSTANCE}`)
 		}

@@ -142,6 +142,7 @@ async function replay(h: HarnessOpts) {
 	const ctx: any = {
 		event: stream,
 		options: {
+			registryScope: LOG_SALT,
 			chunkTimeoutMs: 600_000,
 			toolTextCheckDelayMs: 0,
 			checkIntervalMs: 20,
@@ -233,7 +234,7 @@ describe("v2: context saturation — parent sessions", () => {
 		rmSync(logFile, { force: true })
 		const ctx: any = {
 			event: stream,
-			options: { warmupMs: 0, checkIntervalMs: 20, chunkTimeoutMs: 600_000, gracePeriodMs: 0, logFile },
+			options: { warmupMs: 0, checkIntervalMs: 20, chunkTimeoutMs: 600_000, gracePeriodMs: 0, logFile, registryScope: LOG_SALT },
 			session: { context: async () => [], active: async () => ({}), interrupt: async () => ({}), synthetic: async () => ({}) },
 			model: { get: () => ({ limit: { context: 200_000, output: 32_000 } }) },
 		}
@@ -338,7 +339,7 @@ describe("v2: the saturation arithmetic matches v1", () => {
 		rmSync(logFile, { force: true })
 		const ctx: any = {
 			event: stream,
-			options: { warmupMs: 0, checkIntervalMs: 20, chunkTimeoutMs: 600_000, gracePeriodMs: 0, logFile },
+			options: { warmupMs: 0, checkIntervalMs: 20, chunkTimeoutMs: 600_000, gracePeriodMs: 0, logFile, registryScope: LOG_SALT },
 			session: { context: async () => [], active: async () => ({}), interrupt: async () => ({}), synthetic: async () => ({}) },
 			model: { get: () => undefined },
 			plugin: { list: async () => [{ id: "magic-context" }] },

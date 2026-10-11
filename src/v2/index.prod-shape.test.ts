@@ -97,7 +97,7 @@ async function setup(
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTS, logFile, ...extra },
+		options: { ...OPTS, logFile, ...extra, registryScope: LOG_SALT },
 		session: {
 			context: async () => {
 				if (contextDelayMs) await wait(contextDelayMs)
@@ -278,7 +278,7 @@ describe("v2: history readers accept the production message shape", () => {
 
 		const ctx: any = {
 			event: stream,
-			options: { ...OPTS, logFile, subagentDeadMs: 60_000, subagentWaitMs: 50 },
+			options: { ...OPTS, logFile, subagentDeadMs: 60_000, subagentWaitMs: 50, registryScope: LOG_SALT },
 			session: {
 				context: async (a: any) => (a?.sessionID === CHILD ? childHistory : []),
 				active: async () => ({}),

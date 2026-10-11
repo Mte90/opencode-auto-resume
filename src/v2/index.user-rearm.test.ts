@@ -98,7 +98,7 @@ async function setup(history: Record<string, unknown[]>): Promise<any> {
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile },
+		options: { ...OPTIONS, logFile, registryScope: LOG_SALT },
 		session: {
 			context: async (a: any) => history[a?.sessionID ?? SID] ?? [],
 			active: async () => ({ [SID]: {} }),

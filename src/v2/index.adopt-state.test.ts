@@ -88,7 +88,7 @@ function makeCtx(stream: any, injected: Array<{ sid?: string; text?: string }>, 
 	rmSync(logFile, { force: true })
 	return {
 		event: stream,
-		options: { ...OPTIONS, logFile },
+		options: { ...OPTIONS, logFile, registryScope: LOG_SALT },
 		session: {
 			context: async () => [],
 			active: async () => ({}),

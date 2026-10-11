@@ -71,6 +71,7 @@ async function setup(extraOpts: Record<string, unknown> = {}): Promise<any> {
 	const ctx: any = {
 		event: stream,
 		options: {
+			registryScope: LOG_SALT,
 			chunkTimeoutMs: 50,
 			toolTextCheckDelayMs: 0,
 			checkIntervalMs: 20,

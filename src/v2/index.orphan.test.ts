@@ -108,7 +108,7 @@ async function setup(
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile, ...(opts.subagentWaitMs ? { subagentWaitMs: opts.subagentWaitMs } : {}) },
+		options: { ...OPTIONS, logFile, ...(opts.subagentWaitMs ? { subagentWaitMs: opts.subagentWaitMs } : {}), registryScope: LOG_SALT },
 		session: {
 			context: async (a: any) => history[a?.sessionID ?? SID] ?? [],
 			active: async () => Object.fromEntries([...active].map((s) => [s, {}])),

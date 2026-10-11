@@ -72,6 +72,7 @@ async function setup(promptImpl: (a: any) => Promise<unknown>, opts: Record<stri
 	const ctx: any = {
 		event: stream,
 		options: {
+			registryScope: LOG_SALT,
 			chunkTimeoutMs: 300,
 			toolTextCheckDelayMs: 0,
 			checkIntervalMs: 20,

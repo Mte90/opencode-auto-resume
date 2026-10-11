@@ -138,7 +138,7 @@ async function replay(
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile, ...opts },
+		options: { ...OPTIONS, logFile, ...opts, registryScope: LOG_SALT },
 		session: {
 			context: async () => [userTurn(), ...messages],
 			// The server's own record of what is running, which is what the
@@ -272,7 +272,7 @@ describe("v2: silent dead stream", () => {
 		const injected: unknown[] = []
 		const ctx: any = {
 			event: stream,
-			options: { ...OPTIONS, logFile },
+			options: { ...OPTIONS, logFile, registryScope: LOG_SALT },
 			session: {
 				context: async () => [userTurn(), finished({ output: 400 })],
 				active: async () => ({}),

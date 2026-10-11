@@ -123,7 +123,7 @@ async function setup(
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile, ...(opts.quietCorrections === undefined ? {} : { quietCorrections: opts.quietCorrections }) },
+		options: { ...OPTIONS, logFile, ...(opts.quietCorrections === undefined ? {} : { quietCorrections: opts.quietCorrections }), registryScope: LOG_SALT },
 		session: {
 			context: async () => history,
 			active: async () => ({}),

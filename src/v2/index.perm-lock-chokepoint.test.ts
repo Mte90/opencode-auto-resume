@@ -122,7 +122,7 @@ async function setup(history: unknown[]): Promise<any> {
 	// Prod shape: no ctx.client, empty active set.
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile },
+		options: { ...OPTIONS, logFile, registryScope: LOG_SALT },
 		session: {
 			context: async () => history,
 			active: async () => ({}),

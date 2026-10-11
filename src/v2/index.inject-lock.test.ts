@@ -84,7 +84,7 @@ async function run(slowMs: number) {
 	const logFile = privateLog("lock")
 	const ctx: any = {
 		event: stream,
-		options: { ...FAST, maxRetries: 1, debug: true, logFile },
+		options: { ...FAST, maxRetries: 1, debug: true, logFile, registryScope: LOG_SALT },
 		session: {
 			active: async () => ({}),
 			interrupt: async () => ({}),

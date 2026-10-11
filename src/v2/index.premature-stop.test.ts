@@ -129,7 +129,7 @@ async function replay(
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile, ...opts },
+		options: { ...OPTIONS, logFile, ...opts, registryScope: LOG_SALT },
 		session: {
 			context: async () => [userTurn(harnessOpts.userAgeMs), assistantTurn(TEXT_FOR_HARNESS.value)],
 			active: async () => ({}),

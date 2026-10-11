@@ -99,7 +99,7 @@ async function setup(opts: {
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile },
+		options: { ...OPTIONS, logFile, registryScope: LOG_SALT },
 		session: {
 			context: async (a: any) => history[a?.sessionID ?? SID] ?? [],
 			active: async () => Object.fromEntries([...active].map((s) => [s, {}])),

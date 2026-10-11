@@ -87,7 +87,7 @@ async function setup(opts: { messages?: unknown[]; todos?: Array<{ content: stri
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile },
+		options: { ...OPTIONS, logFile, registryScope: LOG_SALT },
 		session: {
 			context: async () => opts.messages ?? [],
 			active: async () => ({}),

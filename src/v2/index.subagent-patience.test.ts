@@ -114,6 +114,7 @@ async function setup(opts: {
 	const ctx: any = {
 		event: stream,
 		options: {
+			registryScope: LOG_SALT,
 			...OPTIONS,
 			logFile,
 			...(opts.maxRetries !== undefined ? { maxRetries: opts.maxRetries } : {}),

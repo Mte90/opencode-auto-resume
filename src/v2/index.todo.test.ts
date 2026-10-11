@@ -151,7 +151,7 @@ async function replay(
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile, ...opts },
+		options: { ...OPTIONS, logFile, ...opts, registryScope: LOG_SALT },
 		session: {
 			context: async () => history,
 			active: async () => ({}),
@@ -335,7 +335,7 @@ describe("v2: the todo list, read from the tool that owns it", () => {
 			const injected: unknown[] = []
 			const ctx: any = {
 				event: stream,
-				options: { ...OPTIONS, logFile },
+				options: { ...OPTIONS, logFile, registryScope: LOG_SALT },
 				session: {
 					context: async () => [userMessage("ask", OLD), assistantMessage(CELEBRATED, Date.now())],
 					active: async () => ({}),

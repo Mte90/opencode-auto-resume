@@ -88,7 +88,7 @@ async function boot(instances: number): Promise<Boot> {
 				return s
 			},
 		},
-		options: { ...FAST, maxRetries: 1, logFile },
+		options: { ...FAST, maxRetries: 1, logFile, registryScope: LOG_SALT },
 		session: {
 			active: async () => ({}),
 			interrupt: async () => ({}),
@@ -103,7 +103,10 @@ async function boot(instances: number): Promise<Boot> {
 	const cleanups: Array<(() => void) | undefined> = []
 	for (let i = 0; i < instances; i++) cleanups.push(await (plugin as any).setup(ctx))
 
-	const key = `__auto_resume_singleton__:${process.pid}`
+	// The harness scopes its instances (see the cross-scope test below), so the
+	// slot to inspect is the scoped one. The pid-wide prefix is unchanged —
+	// scoping only appends to it.
+	const key = `__auto_resume_singleton__:${process.pid}:${LOG_SALT}`
 	const afterSetup = (globalThis as any)[key]?.live
 
 	streams.forEach((s) => s.push(ev("session.execution.started")))
@@ -132,15 +135,72 @@ describe("v2: the singleton lives on globalThis, so re-evaluations share it", ()
 
 	test("the registry key is process-scoped, not module-scoped", async () => {
 		const { registryKey } = await boot(1)
-		expect(registryKey).toBe(`__auto_resume_singleton__:${process.pid}`)
+		// Process-scoped: keyed by pid on globalThis, so every module evaluation
+		// in the process finds the same slot. The scope is appended to that
+		// prefix, never a substitute for it.
+		expect(registryKey).toBe(`__auto_resume_singleton__:${process.pid}:${LOG_SALT}`)
+		expect(registryKey.startsWith(`__auto_resume_singleton__:${process.pid}`)).toBe(true)
 	})
+
+	// The bug this scopes out (2026-10-11): with a pid-wide key and no scope,
+	// `bun test` running all 79 files in ONE process meant file A's setup
+	// disposed file B's in-flight instance. B's plugin was dead — event pump
+	// aborted, watchdog cleared — so its assertions waited for events nothing
+	// would ever deliver again, and each one failed under load while passing
+	// alone. Two scopes must therefore keep two independent live instances.
+	test("differently scoped instances do NOT dispose each other", async () => {
+		const mk = () => makeEventStream()
+		const logFile = privateLog("scoped")
+		const streams = [mk(), mk()]
+		let next = 0
+		const makeCtx = (registryScope: string): any => ({
+			event: {
+				subscribe: ({ signal }: { signal?: AbortSignal } = {}) => {
+					const s = streams[next++] ?? streams[streams.length - 1]
+					signal?.addEventListener("abort", () => s.close())
+					return s
+				},
+			},
+			options: { ...FAST, maxRetries: 1, logFile, registryScope },
+			session: {
+				active: async () => ({}),
+				interrupt: async () => ({}),
+				synthetic: async () => ({}),
+				prompt: async () => ({}),
+			},
+			client: {
+				session: { get: async () => ({ data: {} }), message: { list: async () => ({ data: [], cursor: null }) } },
+			},
+			storage: { get: async () => ({ todos: [], updatedAt: Date.now() }), set: async () => {}, remove: async () => {} },
+		})
+
+		const disposeA = await (plugin as any).setup(makeCtx("scope-a"))
+		const disposeB = await (plugin as any).setup(makeCtx("scope-b"))
+
+		// Both slots still hold their own live instance: B did not evict A.
+		const g = globalThis as any
+		expect(g[`__auto_resume_singleton__:${process.pid}:scope-a`]?.live).toBeDefined()
+		expect(g[`__auto_resume_singleton__:${process.pid}:scope-b`]?.live).toBeDefined()
+
+		disposeA()
+		// A's teardown must not clear B's slot — different scope, different owner.
+		expect(g[`__auto_resume_singleton__:${process.pid}:scope-b`]?.live).toBeDefined()
+		disposeB()
+		rmSync(logFile, { force: true })
+	}, 20_000)
 
 	// The shipped bug: `let activeInstance` in module scope. Six evaluations of
 	// the bundle each hold their own, so each believes it is the only live one and
 	// the storms continued (8 lines, same millisecond, 19:54:19).
 	test("structural: the singleton is reached THROUGH globalThis", () => {
 		expect(SOURCE).toContain("globalThis as unknown as Record<string, SingletonRegistry | undefined>")
-		expect(SOURCE).toContain("function singletonRegistry()")
+		// Takes the scope that selects the slot, and reaches globalThis through
+		// the scoped key — never module scope. The signature gained its parameter
+		// when registryScope landed; what this pins is that the lookup still goes
+		// through the process-global object under a key derived from the scope.
+		expect(SOURCE).toContain("function singletonRegistry(scope?: string)")
+		expect(SOURCE).toContain("const key = registryKeyFor(scope)")
+		expect(SOURCE).toContain("let reg = g[key]")
 		// No module-scope `activeInstance` may remain: it cannot see other copies.
 		expect(SOURCE).not.toMatch(/^let activeInstance/m)
 		// The teardown must go through the registry too, and must clear the slot

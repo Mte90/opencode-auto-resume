@@ -101,7 +101,7 @@ async function replay(opts: Record<string, unknown> = {}): Promise<Harness> {
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile, ...opts },
+		options: { ...OPTIONS, logFile, ...opts, registryScope: LOG_SALT },
 		session: {
 			context: async () => [userTurn()],
 			active: async () => ({}),

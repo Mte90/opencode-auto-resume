@@ -125,6 +125,7 @@ async function setup(
 	const ctx: any = {
 		event: stream,
 		options: {
+			registryScope: LOG_SALT,
 			...OPTIONS,
 			logFile,
 			// Raise maxRetries so the "blocked call does not count toward the ack
@@ -387,7 +388,7 @@ describe("v2: task_complete degrades rather than failing the watchdog", () => {
 		rmSync(logFile, { force: true })
 		const ctx: any = {
 			event: stream,
-			options: { ...OPTIONS, logFile },
+			options: { ...OPTIONS, logFile, registryScope: LOG_SALT },
 			session: {
 				context: async () => [userMessage("go", OLD)],
 				active: async () => ({}),

@@ -112,6 +112,7 @@ async function setup(history: unknown[], opts: { chunkTimeoutMs?: number } = {})
 	const ctx: any = {
 		event: stream,
 		options: {
+			registryScope: LOG_SALT,
 			chunkTimeoutMs: opts.chunkTimeoutMs ?? 50,
 			toolTextCheckDelayMs: 0,
 			checkIntervalMs: 20,

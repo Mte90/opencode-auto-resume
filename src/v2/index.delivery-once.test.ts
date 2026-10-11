@@ -105,7 +105,7 @@ async function setup(opts: {
 	const logMessages: unknown[] = opts.logMessages ?? []
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile },
+		options: { ...OPTIONS, logFile, registryScope: LOG_SALT },
 		session: {
 			context: async () => [],
 			active: async () => ({ [SID]: {} }),
@@ -179,7 +179,7 @@ describe("v2: a disposed instance sends nothing more", () => {
 		rmSync(logFile, { force: true })
 		const ctx: any = {
 			event: stream,
-			options: { ...OPTIONS, logFile, maxRetries: 1 },
+			options: { ...OPTIONS, logFile, maxRetries: 1, registryScope: LOG_SALT },
 			session: {
 				context: async () => [
 					{ type: "assistant", time: { created: now - 5_000 }, content: [{ type: "text", text: "working" }] },
