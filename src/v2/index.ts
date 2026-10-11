@@ -253,6 +253,14 @@ interface SessionWatch {
 	/** Set when the model's own completion signal was seen (a trailing 🎉).
 	 * Latches so a finished session stops being nudged. */
 	completionSignaled: boolean
+	/** When the latch above was set (Date.now()). Compared against genuine new
+	 * user messages: only work that arrived AFTER the latch re-opens it.
+	 * Without the timestamp the latch could only be cleared on lifecycle
+	 * transitions (markBusy) — but the watchdog re-marks busy from server truth
+	 * with no new work, which wiped freshly-set latches within seconds
+	 * (ses_ed33c0da, 2026-10-11: TASK COMPLETE latched at idle would have died
+	 * at the re-mark 1s later). Cleared alongside completionSignaled. */
+	completionSignaledAt: number
 	/** Set once the empty-idle instant nudge has fired for the current episode.
 	 * A turn that ends with nothing delivered gets exactly one quiet continue;
 	 * a new turn (markBusy) re-arms it. Without the flag every repeat idle
@@ -2015,6 +2023,7 @@ export default define({
 					todoNudgeAttempts: 0,
 					intentNudgeAttempts: 0,
 					completionSignaled: false,
+					completionSignaledAt: 0,
 					emptyIdleNudged: false,
 					todos: [],
 					todosFetchedAt: 0,
@@ -2107,8 +2116,16 @@ export default define({
 					clearTimeout(w.toolTextTimer)
 					w.toolTextTimer = null
 				}
-				// A new turn re-opens the question of whether the work is finished.
-				w.completionSignaled = false
+				// A new turn re-opens the question of whether the work is finished —
+				// BUT only a genuine one. markBusy also runs for plumbing transitions
+				// (watchdog re-mark from server truth, discovery adopt, step events,
+				// our own injections' turns), none of which is new work. Clearing the
+				// latch here wiped freshly-set completions within seconds: ses_ed33c0da
+				// (2026-10-11) would have latched TASK COMPLETE at idle and lost it at
+				// the re-mark 1s later, stalling at +197s anyway. The latch now clears
+				// only on a genuine new user message (noteInboundUserMessage, which
+				// already distinguishes own prompts), timestamped against
+				// completionSignaledAt; the busy-path skip below re-opens it there.
 				// NOTE 3: gaveUp is deliberately NOT cleared here either. It is
 				// an episode latch, not per-turn bookkeeping: a stood-down
 				// session the watchdog re-adopts from server truth (or
@@ -3911,6 +3928,19 @@ export default define({
 			// separately from lastUserMessageSeenAt, which our own prompts also
 			// advance: only non-own messages mark a user takeover.
 			w.lastGenuineUserAt = typeof latest.at === "number" ? latest.at : Date.now()
+			// A genuine new user message is also what re-opens a latched
+			// completion: new instructions mean the "done" being tracked is no
+			// longer the question. This is the ONLY place the latch clears besides
+			// a fresh latch overwriting it — deliberately not in markBusy, whose
+			// transitions include plumbing (watchdog re-marks, discovery adopts,
+			// step events, our own injections' turns) that wiped fresh latches
+			// within seconds (ses_ed33c0da, 2026-10-11). Own prompts return above
+			// before reaching here, so our injections never clear it.
+			if (w.completionSignaled) {
+				w.completionSignaled = false
+				w.completionSignaledAt = 0
+				dbg(`${short(sid)} genuine new user message — re-opening latched completion`)
+			}
 			// A genuine user message is a new episode for the stall ladder too
 			// (the reset lives here, on genuine execution.started, and in the
 			// progress check — never on lifecycle transitions).
@@ -4304,6 +4334,7 @@ export default define({
 							}
 
 							w.completionSignaled = true
+							w.completionSignaledAt = Date.now()
 							log("info", `${short(sid)} task_complete called, ${(await isSubAgentSession(sid)) ? "subagent" : "agent"} done`)
 							w.taskCompleteSignals++
 							if (w.taskCompleteSignals === 2) return { content: TASK_COMPLETE_REPEAT_WARNING }
@@ -4390,6 +4421,31 @@ export default define({
 			}
 
 			if (await shouldStandDownForUser(sid, messages, activeUserWindowMs)) {
+				// Latch FIRST, then stand down. A turn that completed inside the
+				// activity window must still record its completion: latching is
+				// read-only state (no nudge, no interruption), so it is safe to do
+				// even while standing down. Without this, the claim is never
+				// evaluated — the deferred re-check below can lose the race to the
+				// busy watchdog — and the ladder fires on a finished turn:
+				// ses_ed33c0da (2026-10-11) stood down on a TASK COMPLETE turn at
+				// 21:08:42 and stalled at +197s. Mirrors the busy-path latch, same
+				// predicate, same no-open-todos condition. Open todos fall through
+				// to the normal stand-down (the later checks nudge for them when
+				// the window expires); challenges and reminders stay below, because
+				// those INTERVENE and stand-down exists to prevent exactly that.
+				{
+					const tailText = w.lastAssistantText || lastAssistantTextFrom(messages)
+					if (tailText && turnEndsWithCompletionClaim(tailText)) {
+						const open = getOpenTodos(await readTodos(sid))
+						if (open.length === 0 && !w.completionSignaled) {
+							w.completionSignaled = true
+							w.completionSignaledAt = Date.now()
+							log("info", `${short(sid)} turn ends with a completion claim inside the activity window — latching completion, standing down`)
+						}
+					} else {
+						dbg(`${short(sid)} stand-down evaluation: tail is not a completion claim (score the tail, not the turn)`)
+					}
+				}
 				dbg(`${short(sid)} user has pending input or was recently active — standing down`)
 				// ...but only for now. This evaluation is the only one this idle
 				// gets, so standing down without a follow-up makes the session
@@ -4447,6 +4503,7 @@ export default define({
 				}
 				if (!w.completionSignaled) {
 					w.completionSignaled = true
+					w.completionSignaledAt = Date.now()
 					log("info", `${short(sid)} turn ends with a celebration and no open todos — latching completion, not nudging`)
 				} else {
 					dbg(`${short(sid)} completion already latched — skipping`)
@@ -4494,6 +4551,7 @@ export default define({
 				}
 				if (!w.completionSignaled) {
 					w.completionSignaled = true
+					w.completionSignaledAt = Date.now()
 					log("info", `${short(sid)} turn ends with an explicit stop and no open todos — latching completion, not nudging`)
 				} else {
 					dbg(`${short(sid)} completion already latched — skipping`)
@@ -5098,12 +5156,28 @@ export default define({
 				}
 				// A latched completion stands down the stall path too: the session
 				// declared itself done (task_complete tool, celebration, or an
-				// explicit stop) and no fresh turn has cleared the latch in
-				// markBusy since. Nudging a completed quiet session is the nagging
-				// this exists to prevent; a new turn re-arms by clearing the latch.
+				// explicit stop). Nudging a completed quiet session is the nagging
+				// this exists to prevent.
+				//
+				// The latch re-opens ONLY on genuine new work: a user message newer
+				// than the latch itself, read here from history (not from
+				// lastGenuineUserAt, which lags on timer ticks for busy parents).
+				// noteInboundUserMessage is the arbiter — it already distinguishes
+				// genuine messages from our own prompts, so own injections never
+				// re-open it. Plumbing transitions (watchdog re-marks, discovery
+				// adopts, step events) must NOT clear it: ses_ed33c0da (2026-10-11)
+				// would have latched TASK COMPLETE at idle and lost it at the
+				// re-mark 1s later, stalling at +197s anyway.
 				if (w.completionSignaled) {
-					dbg(`${short(sid)} completion latched — skipping stall detection`)
-					continue
+					noteInboundUserMessage(sid, w, await loadMessages(sid))
+					if (w.lastGenuineUserAt > w.completionSignaledAt) {
+						w.completionSignaled = false
+						w.completionSignaledAt = 0
+						dbg(`${short(sid)} genuine new user message after latched completion — re-opening stall detection`)
+					} else {
+						dbg(`${short(sid)} completion latched — skipping stall detection`)
+						continue
+					}
 				}
 				// Stale compaction flag: a compaction that never reports
 				// ended/failed within the TTL is wedged — clear the guard so
@@ -5151,6 +5225,7 @@ export default define({
 							await targetedRecovery(sid, "stop-open-todos", buildOpenTodosReminder(open), "todoNudgeAttempts")
 						} else if (!w.completionSignaled) {
 							w.completionSignaled = true
+							w.completionSignaledAt = Date.now()
 							log("info", `${short(sid)} quiet turn ends with a completion claim and no open todos — latching completion, not nudging`)
 						} else {
 							dbg(`${short(sid)} completion already latched — skipping`)

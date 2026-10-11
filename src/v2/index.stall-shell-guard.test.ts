@@ -1,5 +1,5 @@
 import { describe, test, expect, setDefaultTimeout } from "bun:test"
-import { rmSync } from "node:fs"
+import { rmSync, existsSync, readFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "./index"
@@ -78,7 +78,7 @@ const shellExited = (id: string) => ({ type: "shell.exited", data: { id, status:
 
 const userMessage = (at: number) => ({ type: "user", id: "msg_u", time: { created: at }, content: [{ type: "text", text: "run the suite" }] })
 
-type SetupOpts = { chunkTimeoutMs?: number; checkIntervalMs?: number; history?: unknown[] }
+type SetupOpts = { chunkTimeoutMs?: number; checkIntervalMs?: number; history?: unknown[]; activeUserWindowMs?: number }
 
 const assistantWithTool = (name: string, status: string, at: number, id = `call_${at}`) => ({
 	type: "assistant",
@@ -106,6 +106,7 @@ async function setup(opts: SetupOpts = {}): Promise<any> {
 			registryScope: LOG_SALT,
 			chunkTimeoutMs: opts.chunkTimeoutMs ?? 60,
 			checkIntervalMs: opts.checkIntervalMs ?? 20,
+			activeUserWindowMs: opts.activeUserWindowMs ?? 5 * 60_000,
 			gracePeriodMs: 0,
 			warmupMs: 0,
 			maxRetries: 3,
@@ -133,6 +134,15 @@ async function teardown(h: any) {
 	;(h.cleanup as (() => void) | undefined)?.()
 	rmSync(h.logFile, { force: true })
 }
+
+const logs = (h: any) => (existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : "")
+
+const assistantWith = (at: number, text: string) => ({
+	type: "assistant",
+	id: `msg_a_${at}`,
+	time: { created: at },
+	content: [{ type: "text", text }],
+})
 
 describe("v2: the STALL WATCHDOG defers while a shell is running", () => {
 	test("CONTROL: a busy session with no shell DOES get the stall recovery", async () => {
@@ -251,5 +261,123 @@ describe("v2: the STALL WATCHDOG defers on unfinished work in history", () => {
 		await wait(1600)
 		await teardown(h)
 		expect(h.injected).toEqual([])
+	})
+})
+
+/**
+ * The busy stall ladder must latch a completion claim instead of firing on it.
+ *
+ * ses_ed33c0da5ffe2ENcPETjG4aTuo, 2026-10-11: a scheduled check ended with an
+ * explicit "TASK COMPLETE", and the ladder fired resume attempts 2/3 and 3/3
+ * plus an abort+resume escalation on the completed turn. The idle path had
+ * stood down on recent activity without latching, and the busy path — which
+ * DOES check turnEndsWithCompletionClaim — missed it too, with no latch line
+ * anywhere in the log.
+ *
+ * These tests drive the busy path with the production tail shape and assert
+ * the LATCH (log line), not merely the absence of an injection — absence alone
+ * would pass vacuously via the hand-off skip or any other early return.
+ */
+/**
+ * The busy stall ladder must latch a completion claim instead of firing on it.
+ *
+ * ses_ed33c0da5ffe2ENcPETjG4aTuo, 2026-10-11: a scheduled check ended with an
+ * explicit "TASK COMPLETE", and the ladder fired resume attempts 2/3 and 3/3
+ * plus an abort+resume escalation on the completed turn. The idle path had
+ * stood down on recent activity without latching. The busy path — which DOES
+ * check turnEndsWithCompletionClaim — never logged a latch, a hand-off skip,
+ * or a nudge for that session either. The histText block was skipped silently,
+ * which happens exactly when the completion text is unreadable at evaluation
+ * time (empty history read). Nothing was recorded anywhere, so the ladder
+ * fired on a finished turn.
+ *
+ * The first test below documents that the busy path latches when it CAN read
+ * the claim (predicates work — that was never the defect). The second drives
+ * the production sequence: readable at idle, unreadable by stall time. Only
+ * an idle-set latch survives that; the busy path alone cannot. Both assert the
+ * LATCH (log line), not merely absence — absence alone passes vacuously.
+ */
+describe("v2: the busy stall ladder latches completion claims", () => {
+	// Faithful tail of the production message: prose, then the claim. What
+	// matters is the ending shape the end-anchored patterns judge.
+	const doneTail = (claim: string) =>
+		[
+			"Per the no-action branch:",
+			"- Logged one line to the findings file",
+			"- Schedule kept; the check will run again tomorrow",
+			"- If action is taken before then: the pre-approved resubmit, schedule deletion, log, and notify",
+			"",
+			"All todos are done; findings file and todo list are in sync.",
+			"",
+			claim,
+			"",
+		].join("\n")
+
+	test("a turn ending in TASK COMPLETE latches instead of stalling", async () => {
+		const now = Date.now()
+		const h = await setup({
+			history: [userMessage(now - 600_000), assistantWith(now - 300_000, doneTail("TASK COMPLETE"))],
+		})
+		h.streamRef.push(ev("session.execution.started"))
+		await wait(10)
+		h.streamRef.push(ev("session.step.started"))
+		await wait(1600)
+		const said = logs(h)
+		await teardown(h)
+		expect(h.injected).toEqual([])
+		expect(said).toContain("latching completion")
+	})
+
+	test("a completion latched at idle survives an unreadable history at stall time", async () => {
+		// The production sequence: the claim was readable at the idle
+		// evaluation and unreadable when the busy watchdog evaluated (~3 min
+		// later). Emptying history here simulates exactly that observed
+		// condition — it is not rigging, it is what the log shows (no latch
+		// line, no hand-off line, no nudge: the histText block skipped
+		// silently). Only an idle-set latch survives it.
+		const now = Date.now()
+		const history: unknown[] = [
+			userMessage(now - 2000),
+			assistantWith(now - 1000, doneTail("TASK COMPLETE")),
+		]
+		const h = await setup({ history, chunkTimeoutMs: 60, activeUserWindowMs: 120_000 })
+		// idle evaluation with fresh activity: stand down (+ latch post-fix).
+		// The 121s deferred re-check cannot intervene in this window.
+		for (const e of ["session.execution.started", "session.step.started", "session.step.ended", "session.idle"]) {
+			h.streamRef.push(ev(e))
+			await wait(10)
+		}
+		await wait(400)
+		// By stall time the completion text is unreadable.
+		history.length = 0
+		// Busy again with no new user input; the 60ms stall window passes long
+		// before the deferred re-check could run.
+		h.streamRef.push(ev("session.execution.started"))
+		await wait(10)
+		h.streamRef.push(ev("session.step.started"))
+		await wait(10)
+		await wait(1600)
+		const said = logs(h)
+		await teardown(h)
+		expect(h.injected).toEqual([])
+		expect(said).toContain("latching completion")
+	})
+
+	test("CONTROL: the same shape without the claim still stalls", async () => {
+		// Without this, a green run above proves nothing: a harness in which
+		// the ladder never fires would pass the latch test vacuously.
+		const now = Date.now()
+		const h = await setup({
+			history: [
+				userMessage(now - 600_000),
+				assistantWith(now - 300_000, doneTail("Still working on it.")),
+			],
+		})
+		h.streamRef.push(ev("session.execution.started"))
+		await wait(10)
+		h.streamRef.push(ev("session.step.started"))
+		await wait(1600)
+		await teardown(h)
+		expect(h.injected.length).toBeGreaterThan(0)
 	})
 })
