@@ -297,6 +297,11 @@ interface SessionWatch {
 	 * check that reads the live counter always sees zero. Same class of bug the
 	 * `busyBefore` sample above guards against. */
 	toolsInFlightAtIdle: number
+	/** In-flight tool calls by call id, with start times. The busy-stall guard
+	 * defers recovery while young tools run (and never interrupts exempt names
+	 * like `compress`); unlike the bare `pendingTools` counter this carries the
+	 * ages the decision needs. Entries die with the watch; results remove them. */
+	inflightTools: Map<string, { name: string; at: number }>
 	/** Rate-limit ladder state. `rateLimitedAt` is the last quota decision
 	 * point, `rateLimitAttempts` counts served attempts in this episode, and
 	 * `awaitingQuotaRetry` arms the watchdog-tick gate. A fresh turn resets
@@ -360,6 +365,12 @@ export interface AutoResumeOptions {
 	chunkTimeoutMs?: number
 	gracePeriodMs?: number
 	stuckToolAgeMs?: number
+	/** Tool names the busy-stall path never interrupts (case-insensitive).
+	 * Default `["compress"]`: every tool gets the young-tool deferral, and
+	 * `compress` is additionally never interrupted while fresh;
+	 * `compress` is exempt because interrupting it mid-flight risks leaving
+	 * half-compacted state, the same reason compaction is never interrupted. */
+	neverInterruptTools?: string[]
 	checkIntervalMs?: number
 	maxRetries?: number
 	baseBackoffMs?: number
@@ -806,6 +817,9 @@ const IDLE_CLEANUP_MS = 10 * 60_000
 const COMPACTION_STALE_TTL_MS = 30 * 60_000
 /** A `permission.asked` unanswered this long is treated as abandoned — stale-clear the flag. */
 const PERMISSION_STALE_TTL_MS = 30 * 60_000
+/** An exempt tool (see `neverInterruptTools`) with no result after this long is
+ * wedged, not working — the exemption expires and the stall answers normally. */
+const NEVER_INTERRUPT_STALE_TTL_MS = 30 * 60_000
 const TEXT_BUFFER_TRIM_LEN = 20_000
 
 /**
@@ -1613,6 +1627,7 @@ export default define({
 		const checkIntervalMs = opts.checkIntervalMs ?? DEFAULT_CHECK_INTERVAL_MS
 		const gracePeriodMs = opts.gracePeriodMs ?? DEFAULT_GRACE_PERIOD_MS
 		const stuckToolAgeMs = opts.stuckToolAgeMs ?? DEFAULT_STUCK_TOOL_AGE_MS
+		const neverInterruptTools = (opts.neverInterruptTools ?? ["compress"]).map((n) => String(n).toLowerCase())
 		// `maxRecoveryRetries` is v1's name for the same knob. Prefer the v2 name,
 		// fall back to the v1 alias so an existing v1 config ports unchanged.
 		const maxRetries = opts.maxRetries ?? opts.maxRecoveryRetries ?? DEFAULT_MAX_RETRIES
@@ -1755,6 +1770,7 @@ export default define({
 			"subagentWaitMs",
 			"shareWatchState",
 			"registryScope",
+			"neverInterruptTools",
 			"subagentDeadMs",
 			"silentDeadStreamMinTokens",
 			"streamingFailureErrorNames",
@@ -1918,6 +1934,7 @@ export default define({
 					lastSubagentCheckAt: 0,
 					pendingTools: 0,
 					toolsInFlightAtIdle: 0,
+					inflightTools: new Map(),
 					rateLimitedAt: 0,
 					rateLimitAttempts: 0,
 					awaitingQuotaRetry: false,
@@ -4908,6 +4925,33 @@ export default define({
 					dbg(`${short(sid)} silent with ${busyShells} shell(s) still running — waiting`)
 					continue
 				}
+				// A tool call still running is working, not stalled — even with no
+				// events for longer than the chunk timeout. A 4-minute `write` or
+				// `compress` emits nothing while it runs, so event-silence accrues
+				// and the injection below would interrupt the live call ("Tool
+				// execution interrupted"). Young tools defer; tools older than the
+				// stuck age gate are wedged and the stall answers normally. Exempt
+				// names (default: compress) are never interrupted while fresh —
+				// interrupting a compress risks half-compacted state, the same
+				// reason compaction itself is never interrupted — with the same
+				// stale-TTL escape when one wedges for real.
+				{
+					const now = Date.now()
+					let youngTool = false
+					for (const [, rec] of w.inflightTools) {
+						const age = now - rec.at
+						if (neverInterruptTools.includes(rec.name)) {
+							if (age < NEVER_INTERRUPT_STALE_TTL_MS) {
+								dbg(`${short(sid)} silent with exempt tool "${rec.name}" still running (${Math.round(age / 1000)}s) — waiting`)
+								youngTool = true
+								break
+						}
+							continue
+					}
+					if (age < stuckToolAgeMs) youngTool = true
+				}
+					if (youngTool) continue
+				}
 				// If another session is actively running and this one went silent
 				// right after dispatching a task tool, treat it as a parent wait.
 				if (w.lastWasTaskTool) {
@@ -5695,6 +5739,11 @@ export default define({
 					const name = typeof ev.data?.tool === "string" ? ev.data.tool : (ev.data?.id as string | undefined) ?? "tool"
 					w.lastWasTaskTool = isTaskToolCall(ev)
 					w.pendingTools++
+					{
+						const callId =
+							typeof ev.data?.id === "string" && ev.data.id ? ev.data.id : `${name}#${Date.now()}`
+						w.inflightTools.set(callId, { name: String(name).toLowerCase(), at: Date.now() })
+					}
 					// Any real tool work between completions legitimises the next
 					// task_complete — reset the repeat-signal counter. task_complete
 					// itself is excluded; it manages the counter inside its execute.
@@ -5758,6 +5807,17 @@ export default define({
 					const w = ensureWatch(sid)
 					w.lastWasTaskTool = false
 					w.pendingTools = Math.max(0, w.pendingTools - 1)
+					{
+						const callId = typeof ev.data?.id === "string" ? ev.data.id : undefined
+						if (callId !== undefined) w.inflightTools.delete(callId)
+						else {
+							// No call id on the result: drop the oldest entry. Results
+							// normally arrive in order; a wrong drop only mistimes one
+							// deferral, and entries die with the watch regardless.
+							const oldest = w.inflightTools.keys().next().value
+							if (typeof oldest === "string") w.inflightTools.delete(oldest)
+						}
+					}
 					w.completedSinceProd++
 					w.succeededSinceProd++
 					touch(sid)
@@ -5769,6 +5829,17 @@ export default define({
 					const w = ensureWatch(sid)
 					w.lastWasTaskTool = false
 					w.pendingTools = Math.max(0, w.pendingTools - 1)
+					{
+						const callId = typeof ev.data?.id === "string" ? ev.data.id : undefined
+						if (callId !== undefined) w.inflightTools.delete(callId)
+						else {
+							// No call id on the result: drop the oldest entry. Results
+							// normally arrive in order; a wrong drop only mistimes one
+							// deferral, and entries die with the watch regardless.
+							const oldest = w.inflightTools.keys().next().value
+							if (typeof oldest === "string") w.inflightTools.delete(oldest)
+						}
+					}
 					w.completedSinceProd++
 					touch(sid)
 					return
