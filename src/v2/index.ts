@@ -1144,7 +1144,21 @@ function containsStopStatement(text: string): boolean {
 	//   "There is nothing pending on the first repo, so I moved to the second."
 	// A genuine stop may contain commas ("Nothing launched, nothing pending from
 	// me"), but never a comma followed by then/so/next/afterwards/and then.
-	if (/,\s*(then|so|next|now|afterwards?|and then)\b/i.test(lastLines)) return false
+	//
+	// SCOPE: the final CLAUSE, not the whole window (2026-10-11). Both examples
+	// above put the connective in the SAME clause as the stop, which is the only
+	// thing this guard is about. Scanning all three lines vetoed on connective
+	// prose from unrelated COMPLETED sentences: a turn ending in a bare
+	// "TASK COMPLETE" drew a stall injection 186s later because an earlier line
+	// read "...a config fix, SO it changes what I do next time." The stop
+	// pattern matched and the guard discarded it — a safety vetoing the very
+	// signal it exists to protect, on text it was never written about. Same
+	// clause discipline the pattern block above already enforces; the guard was
+	// the one place it was missing. Sentence-ending punctuation is stripped
+	// first so a terminal "." cannot yield an empty final clause.
+	const trimmedTail = lastLines.trim().replace(/[.!?…]+$/, "")
+	const finalClause = trimmedTail.split(/[.;:!?—–]/).pop() ?? trimmedTail
+	if (/,\s*(then|so|next|now|afterwards?|and then)\b/i.test(finalClause)) return false
 	return STOP_STATEMENT_PATTERNS.some((pat) => pat.test(lastLines))
 }
 

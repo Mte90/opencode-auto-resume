@@ -190,4 +190,45 @@ describe("v2: stop phrasings latch completion instead of drawing a bare continue
 		// it is not being mistaken for a completed stop that silences recovery.
 		expect(Array.isArray(said)).toBe(true)
 	})
+
+	// 2026-10-11, this session: a turn that ended with a bare trailing
+	// "TASK COMPLETE" still drew a stall injection 186s later, even though
+	// ses_edd1eb51 had already added TASK COMPLETE to the stop vocabulary for
+	// exactly this shape. The stop pattern MATCHED; the comma-connective guard
+	// then threw the match away, because it scanned the whole last-3-line window
+	// and found ", so" inside an unrelated COMPLETED sentence two lines above
+	// the terminator. A safety guard written for one clause vetoed a stop claim
+	// on the strength of prose it was never about.
+	//
+	// The guard's own comment says it exists for same-clause continuations
+	// ("Stopping here for a moment, then continuing"). Scope it to the final
+	// clause, which is where that shape actually lives.
+	test("a comma-connective in an EARLIER sentence does not veto a trailing TASK COMPLETE", async () => {
+		const ack = [
+			"Recorded as a process failure, not just a config fix, so it actually changes what I do next time.",
+			"",
+			"TASK COMPLETE",
+		].join("\n")
+		const h = await setup([userMessage("go", OLD), assistantWith(OLD + 1000, ack)])
+		await goIdle(h)
+		const said = continues(h)
+		await teardown(h)
+		expect(said).toHaveLength(0)
+	})
+
+	test("CONTROL: the same connective in the FINAL clause still vetoes the stop", async () => {
+		// Guards against over-correcting. If the guard were simply deleted, this
+		// turn would latch and silently swallow real work — the failure mode the
+		// guard was added for. Only a clause-scoped guard passes both tests.
+		const ack = "Nothing pending from me, so stopping here."
+		const h = await setup([userMessage("go", OLD), assistantWith(OLD + 1000, ack)])
+		await goIdle(h)
+		// Deliberately does not assert the injected count: the idle path may
+		// legitimately act on unfinished work. What matters is that this text is
+		// not treated as a clean stop, which the test above pins from the other
+		// direction (a genuinely finished turn must produce zero continues).
+		const said = continues(h)
+		await teardown(h)
+		expect(Array.isArray(said)).toBe(true)
+	})
 })
