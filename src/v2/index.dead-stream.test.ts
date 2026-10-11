@@ -326,4 +326,88 @@ describe("v2: silent dead stream", () => {
 		expect(injected.length).toBeGreaterThan(0)
 		expect(injected.length).toBeLessThanOrEqual(2)
 	})
+
+	test("an idle turn that delivered nothing gets one instant nudge", async () => {
+		// The hole this closes: no finish (not a dead stream), no parts (not
+		// stuck), no text (nothing for the pattern checks) — every detector
+		// passes over it in silence and the session sits until the next event,
+		// which may never come. One quiet continue, immediately, no 180s wait.
+		const { injected, logs } = await replay([])
+		expect(injected).toHaveLength(1)
+		expect(logs.some((l) => l.includes("instant nudge"))).toBe(true)
+	})
+
+	test("CONTROL: a turn that delivered text gets no instant nudge", async () => {
+		const { logs } = await replay([finished({ text: "The change is in src/index.ts and tests pass.", output: 400 })])
+		expect(logs.some((l) => l.includes("instant nudge"))).toBe(false)
+	})
+
+	test("CONTROL: a user-cancelled empty turn is never nudged", async () => {
+		// The user's stop is final, even when the turn delivered nothing.
+		const stream = makeEventStream()
+		const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-deadstream-${process.pid}-${counter++}.log`)
+		rmSync(logFile, { force: true })
+		const injected: unknown[] = []
+		const ctx: any = {
+			event: stream,
+			options: { ...OPTIONS, logFile, registryScope: LOG_SALT },
+			session: {
+				context: async () => [userTurn()],
+				active: async () => ({}),
+				interrupt: async () => ({}),
+				synthetic: async () => ({}),
+				prompt: async () => (injected.push(1), {}),
+			},
+			client: { session: { get: async () => ({ data: {} }) } },
+		}
+		const cleanup = await (plugin as any).setup(ctx)
+		for (const e of [
+			ev("session.execution.started"),
+			ev("session.execution.interrupted", { reason: "user" }),
+			ev("session.idle"),
+		]) {
+			stream.push(e)
+			await wait(10)
+		}
+		await wait(600)
+		;(cleanup as (() => void) | undefined)?.()
+		rmSync(logFile, { force: true })
+		expect(injected).toEqual([])
+	})
+
+	test("the instant nudge fires once per episode, not once per idle", async () => {
+		// Two idle transitions with no new turn between them: the second finds
+		// the flag set and stays quiet. A new turn (markBusy) re-arms it.
+		const stream = makeEventStream()
+		const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-deadstream-${process.pid}-${counter++}.log`)
+		rmSync(logFile, { force: true })
+		const injected: unknown[] = []
+		const ctx: any = {
+			event: stream,
+			options: { ...OPTIONS, logFile, registryScope: LOG_SALT },
+			session: {
+				context: async () => [userTurn()],
+				active: async () => ({}),
+				interrupt: async () => ({}),
+				synthetic: async () => ({}),
+				prompt: async () => (injected.push(1), {}),
+			},
+			client: { session: { get: async () => ({ data: {} }) } },
+		}
+		const cleanup = await (plugin as any).setup(ctx)
+		for (const e of [
+			ev("session.execution.started"),
+			ev("session.step.started"),
+			ev("session.step.ended"),
+			ev("session.idle"),
+			ev("session.idle"),
+		]) {
+			stream.push(e)
+			await wait(10)
+		}
+		await wait(700)
+		;(cleanup as (() => void) | undefined)?.()
+		rmSync(logFile, { force: true })
+		expect(injected).toHaveLength(1)
+	})
 })

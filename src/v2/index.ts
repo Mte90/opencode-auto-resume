@@ -253,6 +253,11 @@ interface SessionWatch {
 	/** Set when the model's own completion signal was seen (a trailing 🎉).
 	 * Latches so a finished session stops being nudged. */
 	completionSignaled: boolean
+	/** Set once the empty-idle instant nudge has fired for the current episode.
+	 * A turn that ends with nothing delivered gets exactly one quiet continue;
+	 * a new turn (markBusy) re-arms it. Without the flag every repeat idle
+	 * would nag a session that is legitimately quiet. */
+	emptyIdleNudged: boolean
 	/** The session's todo list, read from the todo tool's storage key. */
 	todos: Todo[]
 	todosFetchedAt: number
@@ -1901,6 +1906,7 @@ export default define({
 					todoNudgeAttempts: 0,
 					intentNudgeAttempts: 0,
 					completionSignaled: false,
+					emptyIdleNudged: false,
 					todos: [],
 					todosFetchedAt: 0,
 					taskCompleteSignals: 0,
@@ -1973,6 +1979,13 @@ export default define({
 				// same thing.
 				w.todoNudgeAttempts = 0
 				w.intentNudgeAttempts = 0
+				// NOTE: emptyIdleNudged is deliberately NOT reset here. The
+				// flag is single-shot per observable episode, and markBusy runs
+				// on our own recovery injections too: resetting it here would
+				// re-arm on the very inject it just sent, and an idle-empty
+				// session would cycle nudge-inject-idle-nudge forever. It
+				// re-arms only where a new episode is observable: a genuine
+				// user message, a genuine execution.started, or abort+resume.
 				// A new turn means the text a pending pattern pass was going to judge is
 				// superseded, and markBusy has just emptied the buffer it would have read.
 				if (w.toolTextTimer) {
@@ -2712,6 +2725,8 @@ export default define({
 			// caller is gaveUp-guarded), but the rule belongs here so a future
 			// caller cannot escalate into a latch that blocks follow-up.
 			w.gaveUp = false
+			// Same observable-episode rule for the empty-idle single-shot.
+			w.emptyIdleNudged = false
 			// Deliberately does not recordContinue(): our own escalation must not feed
 			// the loop guard that triggered it, or the guard trips on its own output.
 			// Through the same choke point as every other path. The runtime
@@ -3454,6 +3469,117 @@ export default define({
 		}
 
 		/**
+		 * One instant nudge for a turn the model never answered at all.
+		 *
+		 * The caller only reaches here when there is no text — but "no text"
+		 * is not "nothing happened". A short answer below the token floor, a
+		 * turn that did tool work, or a retry the server still lists are all
+		 * deliberate silences the suite pins as leave-alone, so this fires
+		 * only when no assistant message exists after the newest user message
+		 * at all. Everything else belongs to the detectors above (dead stream,
+		 * stuck tool, silent reasoning) or the stall ladder.
+		 *
+		 * Without this, such a turn is invisible to every detector and the
+		 * session sits until the next event — which may never come. One quiet
+		 * continue, fired immediately (no stall-window wait), single-shot per
+		 * episode.
+		 *
+		 * The user's stop stays final: userCancelled, gaveUp, and every other
+		 * lock is checked here AND inside recover(), so an interrupted job can
+		 * never be restarted by this. A turn awaiting the user's reply is a
+		 * hand-off, not a death, and a latched completion is never re-nudged.
+		 */
+		async function nudgeEmptyIdleTurn(sid: string, w: SessionWatch, messages: unknown[]): Promise<boolean> {
+			if (w.emptyIdleNudged) return false
+			if (w.userCancelled || w.gaveUp || w.permissionPending) return false
+			if (w.completionSignaled) return false
+			if (w.failureLoopLatched) {
+				dbg(`${short(sid)} failure loop latched — standing down until a genuine turn`)
+				return false
+			}
+			// The stall ladder already owns this episode: a recovery is in
+			// flight (w.recovering) or has already fired (resumeAttempts > 0).
+			// Firing here would stack a second, unlabeled continue on top of
+			// the ladder's — the twin-injection shape the dedupe machinery
+			// exists to prevent (ses_ee14d727: an idle lands between our send
+			// and the model's start, and that idle must not restart OR duplicate
+			// the ladder). The empty-idle nudge is only for episodes where
+			// NOTHING has fired yet.
+			if (w.recovering || w.resumeAttempts > 0) return false
+			if (hasAssistantReplySinceUser(messages)) return false
+			if (isWaitingOnUser(sid, w, messages)) {
+				dbg(`${short(sid)} empty idle turn is waiting on the user — not nudging`)
+				return false
+			}
+			{
+				const kind = lockKind(w)
+				if (kind) {
+					dbg(`${short(sid)} ${kind} locked — refusing empty-idle nudge (reason: ${lockReason(w)})`)
+					return false
+				}
+			}
+			if (w.compacting) {
+				dbg(`${short(sid)} mid-compaction — refusing empty-idle nudge`)
+				return false
+			}
+			if (selfAbortActive(w)) {
+				dbg(`${short(sid)} self-abort in flight — refusing empty-idle nudge`)
+				return false
+			}
+			// Same loop guard as recover(): our continue counts toward the
+			// shared window, and past the max the answer is escalation, not
+			// another prompt.
+			if (continuesInWindow(w) >= loopMaxContinues) {
+				log("warn", `${short(sid)} hallucination loop (${loopMaxContinues} continues/${loopWindowMs / 1000}s) — abort+resume`)
+				await tryAbortAndResume(sid, w)
+				w.continueTimestamps = []
+				return true
+			}
+			w.emptyIdleNudged = true
+			recordContinue(sid)
+			// Send DIRECTLY, not through recover(): recover() schedules on a
+			// backoff timer (the opposite of instant) and arms selfRecovery
+			// for a turn that may never start — a stale claim that would
+			// steal genuineness from the next real turn (a fresh turn must
+			// reset the quota ladder — pinned by the rate-limit suite).
+			// notifyAndPrompt is awaited here, so no timer gap can re-arm
+			// behind us; and a prompt this sends IS a fresh episode, which is
+			// exactly what the flag being clear means.
+			log("info", `${short(sid)} idle with no reply, no question, no completion claim — instant nudge (single-shot this episode)`)
+			// notifyAndPrompt arms selfRecovery for the turn this prompt starts.
+			// That turn IS a fresh episode by definition — nothing was happening
+			// — so genuine classification is correct for it. But if no turn
+			// follows, the claim would linger and steal genuineness from the next
+			// real turn (a fresh turn must reset the quota ladder — pinned by
+			// the rate-limit suite). Restore unless someone else armed
+			// concurrently, whose claim is not ours to clear.
+			const wasSelfRecovery = w.selfRecovery
+			const sent = await notifyAndPrompt(sid, opts.continuePrompt ?? CONTINUE_PROMPT, "empty-idle nudge")
+			if (!wasSelfRecovery) w.selfRecovery = false
+			return sent
+		}
+
+		/**
+		 * True when any assistant message exists after the newest user message.
+		 * Anything the model said or did — text, reasoning, tool calls — counts:
+		 * the instant nudge is only for a turn with literally no reply.
+		 */
+		function hasAssistantReplySinceUser(messages: unknown[]): boolean {
+			for (let i = messages.length - 1; i >= 0; i--) {
+				const m = messages[i] as { role?: unknown; type?: unknown } | null | undefined
+				if (!m || typeof m !== "object") continue
+				const role = msgRole(m)
+				// The newest user message bounds the current turn: anything at
+				// or before it belongs to an earlier episode.
+				if (role === "user") return false
+				if (role === "assistant") return true
+			}
+			// No user message and no assistant message: no turn exists at all,
+			// so there is nothing to restart.
+			return false
+		}
+
+		/**
 		 * True when the session is holding the ball: a tool call whose result is
 		 * still outstanding.
 		 *
@@ -3669,6 +3795,11 @@ export default define({
 			// And it re-opens a stood-down session: the stall gaveUp latch
 			// clears on genuine user takeovers, never on transitions.
 			w.gaveUp = false
+			// Same for the empty-idle single-shot: a genuine user message is
+			// a new episode, so the instant nudge re-arms here — and only at
+			// the observable-episode sites, never in markBusy (which also runs
+			// on our own recovery injections and would re-arm on its own send).
+			w.emptyIdleNudged = false
 			// Deliberately NOT clearing checkedToolPartIDs: already-reported
 			// errors must never be recounted. Clearing it made every genuine
 			// user message re-suggest the same stale errors (2026-10-04: one
@@ -4109,7 +4240,16 @@ export default define({
 			// history when it is empty (e.g. the plugin loaded mid-turn) or stale.
 			let text = w.lastAssistantText
 			if (!text) text = lastAssistantTextFrom(messages)
-			if (!text) return
+			if (!text) {
+				// Nothing delivered and nothing to judge: no finish to call
+				// dead, no parts to call stuck, no text for the pattern checks
+				// below. Without this branch such a turn is invisible to every
+				// detector and the session sits until the next event — which
+				// may never come. One quiet continue, single-shot per episode;
+				// the user's stop stays final (see guards inside).
+				await nudgeEmptyIdleTurn(sid, w, messages)
+				return
+			}
 
 			// A turn that ends by handing control back to the user (a question or an
 			// explicit prompt) is awaiting their reply; a synthetic nudge here starts
@@ -5309,6 +5449,9 @@ export default define({
 						// gaveUp latch clears here (and on genuine user messages
 						// and abort+resume), never on lifecycle transitions.
 						w.gaveUp = false
+						// Same for the empty-idle single-shot: a genuine turn is
+						// a new episode, so the instant nudge re-arms here.
+						w.emptyIdleNudged = false
 						// Drop the durable arm with the in-memory one. This delete is
 						// what lets restore skip the history read: no record means the
 						// user has spoken since the arm, so there is nothing to serve.
