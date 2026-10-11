@@ -1937,7 +1937,13 @@ export default define({
 				}
 				// A new turn re-opens the question of whether the work is finished.
 				w.completionSignaled = false
-				w.gaveUp = false
+				// NOTE 3: gaveUp is deliberately NOT cleared here either. It is
+				// an episode latch, not per-turn bookkeeping: a stood-down
+				// session the watchdog re-adopts from server truth (or
+				// discovery seeds) must stay stood down, or the stand-down
+				// guarantee cycles. It clears only on observable new episodes:
+				// a genuine user message (noteInboundUserMessage), a genuine
+				// execution.started, or the abort+resume escalation.
 				// A new turn means the parent moved on, so whatever the previous orphan
 				// watch was about is no longer the question. Left armed, it would fire
 				// mid-turn and abort a session that is doing exactly what it should.
@@ -2657,6 +2663,11 @@ export default define({
 			if (!running) return false
 			w.aborting = false
 			w.resumeAttempts = 0
+			// The escalation is an observable new episode, so it also re-opens
+			// a stood-down session. Unreachable with gaveUp set today (every
+			// caller is gaveUp-guarded), but the rule belongs here so a future
+			// caller cannot escalate into a latch that blocks follow-up.
+			w.gaveUp = false
 			// Deliberately does not recordContinue(): our own escalation must not feed
 			// the loop guard that triggered it, or the guard trips on its own output.
 			// Through the same choke point as every other path. The runtime
@@ -3592,6 +3603,9 @@ export default define({
 			// A genuine user message also closes any refire episode: the next
 			// stall starts back at the base fuse.
 			w.episodeRefires = 0
+			// And it re-opens a stood-down session: the stall gaveUp latch
+			// clears on genuine user takeovers, never on transitions.
+			w.gaveUp = false
 			// Deliberately NOT clearing checkedToolPartIDs: already-reported
 			// errors must never be recounted. Clearing it made every genuine
 			// user message re-suggest the same stale errors (2026-10-04: one
@@ -5228,6 +5242,10 @@ export default define({
 						w.rateLimitAttempts = 0
 						w.quotaNoticedAt = 0
 						w.awaitingQuotaRetry = false
+						// A genuine turn re-opens a stood-down session: the stall
+						// gaveUp latch clears here (and on genuine user messages
+						// and abort+resume), never on lifecycle transitions.
+						w.gaveUp = false
 						// Drop the durable arm with the in-memory one. This delete is
 						// what lets restore skip the history read: no record means the
 						// user has spoken since the arm, so there is nothing to serve.
