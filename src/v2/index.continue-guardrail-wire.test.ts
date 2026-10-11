@@ -123,7 +123,7 @@ describe("v2: the guardrail reaches the model, not just the source", () => {
 		await wait(10)
 		h.streamRef.push(ev("session.step.started"))
 		await wait(1600)
-		const said = h.injected.map((i) => i.text ?? "")
+		const said = h.injected.map((i: { text?: string }) => i.text ?? "")
 		await teardown(h)
 		expect(said.length).toBeGreaterThan(0)
 		expect(said[0]).toContain("continue")
