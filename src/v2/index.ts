@@ -3168,7 +3168,48 @@ export default define({
 						dbg(`${short(sid)} waiting on user input at inject time — not interrupting`)
 						return
 					}
-					const stallText = await buildStallContinueText(sid, reason, attempt)
+				// A stall with an old unfinished tool is a stuck tool wearing a busy
+				// label: the generic "continue" below cannot complete a call that
+				// never returns, but the stuck prompt ("proceed without it") routes
+				// around it. Observed 2026-10-11: a `write` hung 3+ min on a busy
+				// session, the stall fired correctly and injected — and the model
+				// could not act on it. The stuck pass itself never runs on busy
+				// sessions (idle inspection + watchdog idle branch only), so the
+				// stall is the only path that can reach this shape.
+				//
+				// This intentionally does NOT route through checkForStuckToolCalls
+				// / targetedRecovery: the stall path holds w.recovering while this
+				// timer runs, which targetedRecovery refuses — routing through it
+				// silently no-ops (verified: both stall tests failed that way).
+				// Instead the shared scan decides and the stall's own send below
+				// delivers, under the stall's budgets. Young tools never reach
+				// here (deferred upstream by hasYoungUnfinishedWork); no unfinished
+				// tools means the scan is empty and the generic text still sends;
+				// a spent stuck condition simply re-evaluates next tick like any
+				// other stall. Trailing-error retry stays idle-path-owned.
+				{
+					const stallMessages = await loadMessages(sid)
+					let stallLastUserAt = 0
+					for (const m of stallMessages) {
+						if (msgRole(m) === "user") stallLastUserAt = Math.max(stallLastUserAt, msgAt(m))
+					}
+					const { stuck: stallStuck } = scanToolParts(stallMessages, stallLastUserAt, Date.now() - stuckToolAgeMs)
+					if (stallStuck.length > 0) {
+						const stuckPrompt = buildStuckNudgePrompt(stallStuck)
+						log("warn", `${short(sid)} stall with tool call(s) "${stallStuck.slice(0, 3).join('", "')}" stuck unfinished — sending stuck prompt instead of generic continue`)
+						const ok = await injectOnce(sid, stuckPrompt, "stalled — stuck tool", false, true)
+						w.pendingRecoveryArmed = false
+						if (ok) {
+							w.lastRetryAt = Date.now()
+							touch(sid)
+							markBusy(sid)
+						} else if (attempt >= maxRetries) {
+							await tryAbortAndResume(sid, w)
+						}
+						return
+					}
+				}
+				const stallText = await buildStallContinueText(sid, reason, attempt)
 					const ok = await injectOnce(sid, stallText, "stalled — retrying", false, true)
 					w.pendingRecoveryArmed = false
 					if (ok) {
@@ -4022,21 +4063,18 @@ export default define({
 		 * than the stall window count: a call that just went out has not had a
 		 * chance to answer yet. Anything else (completed/error) is settled.
 		 */
-		async function checkForStuckToolCalls(sid: string, w: SessionWatch): Promise<boolean> {
-			if (w.userCancelled || w.completionSignaled) return false
-			{
-				const locked = lockKind(w)
-				if (locked) {
-					dbg(`${short(sid)} locked (${locked}) — skipping stuck-tool pass`)
-					return false
-				}
-			}
-			const messages = await loadMessages(sid)
-			let lastUserAt = 0
-			for (const m of messages) {
-				if (msgRole(m) === "user") lastUserAt = Math.max(lastUserAt, msgAt(m))
-			}
-			const cutoff = Date.now() - stuckToolAgeMs
+	/**
+	 * The message-history scan shared by the stuck-tool pass and the stall
+	 * timer. Extracted (not duplicated) so both judge the same shape: tool
+	 * parts newer than the last user message that never settled, split into
+	 * aged-out `stuck` names versus a trailing failure plus whether anything
+	 * is still in flight at all.
+	 */
+		function scanToolParts(
+			messages: unknown[],
+			lastUserAt: number,
+			cutoff: number,
+		): { stuck: string[]; trailing: { name: string; err: string; created: number } | null; anythingInFlight: boolean } {
 			const stuck: string[] = []
 			// A failed call is retried only when the turn ENDED on it: the error
 			// is the trailing part of the latest assistant content, with nothing
@@ -4097,6 +4135,33 @@ export default define({
 					if (!stuck.includes(name)) stuck.push(name)
 				}
 			}
+			return { stuck, trailing, anythingInFlight }
+		}
+
+		function buildStuckNudgePrompt(stuck: string[]): string {
+			const names = stuck.slice(0, 3).join('", "')
+			return (
+				`A "${names}" call never returned a result and the turn went idle waiting on it. ` +
+				`Proceed without it: continue the task from where you left off and do not retry the same call.`
+			)
+		}
+
+		async function checkForStuckToolCalls(sid: string, w: SessionWatch): Promise<boolean> {
+			if (w.userCancelled || w.completionSignaled) return false
+			{
+				const locked = lockKind(w)
+				if (locked) {
+					dbg(`${short(sid)} locked (${locked}) — skipping stuck-tool pass`)
+					return false
+				}
+			}
+			const messages = await loadMessages(sid)
+			let lastUserAt = 0
+			for (const m of messages) {
+				if (msgRole(m) === "user") lastUserAt = Math.max(lastUserAt, msgAt(m))
+			}
+			const cutoff = Date.now() - stuckToolAgeMs
+			const { stuck, trailing, anythingInFlight } = scanToolParts(messages, lastUserAt, cutoff)
 			// A call still in flight (any age) means the turn may yet resolve on
 			// its own — the stall and dead-stream paths own that case, not this one.
 			if (trailing && !anythingInFlight && trailing.created > lastUserAt) {
@@ -4110,10 +4175,8 @@ export default define({
 				}
 			}
 			if (stuck.length === 0) return false
+			const prompt = buildStuckNudgePrompt(stuck)
 			const names = stuck.slice(0, 3).join('", "')
-			const prompt =
-				`A "${names}" call never returned a result and the turn went idle waiting on it. `
-				+ `Proceed without it: continue the task from where you left off and do not retry the same call.`
 			log("warn", `${short(sid)} tool call(s) "${names}" stuck unfinished — nudging to proceed without it`)
 			return targetedRecovery(sid, "stuck-tool", prompt, "stuckToolAttempts").then(() => true)
 		}

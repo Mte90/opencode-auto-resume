@@ -381,3 +381,53 @@ describe("v2: the busy stall ladder latches completion claims", () => {
 		expect(h.injected.length).toBeGreaterThan(0)
 	})
 })
+
+/**
+ * A silence stall with a wedged tool must send the stuck prompt, not the
+ * generic continue.
+ *
+ * Production 2026-10-11 (…CqlDn5gF): a `write` hung 3+ min on a busy session.
+ * The stuck-tool pass never runs on busy sessions (idle inspection + watchdog
+ * idle branch only), so nothing nudged it. The stall ladder fired correctly
+ * at 187s and injected a generic continue — visible in the transcript at
+ * 21:53:39 — which the model could not act on: the turn was parked on the hung
+ * write, and "continue" cannot complete a call that never returns. Only the
+ * stuck prompt ("proceed without it") routes around it.
+ *
+ * So the stall timer delegates: when history shows an old unfinished tool, it
+ * runs checkForStuckToolCalls instead of sending generic text. Young tools
+ * still defer upstream (hasYoungUnfinishedWork); no unfinished tools still get
+ * the generic continue. Each case below pins one branch.
+ */
+describe("v2: a stalled turn parked on a wedged tool gets the stuck prompt", () => {
+	test("old unfinished write -> stuck prompt, not generic stall text", async () => {
+		const now = Date.now()
+		const h = await setup({
+			history: [userMessage(now - 600_000), assistantWithTool("write", "running", now - 120_000)],
+		})
+		h.streamRef.push(ev("session.execution.started"))
+		await wait(10)
+		h.streamRef.push(ev("session.step.started"))
+		await wait(1600)
+		await teardown(h)
+		expect(h.injected.length).toBeGreaterThan(0)
+		expect(h.injected[0]?.text ?? "").toMatch(/never returned a result/i)
+	})
+
+	test("CONTROL: no unfinished tool -> generic stall text", async () => {
+		// Without this, the test above could pass by the stall never firing at
+		// all and some other path injecting. This proves the generic path is
+		// intact when there is nothing stuck to delegate to.
+		const now = Date.now()
+		const h = await setup({
+			history: [userMessage(now - 600_000), assistantWith(now - 300_000, "still working")],
+		})
+		h.streamRef.push(ev("session.execution.started"))
+		await wait(10)
+		h.streamRef.push(ev("session.step.started"))
+		await wait(1600)
+		await teardown(h)
+		expect(h.injected.length).toBeGreaterThan(0)
+		expect(h.injected[0]?.text ?? "").toMatch(/stalled \(attempt/)
+	})
+})
