@@ -3182,48 +3182,7 @@ export default define({
 						dbg(`${short(sid)} waiting on user input at inject time — not interrupting`)
 						return
 					}
-				// A stall with an old unfinished tool is a stuck tool wearing a busy
-				// label: the generic "continue" below cannot complete a call that
-				// never returns, but the stuck prompt ("proceed without it") routes
-				// around it. Observed 2026-10-11: a `write` hung 3+ min on a busy
-				// session, the stall fired correctly and injected — and the model
-				// could not act on it. The stuck pass itself never runs on busy
-				// sessions (idle inspection + watchdog idle branch only), so the
-				// stall is the only path that can reach this shape.
-				//
-				// This intentionally does NOT route through checkForStuckToolCalls
-				// / targetedRecovery: the stall path holds w.recovering while this
-				// timer runs, which targetedRecovery refuses — routing through it
-				// silently no-ops (verified: both stall tests failed that way).
-				// Instead the shared scan decides and the stall's own send below
-				// delivers, under the stall's budgets. Young tools never reach
-				// here (deferred upstream by hasYoungUnfinishedWork); no unfinished
-				// tools means the scan is empty and the generic text still sends;
-				// a spent stuck condition simply re-evaluates next tick like any
-				// other stall. Trailing-error retry stays idle-path-owned.
-				{
-					const stallMessages = await loadMessages(sid)
-					let stallLastUserAt = 0
-					for (const m of stallMessages) {
-						if (msgRole(m) === "user") stallLastUserAt = Math.max(stallLastUserAt, msgAt(m))
-					}
-					const { stuck: stallStuck } = scanToolParts(stallMessages, stallLastUserAt, Date.now() - stuckToolAgeMs)
-					if (stallStuck.length > 0) {
-						const stuckPrompt = buildStuckNudgePrompt(stallStuck)
-						log("warn", `${short(sid)} stall with tool call(s) "${stallStuck.slice(0, 3).join('", "')}" stuck unfinished — sending stuck prompt instead of generic continue`)
-						const ok = await injectOnce(sid, stuckPrompt, "stalled — stuck tool", false, true)
-						w.pendingRecoveryArmed = false
-						if (ok) {
-							w.lastRetryAt = Date.now()
-							touch(sid)
-							markBusy(sid)
-						} else if (attempt >= maxRetries) {
-							await tryAbortAndResume(sid, w)
-						}
-						return
-					}
-				}
-				const stallText = await buildStallContinueText(sid, reason, attempt)
+const stallText = await buildStallContinueText(sid, reason, attempt)
 					const ok = await injectOnce(sid, stallText, "stalled — retrying", false, true)
 					w.pendingRecoveryArmed = false
 					if (ok) {
