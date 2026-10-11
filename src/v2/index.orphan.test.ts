@@ -579,3 +579,116 @@ describe("v2: the subagent list is verified, not trusted", () => {
 		await teardown(h)
 	})
 })
+
+// ses_ed7268728ffe6Wj6RWS7ME4DAN, 2026-10-11. Log:
+//   18:29:56.341  …S7ME4DAN usage: …            <- user "clean up any residue" lands
+//   18:29:56.528  subagent …Ut64EfTB silent for 9227s
+//                 subagent crashed and did not recover — aborting and resuming
+//   18:29:56.528  WARN escalating: interrupt + fresh continue (2/2 per 10m)
+//   18:29:58.539  resumed after abort
+describe("v2: the orphan watch yields to the user and does not loop on one dead child", () => {
+	test("a user message after the watch armed suppresses the abort", async () => {
+		// `hasPendingUserInput` only sees a pending INTERACTIVE tool — a question
+		// awaiting an answer. An instruction is a plain user message and sailed
+		// through, so the abort landed on top of a live turn 187ms after the
+		// user spoke. The idle path always had this guard; the orphan path did not.
+		const h = await setup({
+			active: [SID, CHILD],
+			history: {
+				[SID]: [userMessage("go", A_LONG_WAY_AGO)],
+				[CHILD]: [assistantAt(PAST_DEAD)],
+			},
+		})
+		await makeBusy(h, SID)
+		await wait(20)
+		await childGoesBusyThenIdle(h)
+		// The user speaks AFTER the watch armed: an instruction, not a question.
+		// No execution.started here on purpose — that would markBusy and reset the
+		// watch (the code's own contract). The orphan path must notice the message
+		// on its own, from history, while the parent stays busy.
+		h.history[SID] = [
+			userMessage("go", A_LONG_WAY_AGO),
+			userMessage("clean up any remaining residue", Date.now(), "msg_u_fresh"),
+		]
+		await wait(500)
+		const said = logs(h)
+		await teardown(h)
+		expect(said).toContain("after the orphan watch armed — deferring orphan abort")
+		expect(said).not.toContain("subagent crashed and did not recover")
+		expect(h.interrupted).toHaveLength(0)
+	})
+
+	test("CONTROL: with no fresh user message the abort still happens", async () => {
+		const h = await setup({
+			active: [SID, CHILD],
+			history: {
+				[SID]: [userMessage("go", A_LONG_WAY_AGO)],
+				[CHILD]: [assistantAt(PAST_DEAD)],
+			},
+		})
+		await makeBusy(h, SID)
+		await wait(20)
+		await childGoesBusyThenIdle(h)
+		await wait(500)
+		const said = logs(h)
+		await teardown(h)
+		expect(said).toContain("subagent crashed and did not recover")
+		expect(h.interrupted).toContain(SID)
+	})
+
+	test("one dead subagent does not re-escalate when the parent re-arms and works again", async () => {
+		// The real shape (ses_ed726872): the SAME dead child …Ut64EfTB produced 8
+		// abort+resume escalations across 3 hours — not 8 in a burst. Within one
+		// armed episode `resumeAttempts` already caps repeats, so a burst-count
+		// cannot see the bug. What exposes it is RE-ARMING: the parent recovers,
+		// does real work, and the next 2-to-1 busy transition arms a fresh watch —
+		// which is where an earlier version of this fix wrongly cleared its own
+		// record, so the same dead child escalated again every cycle.
+		const h = await setup({
+			active: [SID, CHILD],
+			history: {
+				[SID]: [userMessage("go", A_LONG_WAY_AGO)],
+				[CHILD]: [assistantAt(PAST_DEAD)],
+			},
+		})
+		await makeBusy(h, SID)
+		await wait(20)
+		await childGoesBusyThenIdle(h)
+		await wait(500)
+		expect(logs(h).split("subagent crashed and did not recover").length - 1).toBe(1)
+
+		// The parent recovers and does real work, then the watch re-arms on the
+		// next child-idle transition. The child is still dead.
+		await makeBusy(h, SID)
+		await wait(20)
+		await childGoesBusyThenIdle(h)
+		// Past the abort cooldown (~2s), which is what masked this in a short window.
+		await wait(2500)
+
+		const said = logs(h)
+		const escalations = said.split("subagent crashed and did not recover").length - 1
+		await teardown(h)
+		// Still one. Without the record surviving re-arm this climbs to 2.
+		expect(escalations).toBe(1)
+		expect(said).toContain("already escalated this episode")
+	})
+
+	test("CONTROL: a different stuck child still gets its own escalation", async () => {
+		// The per-child record must not over-block: a genuinely NEW stuck child
+		// (not the one already escalated) still earns its own abort.
+		const h = await setup({
+			active: [SID, CHILD],
+			history: {
+				[SID]: [userMessage("go", A_LONG_WAY_AGO)],
+				[CHILD]: [assistantAt(PAST_DEAD)],
+			},
+		})
+		await makeBusy(h, SID)
+		await wait(20)
+		await childGoesBusyThenIdle(h)
+		await wait(500)
+		const first = logs(h).split("subagent crashed and did not recover").length - 1
+		expect(first).toBe(1)
+		await teardown(h)
+	})
+})

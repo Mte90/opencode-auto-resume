@@ -272,6 +272,12 @@ interface SessionWatch {
 	 * session went idle. A parent still busy after that is the case this exists for.
 	 * null means not armed. */
 	orphanWatchStartAt: number | null
+	/** When the current orphan episode was ARMED, kept distinct from
+	 * orphanWatchStartAt (which the clock advances on every deferral). The user
+	 * guard compares against this so a deferral cannot "age out" the very
+	 * message it was deferring for: ses_ed726872 escalated 187ms after the
+	 * user spoke because nothing here compared arm-time to user-message-time. */
+	orphanWatchArmedAt: number | null
 	/** Last time the subagents of this session were polled, so the watchdog does not
 	 * ask the server on every tick. */
 	lastSubagentCheckAt: number
@@ -279,6 +285,14 @@ interface SessionWatch {
 	 * budget the same prompt goes out on every watchdog tick — v1's structure
 	 * assumed the subagent goes busy again, and a dead one never does. */
 	orphanRecoveryTried: boolean
+	/** The child this orphan episode already escalated for. ses_ed726872
+	 * (2026-10-11): a subagent that ended 2.5h earlier kept returning a
+	 * "crashed" verdict, so the parent was aborted + re-continued 8 times across
+	 * 3 hours — `orphanRecoveryTried` only bounds the WAKE attempt, and once
+	 * that fails every later crashed verdict escalates again. Recording the
+	 * child means one dead subagent can cost the parent exactly one abort;
+	 * a genuinely NEW stuck child still gets its own. */
+	orphanEscalatedChildSid?: string
 	/** The pending deferred pattern pass, if any. Held so a new idle can replace
 	 * it rather than stack a second judgement on the same turn, and so a new turn
 	 * can cancel it. */
@@ -1965,6 +1979,7 @@ export default define({
 					taskCompleteSignals: 0,
 					taskCompleteOverrides: 0,
 					orphanWatchStartAt: null,
+					orphanWatchArmedAt: null,
 					orphanRecoveryTried: false,
 					toolTextTimer: null,
 					recoverTimer: null,
@@ -2063,6 +2078,15 @@ export default define({
 				// watch was about is no longer the question. Left armed, it would fire
 				// mid-turn and abort a session that is doing exactly what it should.
 				w.orphanWatchStartAt = null
+				w.orphanWatchArmedAt = null
+				// orphanEscalatedChildSid deliberately SURVIVES here. It records that
+				// a specific dead child has already cost this parent one abort, not a
+				// retry budget — and a parent that recovers and does real work between
+				// aborts is exactly the loop that produced 8 escalations in 3 hours
+				// (ses_ed726872). Clearing it on every genuine turn reinstates the bug
+				// the moment the parent does anything useful. It is cleared when the
+				// watch is disarmed as void (an idle session's own watch) and when the
+				// session is torn down.
 				w.recentToolCalls = []
 				w.textParts.clear()
 				w.lastAssistantText = ""
@@ -2086,6 +2110,11 @@ export default define({
 				// This session is not the parent the watch is about: the watch is armed on
 				// the session that *stays* busy, so an idle session's own watch is void.
 				w.orphanWatchStartAt = null
+				w.orphanWatchArmedAt = null
+				// orphanEscalatedChildSid survives, same reason as in markBusy: a
+				// parent that idles between aborts and then works again is the exact
+				// shape that cycled 8 times. An idle transition voids the ARMED
+				// watch, not the record of what a dead child already cost.
 			}
 			// NOTE: this used to clear `permissionPending`. The `session.idle` handler
 			// calls markIdle() and then inspectOnIdle(), so the flag was always false by
@@ -4729,7 +4758,15 @@ export default define({
 					return
 				}
 				w.orphanWatchStartAt = Date.now()
+				w.orphanWatchArmedAt = w.orphanWatchStartAt
 				w.orphanRecoveryTried = false
+				// orphanEscalatedChildSid is deliberately NOT cleared here. It records
+				// that a specific dead child has already cost this parent one abort.
+				// Arming happens on EVERY 2-to-1 busy transition, and re-arming is
+				// exactly what produced the 8 escalations in 3 hours (ses_ed726872);
+				// clearing here wiped the record before the next verdict could read
+				// it, so the guard never fired. Cleared only on teardown, on gaveUp,
+				// or superseded by a genuinely different child in runOrphanWatch.
 				log(
 					"info",
 					`subagents of ${short(sid)} fell quiet while it stayed busy. orphan watch (${subagentWaitMs / 1000}s, ${children.length} subagent(s))`,
@@ -4745,6 +4782,10 @@ export default define({
 				if (!w.gaveUp) {
 					w.gaveUp = true
 					w.orphanWatchStartAt = null
+					w.orphanWatchArmedAt = null
+					// gaveUp is a legitimate reset: the watch stood down for good, so a
+					// future episode (even with the same dead child) starts clean.
+					w.orphanEscalatedChildSid = undefined
 					log("warn", `${short(sid)} orphan watch gave up after ${w.resumeAttempts} attempts`)
 				}
 				return
@@ -4762,9 +4803,73 @@ export default define({
 				w.orphanWatchStartAt = now
 				return
 			}
+			// Never abort a parent the user just spoke to. `hasPendingUserInput`
+			// above only sees a pending INTERACTIVE tool — a question awaiting an
+			// answer. An instruction ("clean up any remaining residue") is a plain
+			// user message, so it sailed straight through and the abort landed on
+			// top of it: ses_ed726872, 187ms after the user's message, escalated
+			// `interrupt + fresh continue` onto a live turn. The idle path has
+			// always had this guard (shouldStandDownForUser); the orphan path did
+			// not.
+			//
+			// The newest user message is read from HISTORY, not from
+			// w.lastGenuineUserAt: that field only advances on the execution/step
+			// event handlers (the watchdog skips noteInboundUserMessage for a busy,
+			// non-cancelled parent), so on a timer tick it can still hold a
+			// pre-message value — which is precisely the race this closes. Reading
+			// history is the same source hasPendingUserInput just used, so it
+			// cannot lag behind it.
+			//
+			// Compared against orphanWatchArmedAt, NOT orphanWatchStartAt: the
+			// latter is advanced on every deferral above, so a deferral would age
+			// out the very message it was deferring for and the next tick would
+			// fire anyway.
+			if (w.orphanWatchArmedAt !== null) {
+				const msgs = await loadMessages(sid)
+				let newestUserAt = 0
+				for (const m of msgs as Array<{ type?: string; role?: string; time?: { created?: number }; info?: { time?: { created?: number } } }>) {
+					if (msgRole(m) !== "user") continue
+					const at = msgAt(m)
+					if (typeof at === "number" && at > newestUserAt) newestUserAt = at
+				}
+				if (newestUserAt > w.orphanWatchArmedAt) {
+					dbg(
+						`${short(sid)} user spoke ${Math.round((now - newestUserAt) / 1000)}s ago, after the orphan watch armed — deferring orphan abort`,
+					)
+					return
+				}
+			}
 
 			const verdict = await subagentVerdict(sid, activeIDs)
 			if (verdict.status === "crashed") {
+				// One dead subagent may cost the parent exactly ONE abort.
+				// ses_ed726872: `…Ut64EfTB` ended 2.5h before, kept returning a
+				// crashed verdict, and the parent was aborted + re-continued 8
+				// times across 3 hours. `orphanRecoveryTried` bounds only the WAKE
+				// attempt; once that fails, every later crashed verdict escalated
+				// again. Recording the child closes that loop. A genuinely
+				// different stuck child still gets its own escalation, and a new
+				// orphan episode (new arm) clears the record.
+				if (verdict.stuckSid && w.orphanEscalatedChildSid === verdict.stuckSid) {
+					// Already counted against the budget when it was escalated; spend it
+					// again so the episode still TERMINATES via the gaveUp latch instead
+					// of being held here forever. The no-cycling guarantee (the one the
+					// subagent-patience suite pins) is preserved; only the abort is
+					// skipped.
+					w.resumeAttempts++
+					if (w.resumeAttempts >= maxRetries) {
+						if (!w.gaveUp) {
+							w.gaveUp = true
+							log("warn", `${short(sid)} orphan watch gave up after ${w.resumeAttempts} attempts`)
+						}
+					} else {
+						w.orphanWatchStartAt = now
+					}
+					dbg(
+						`${short(sid)} subagent ${short(verdict.stuckSid)} already escalated this episode — not re-aborting the parent`,
+					)
+					return
+				}
 				// Waking the child is cheaper than killing the parent, so it is tried
 				// first — but exactly once. If the child does not come back, the parent
 				// is the only thing left to save and the watch stops asking.
@@ -4776,6 +4881,7 @@ export default define({
 					}
 				}
 				log("info", `${short(sid)} subagent crashed and did not recover — aborting and resuming the parent`)
+				if (verdict.stuckSid) w.orphanEscalatedChildSid = verdict.stuckSid
 				// Count orphan aborts toward the gaveUp budget (checked at this
 				// function's top): without this the watch cycles forever, because
 				// nothing else increments resumeAttempts on this path.
