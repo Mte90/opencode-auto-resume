@@ -879,7 +879,49 @@ const TOOL_STATE_COMPLETED = "completed"
  */
 const AWAITING_USER_TOOLS = new Set(["question", "permission", "ask", "confirm"])
 
+/** The literal bare continue. Kept for `richContinuePrompt: false` (an explicit
+ * opt-out) and for v1 parity. Not the default — see SAFE_CONTINUE_PROMPT. */
 const CONTINUE_PROMPT = "continue"
+
+/**
+ * The default for every synthetic continue that has no richer prompt of its own.
+ *
+ * A bare "continue" is an unbounded instruction: it tells the model to keep
+ * going without saying what "going" means. Every liveness signal in this plugin
+ * is fallible — on 2026-10-11 a subagent that had been dead for 2.5 hours was
+ * still tracked, and the orphan watch aborted and re-continued the parent 8 times
+ * across 3 hours, twice on top of a live user message. When the signal is wrong
+ * the message is the last line of defence, and "continue" alone has none: a
+ * model that decides the next step on its own has nothing telling it to stop at
+ * the edge of the work it was given.
+ *
+ * So the guardrails ride along with the instruction, in the same words the stall
+ * path already uses (recover()'s rich prompt), which keeps every continue this
+ * plugin emits consistent:
+ *
+ *   Only continue work already in progress. Do not start anything new, and do
+ *   not take destructive or irreversible actions without explicit user approval.
+ *
+ * This bounds the blast radius of a false positive without changing WHEN the
+ * plugin intervenes — the detection logic is untouched. A configured
+ * `continuePrompt` still wins verbatim: an operator who sets it has said what
+ * they want.
+ */
+const SAFE_CONTINUE_PROMPT =
+	"continue\nOnly continue work already in progress. Do not start anything new, " +
+	"and do not take destructive or irreversible actions without explicit user approval."
+
+/**
+ * The empty-idle nudge has nothing in progress to continue — that is precisely
+ * what fired it — so the same sentence would be incoherent ("continue work
+ * already in progress" with no such work). Same guardrail, phrased for the case:
+ * if work WAS in flight, carry it; otherwise go back to the user rather than
+ * inventing a task.
+ */
+const SAFE_EMPTY_IDLE_PROMPT =
+	"continue\nIf work was already in progress, continue it and finish nothing else. " +
+	"Otherwise ask the user what to do next rather than starting something new. " +
+	"Do not take destructive or irreversible actions without explicit user approval."
 
 /**
  * The `task_complete` acknowledgement texts.
@@ -2821,7 +2863,7 @@ export default define({
 			// escalation that lands on top of a concurrent recovery injection is
 			// exactly the case that produced the simultaneous bursts of synthetic
 			// continues (and the "Step interrupted" they caused).
-			const ok = await injectOnce(sid, opts.continuePrompt ?? CONTINUE_PROMPT, "abort+resume escalation", true)
+			const ok = await injectOnce(sid, opts.continuePrompt ?? SAFE_CONTINUE_PROMPT, "abort+resume escalation", true)
 			if (ok) {
 				w.lastRetryAt = Date.now()
 				log("info", `${short(sid)} resumed after abort`)
@@ -3641,7 +3683,7 @@ export default define({
 			// the rate-limit suite). Restore unless someone else armed
 			// concurrently, whose claim is not ours to clear.
 			const wasSelfRecovery = w.selfRecovery
-			const sent = await notifyAndPrompt(sid, opts.continuePrompt ?? CONTINUE_PROMPT, "empty-idle nudge")
+			const sent = await notifyAndPrompt(sid, opts.continuePrompt ?? SAFE_EMPTY_IDLE_PROMPT, "empty-idle nudge")
 			if (!wasSelfRecovery) w.selfRecovery = false
 			return sent
 		}
@@ -4426,11 +4468,11 @@ export default define({
 				return
 			}
 			if (containsReadyToContinuePattern(text, readyToContinuePatterns)) {
-				await targetedRecovery(sid, "ready-to-continue", opts.continuePrompt ?? CONTINUE_PROMPT, "intentNudgeAttempts")
+				await targetedRecovery(sid, "ready-to-continue", opts.continuePrompt ?? SAFE_CONTINUE_PROMPT, "intentNudgeAttempts")
 				return
 			}
 			if (resumeOnActionIntent && containsActionIntent(text)) {
-				await targetedRecovery(sid, "action-intent", opts.actionIntentPrompt ?? opts.continuePrompt ?? CONTINUE_PROMPT, "intentNudgeAttempts")
+				await targetedRecovery(sid, "action-intent", opts.actionIntentPrompt ?? opts.continuePrompt ?? SAFE_CONTINUE_PROMPT, "intentNudgeAttempts")
 				return
 			}
 			// An explicit stop latches like a celebration and wins over the
