@@ -3397,7 +3397,11 @@ export default define({
 		 * `recover()`'s inject-time check reads an idle session as "recovered by
 		 * itself" and drops the injection.
 		 *
-		 * Returns true when it took action, so the caller stops looking.
+		 * Returns true when it took action — or when the evidence positively says
+		 * hands off (tools still in flight, own flag back to busy) — so the
+		 * caller stops looking. Returns false when it declined on weak evidence
+		 * (server still lists an idle session): the session is NOT buried, the
+		 * remaining idle checks still run, and the next inspection re-evaluates.
 		 */
 		async function recoverSilentDeadStream(sid: string, messages: unknown[]): Promise<boolean> {
 			const dead = lastSilentDeadStream(messages)
@@ -3421,9 +3425,24 @@ export default define({
 			// that is quietly retrying looks exactly like a dead stream from the
 			// event stream, and the event may not have arrived yet when the turn
 			// ends — which is v1's own reason for re-checking live status here.
-			if (w.status === "busy" || (await getActiveSessions()).includes(sid)) {
-				dbg(`${short(sid)} silent dead stream, but the session is running again — likely a provider retry`)
+			//
+			// Our own flag flipping back to busy means a fresh execution.started
+			// arrived after the idle: the session genuinely restarted, so hands
+			// off. That is positive evidence, and it counts as handled.
+			if (w.status === "busy") {
+				dbg(`${short(sid)} silent dead stream, but the session is busy again — genuine restart, leaving it alone`)
 				return true
+			}
+			// The server still listing the session is weak evidence by comparison:
+			// its active map is known-stale (an idled session can linger there),
+			// while our own flag says idle. Declining here must NOT report
+			// handled — return true buries the session, and no later pass will
+			// ever reconsider it (2026-10-11: a real dead stream stood down this
+			// way while the job sat idle). Return false so the remaining idle
+			// checks run now and the next inspection re-reads the server fresh.
+			if ((await getActiveSessions()).includes(sid)) {
+				dbg(`${short(sid)} silent dead stream, but the server still lists the session — possibly a provider retry; deferring, not burying`)
+				return false
 			}
 			w.pendingRecoveryArmed = true
 			log(

@@ -243,14 +243,37 @@ describe("v2: silent dead stream", () => {
 		expect(injected).toEqual([])
 	})
 
-	test("a session the server still reports as running is left alone", async () => {
+	test("a session the server still reports as running is left alone — this pass", async () => {
 		// A provider that is quietly retrying looks identical from the event
 		// stream. Injecting into that would turn a recovering session into a
 		// stalled one, which is the harm the guard prevents — and the event may
 		// not have arrived yet, so the guard asks the server.
+		//
+		// "This pass" is doing real work in that sentence. The server listing
+		// is weak evidence (its active map is known-stale), so declining must
+		// not bury the session: the next inspection re-reads the server fresh.
+		// The old code returned handled here, which ended the whole inspection
+		// and permanently buried real dead streams (2026-10-11).
 		const { injected, logs } = await replay(DEAD, {}, { serverRunning: true })
 		expect(injected).toEqual([])
-		expect(logs.some((l) => l.includes("running again"))).toBe(true)
+		expect(logs.some((l) => l.includes("deferring, not burying"))).toBe(true)
+	})
+
+	test("declining on a stale server listing does not bury the remaining checks", async () => {
+		// The fall-through this pins: a dead stream where the server still
+		// lists the session, PLUS an unfinished tool call. Old code returned
+		// handled at the dead-stream guard, so the stuck-tool check never ran
+		// and nothing was ever injected. New code declines (false), the
+		// stuck-tool check runs, and the session gets its nudge.
+		const stuckPart = {
+			type: "assistant",
+			id: "msg_stuck",
+			time: { created: Date.now() - 120_000 },
+			content: [{ type: "tool", id: "call_9", name: "compress", state: { status: "streaming" }, time: { created: Date.now() - 120_000 } }],
+		}
+		const { injected } = await replay([finished({ output: 400 }), stuckPart], {}, { serverRunning: true })
+		expect(injected).toHaveLength(1)
+		expect(String((injected[0] as any).text ?? "")).toContain("never returned a result")
 	})
 
 	test("CONTROL for that guard: the same dead stream on an idle session does resume", async () => {
