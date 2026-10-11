@@ -571,6 +571,10 @@ const SUBAGENT_RECOVERY_PROMPT =
 const DEFAULT_SILENT_DEAD_STREAM_MIN_TOKENS = 200
 const DEFAULT_CONTEXT_SATURATION_THRESHOLD = 0.85
 /** How long a fetched todo list is trusted before being re-read. */
+/** Cap on the remembered tool-part ids. Bounds a set that is otherwise fed one
+ * entry per tool part, on every idle, for the life of the session. */
+const CHECKED_TOOL_PART_IDS_MAX = 500
+
 const TODO_CACHE_TTL_MS = 3_000
 const DEFAULT_MAX_RECOVERY_RETRIES = 2
 // Referenced from FEATURE_GATED_OPTIONS docs; kept so the intended v1 default is
@@ -1386,6 +1390,30 @@ function short(sid: string): string {
 function sidOf(ev: V2Event): string | undefined {
 	const sid = ev.data?.sessionID
 	return typeof sid === "string" ? sid : undefined
+}
+
+/**
+ * Role of a history record, tolerant of every shape the transcript API uses.
+ *
+ * Audit 2026-10-10: production stores `{"role":"user","time":{"created":...}}`
+ * (verified in opencode.db), while the harness fed `{type:"user"}`. Six readers
+ * compared `.type` only and went blind in prod — the quota-restore guard failed
+ * OPEN, re-arming a ladder for a session the user had already continued, and the
+ * stuck-tool / silent-reasoning / subagent-crash detectors silently never fired.
+ * 938 tests passed because every fixture used `type`. Read the role HERE.
+ */
+function msgRole(m: unknown): string {
+	const mm = m as { role?: unknown; type?: unknown; info?: { role?: unknown } } | null | undefined
+	if (!mm || typeof mm !== "object") return ""
+	const v = mm.role ?? mm.type ?? mm.info?.role
+	return typeof v === "string" ? v : ""
+}
+
+/** Creation time of a history record; 0 when absent. Same tolerance as msgRole. */
+function msgAt(m: unknown): number {
+	const mm = m as { time?: { created?: unknown }; info?: { time?: { created?: unknown } } } | null | undefined
+	const t = mm?.time?.created ?? mm?.info?.time?.created
+	return typeof t === "number" ? t : 0
 }
 
 function isTaskToolCall(ev: V2Event): boolean {
@@ -3169,11 +3197,10 @@ export default define({
 					info?: { content?: string }
 					content?: Array<{ type?: string; text?: string }>
 				}
-				// Prod history carries role, the harness carries type — read both.
-				// ses_edbb4e67 (2026-10-10): type-only read returned "" in prod,
-				// so a "TASK COMPLETE" delivery never latched and the stall fired.
-				const msgRole = msg?.type ?? msg?.role
-				if (!msg || msgRole !== "assistant") continue
+				// Prod history carries role, the harness carries type — msgRole reads both.
+// ses_edbb4e67 (2026-10-10): type-only read returned "" in prod,
+// so a "TASK COMPLETE" delivery never latched and the stall fired.
+				if (!msg || msgRole(msg) !== "assistant") continue
 				// Prod shape carries flat text; harness shape carries parts.
 				// Mirror userTextsOf: check both, or history reads go blind.
 				// ses_ed93e258 (2026-10-10): parts-only read missed flat-text
@@ -3215,8 +3242,7 @@ export default define({
 					content?: Array<{ type?: string; text?: string }>
 				}
 				// Same prod/harness split as lastAssistantTextFrom: role vs type.
-				const msgRole = msg?.type ?? msg?.role
-				if (!msg || msgRole !== "assistant" || !Array.isArray(msg.content)) continue
+				if (!msg || msgRole(msg) !== "assistant" || !Array.isArray(msg.content)) continue
 				const reasoning = msg.content
 					.filter((part) => part?.type === "reasoning" && typeof part.text === "string")
 					.map((part) => part.text as string)
@@ -3250,12 +3276,12 @@ export default define({
 		function lastSilentDeadStream(messages: unknown[]): { finish: string; outputTokens: number } | null {
 			for (let i = messages.length - 1; i >= 0; i--) {
 				const msg = messages[i] as {
-					type?: string
+					role?: string
 					content?: Array<{ type?: string; text?: string }>
 					finish?: string
 					tokens?: { output?: number }
 				}
-				if (msg?.type !== "assistant") continue
+				if (msgRole(msg) !== "assistant") continue
 				const finish = typeof msg.finish === "string" ? msg.finish : undefined
 				if (!finish) continue
 				const parts = Array.isArray(msg.content) ? msg.content : []
@@ -3393,7 +3419,7 @@ export default define({
 				time?: { created?: number }
 				info?: { time?: { created?: number }; role?: string }
 			}
-			const isUser = m?.type === "user" || m?.role === "user" || m?.info?.role === "user"
+			const isUser = msgRole(m) === "user"
 			if (!isUser) continue
 			const ts = m.time?.created ?? m.info?.time?.created
 			return typeof ts === "number" ? ts : undefined
@@ -3453,7 +3479,7 @@ export default define({
 					info?: { time?: { created?: number }; role?: string }
 					content?: Array<{ type?: string; text?: string }>
 				}
-				const isUser = m?.type === "user" || m?.role === "user" || m?.info?.role === "user"
+				const isUser = msgRole(m) === "user"
 				if (!isUser) continue
 				const text = Array.isArray(m?.content)
 					? m.content.filter((p) => p?.type === "text" && typeof p.text === "string").map((p) => p.text as string).join("\n")
@@ -3607,8 +3633,8 @@ export default define({
 			}
 			const messages = await loadMessages(sid)
 			let lastUserAt = 0
-			for (const m of messages as Array<{ type?: string; time?: { created?: number } }>) {
-				if (m?.type === "user" && typeof m?.time?.created === "number") lastUserAt = Math.max(lastUserAt, m.time.created)
+			for (const m of messages) {
+				if (msgRole(m) === "user") lastUserAt = Math.max(lastUserAt, msgAt(m))
 			}
 			const cutoff = Date.now() - stuckToolAgeMs
 			const stuck: string[] = []
@@ -3622,7 +3648,7 @@ export default define({
 			let trailing: { name: string; err: string; created: number } | null = null
 			let anythingInFlight = false
 			for (const m of messages as Array<{ type?: string; time?: { created?: number }; content?: Array<{ type?: string; name?: string; state?: { status?: string; error?: unknown; output?: unknown }; time?: { created?: number } }> }>) {
-				if (!m || m.type !== "assistant" || !Array.isArray(m.content)) continue
+				if (!m || msgRole(m) !== "assistant" || !Array.isArray(m.content)) continue
 				for (const part of m.content) {
 					if (part?.type !== "tool") {
 						trailing = null
@@ -3720,14 +3746,14 @@ export default define({
 			}
 			const messages = await loadMessages(sid)
 			let lastUserAt = 0
-			for (const m of messages as Array<{ type?: string; time?: { created?: number } }>) {
-				if (m?.type === "user" && typeof m?.time?.created === "number") lastUserAt = Math.max(lastUserAt, m.time.created)
+			for (const m of messages) {
+				if (msgRole(m) === "user") lastUserAt = Math.max(lastUserAt, msgAt(m))
 			}
 			let newestPostUserAt = 0
 			let sawReasoning = false
 			for (const m of messages as Array<{ type?: string; time?: { created?: number }; content?: Array<{ type?: string; text?: string }> }>) {
-				if (!m || m.type !== "assistant" || !Array.isArray(m.content)) continue
-				const at = typeof m?.time?.created === "number" ? m.time.created : 0
+				if (!m || msgRole(m) !== "assistant" || !Array.isArray(m.content)) continue
+				const at = msgAt(m)
 				if (at <= lastUserAt) continue
 				if (at > newestPostUserAt) newestPostUserAt = at
 				for (const part of m.content) {
@@ -3784,6 +3810,16 @@ export default define({
 						const partId = typeof part.id === "string" ? part.id : ""
 						if (!partId || w.checkedToolPartIDs.has(partId)) continue
 						w.checkedToolPartIDs.add(partId)
+						// Bounded: the history is re-walked on every idle, so this set
+						// otherwise grows one entry per tool part for the life of the
+						// session — audit 2026-10-10, the only uncapped collector here
+						// (ownPromptTexts 10, textParts 2, recentToolCalls 120s).
+						// A FIFO trim is enough: parts old enough to fall out are old
+						// enough that re-reporting them would be wrong anyway.
+						if (w.checkedToolPartIDs.size > CHECKED_TOOL_PART_IDS_MAX) {
+							const oldest = w.checkedToolPartIDs.values().next().value
+							if (typeof oldest === "string") w.checkedToolPartIDs.delete(oldest)
+						}
 						const state = part.state as { status?: string } | undefined
 						if (state?.status !== "error") continue
 						const toolName = typeof part.name === "string" ? part.name : ""
@@ -4271,11 +4307,11 @@ export default define({
 							content?: Array<{ type?: string; state?: { status?: string } }>
 						}
 						| undefined
-					if (last?.type === "assistant" && last.error !== undefined) {
+					if (last && msgRole(last) === "assistant" && last.error !== undefined) {
 						dbg(`subagent ${short(child)} reported an error`)
 						return { status: "crashed" }
 					}
-					const msgTime = last?.time?.created
+					const msgTime = msgAt(last) || undefined
 					const silentFor = typeof msgTime === "number" ? now - msgTime : Infinity
 					// An unanswered tool part is the "still working, slowly" case.
 					const hasToolCall = (last?.content ?? []).some(
@@ -4688,11 +4724,25 @@ export default define({
 			cleanupIdleSessions()
 		}
 
-		const watchdog = setInterval(() => {
-			checkActiveSessions().catch((e) =>
-				log("error", `watchdog failed: ${e instanceof Error ? e.message : String(e)}`),
-			)
-		}, checkIntervalMs)
+		// Re-entrancy guard: `checkActiveSessions` awaits per-session history reads and
+	// subagent polls, so a sweep can outlast the interval and the next tick would
+	// start a second concurrent sweep over the same SessionWatch objects. Audit
+	// 2026-10-10. Skipping is the safe direction — the next tick picks up whatever
+	// this one skipped — whereas overlapping means two evaluators can both decide a
+	// stall is real and both recover it.
+	let watchdogBusy = false
+	const watchdog = setInterval(() => {
+		if (watchdogBusy) {
+			dbg("watchdog sweep still running — skipping this tick")
+			return
+		}
+		watchdogBusy = true
+		checkActiveSessions()
+			.catch((e) => log("error", `watchdog failed: ${e instanceof Error ? e.message : String(e)}`))
+			.finally(() => {
+				watchdogBusy = false
+			})
+	}, checkIntervalMs)
 
 		// Discovery sweep. Separate timer from the watchdog because the two have
 		// different jobs and different costs: the watchdog runs every few seconds
@@ -4759,10 +4809,10 @@ export default define({
 					if (Array.isArray(msgs)) {
 						for (let i = msgs.length - 1; i >= 0; i--) {
 							const m = msgs[i] as {
-								type?: string
+								role?: string
 								model?: { providerID?: string; id?: string; modelID?: string }
 							}
-							if (m?.type !== "assistant" || !m.model) continue
+							if (msgRole(m) !== "assistant" || !m.model) continue
 							const providerID = m.model.providerID
 							const modelID = m.model.modelID ?? m.model.id
 							if (typeof providerID === "string" && typeof modelID === "string") {
@@ -5039,13 +5089,17 @@ export default define({
 				if (Date.now() - mark.at >= horizon) continue
 				const messages = await loadMessages(sid)
 				let lastUserAt = 0
-				for (const m of messages as Array<{ type?: string; time?: { created?: number } }>) {
-					if (m?.type === "user" && typeof m?.time?.created === "number") lastUserAt = Math.max(lastUserAt, m.time.created)
+				for (const m of messages) {
+					if (msgRole(m) === "user") lastUserAt = Math.max(lastUserAt, msgAt(m))
 				}
 				if (lastUserAt > mark.at) continue
 				w.rateLimitedAt = mark.at
 				w.rateLimitAttempts = mark.rung
 				w.awaitingQuotaRetry = true
+				// The arm that wrote this marker also sent the user-visible notice,
+				// so carry that across the reload — otherwise the next hit in the
+				// restored episode re-announces a stand-down already announced.
+				w.quotaNoticedAt = mark.at
 				log("warn", `${short(sid)} quota ladder restored (armed ${Math.round((Date.now() - mark.at) / 1000)}s ago, rung ${mark.rung}) — retry due on schedule`)
 			}
 		}
