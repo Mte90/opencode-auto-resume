@@ -346,6 +346,13 @@ interface SessionWatch {
 	/** Last time the silent-reasoning sweep examined this session. Bounds the
 	 * history read to ~one per stall window per idle session. */
 	lastSilentReasoningCheck: number
+	/** Last time the watchdog's idle branch re-ran the stuck-tool pass. The
+	 * event-driven pass only sees a call that is ALREADY past the age gate when
+	 * `session.idle` fires; a call that was younger then ages into stuck with no
+	 * further idle event, so only the watchdog can still catch it. Throttled to
+	 * the stuck-tool age gate so a parked session costs ~one history read per
+	 * gate, not one per tick. Reset on a fresh turn, like lastSilentReasoningCheck. */
+	lastStuckToolCheck: number
 	/** Set while the session is mid native compaction — recovery must never interrupt it. */
 	compacting: boolean
 	/** Timestamp of the latest `session.compaction.started` (stale-guard for the flag). */
@@ -1032,9 +1039,30 @@ function containsDoneClaimPattern(text: string, patterns: RegExp[] = DONE_CLAIM_
  */
 const STOP_STATEMENT_PATTERNS: RegExp[] = [
 	/no action needed/i,
-	/stopping (here|there)[.!]*$/i,
-	/nothing (further |else )?(to do|left|remaining|needed)[.!]*$/i,
-	/no further action[.!]*$/i,
+	/\bstop(ping|ped)?\s+(here|there|now)\b[.!]*$/i,
+	// ses_ed726872 (2026-10-11): told to stop, answered "Stopping as instructed
+	// — no further runs ... Nothing launched, nothing pending from me", and the
+	// stall ladder fired two bare `continue`s anyway (latch never set). The
+	// branch listed only `to do|left|remaining|needed`, and a model saying
+	// "nothing pending from me" matched NONE of them. Same class as the stuck
+	// -tool gap — a narrow vocabulary deciding liveness — so the branch is
+	// widened to the shapes these messages actually take, rather than adding a
+	// pattern per wording.
+	//
+	// Clause discipline (this is the part that matters): a stop is only a stop
+	// if it is the LAST clause. The tail is split on any clause terminator —
+	// sentence punctuation, semicolon, or em/en dash — and each pattern must
+	// match the FINAL clause (allowing only short closing filler like "from me"
+	// / "for now"). Without that, "Stopping here for a moment, then continuing"
+	// or "No further action is needed for the sync; next I will run the audit"
+	// both read as completed stops and wrongly latch. Semicolon and dash are
+	// the terminators real stop-acks lean on.
+	/\bnothing\b[^.;:!?—–\n]*\b(further|else|pending|left|remaining|outstanding|launched|queued|scheduled|to do)\b[^.;:!?—–\n]*[.!]*$/i,
+	/\bno (further|additional|more) (action|work|steps?|runs?|anything)\b[^.;:!?—–\n]*[.!]*$/i,
+	/\bnone (pending|left|remaining|outstanding)\b[^.;:!?—–\n]*[.!]*$/i,
+	/\b(stopping|halt|halted|standing down|pausing|paused)\b[^.;:!?—–\n]*[.!]*$/i,
+	/\b(that'?s|thats|this is) (all|it|everything)\b[^.;:!?—–\n]*[.!]*$/i,
+	/\b(parked|not started|unstarted)\b[^.;:!?—–\n]*[.!]*$/i,
 	// ses_edd1eb51 (2026-10-09): the model ended two deliveries with a bare
 	// trailing "TASK COMPLETE" and the stall ladder fired 186s later — the
 	// system's own completion vocabulary written as text latched nothing.
@@ -1044,6 +1072,15 @@ const STOP_STATEMENT_PATTERNS: RegExp[] = [
 function containsStopStatement(text: string): boolean {
 	const lines = text.split("\n")
 	const lastLines = lines.slice(-3).join("\n")
+	// A stop claim that is immediately followed by a comma and a CONTINUING
+	// connective is not the end of the turn — the model kept going. Two shapes
+	// kept fooling the clause terminators above, because they separate with a
+	// bare comma and no semicolon/dash/period:
+	//   "Stopping here for a moment, then continuing with the migration."
+	//   "There is nothing pending on the first repo, so I moved to the second."
+	// A genuine stop may contain commas ("Nothing launched, nothing pending from
+	// me"), but never a comma followed by then/so/next/afterwards/and then.
+	if (/,\s*(then|so|next|now|afterwards?|and then)\b/i.test(lastLines)) return false
 	return STOP_STATEMENT_PATTERNS.some((pat) => pat.test(lastLines))
 }
 
@@ -1943,6 +1980,7 @@ export default define({
 					checkedToolPartIDs: new Set(),
 					lastUserMessageSeenAt: 0,
 					lastSilentReasoningCheck: 0,
+					lastStuckToolCheck: 0,
 					lastTokenTotal: 0,
 					contextWrapupAttempts: 0,
 					pendingRecoveryArmed: false,
@@ -1985,6 +2023,9 @@ export default define({
 				// abort+resume escalation. Nowhere else.
 				w.toolTextAttempts = 0
 				w.stuckToolAttempts = 0
+				// A fresh turn means the age gate is judged against a new call, so
+				// the watchdog's stuck-tool throttle re-arms with the attempt budget.
+				w.lastStuckToolCheck = 0
 				// Deliberately NOT resetting doneClaimAttempts / doneClaimOpenTodosAttempts.
 				// v1 moved both out of the busy-cycle reset for a reason (#26): a model
 				// that keeps re-announcing completion would get a fresh budget on every
@@ -4818,6 +4859,21 @@ export default define({
 						if (idleFor > chunkTimeoutMs && now - w.lastSilentReasoningCheck > chunkTimeoutMs) {
 							w.lastSilentReasoningCheck = now
 							await checkForSilentReasoningTurn(sid, w)
+						}
+						// Re-run the stuck-tool pass for a parked session. The
+						// event-driven pass runs once, on `session.idle`; if the call
+						// was still inside the age gate then (which is normal — the
+						// turn ends the moment the model stops emitting, not the
+						// moment the tool answers), it is declined by design and a
+						// parked session emits no further events, so nothing would
+						// ever re-examine it. The call's own age gate still decides:
+						// this only catches calls that have since aged into stuck.
+						// Throttled to the age gate so the cost is ~one history read
+						// per gate, and reusing checkForStuckToolCalls means the same
+						// locks, budgets and busy-shell guard apply as on the idle path.
+						if (idleFor > stuckToolAgeMs && now - w.lastStuckToolCheck > stuckToolAgeMs) {
+							w.lastStuckToolCheck = now
+							await checkForStuckToolCalls(sid, w)
 						}
 						continue
 					} else {
