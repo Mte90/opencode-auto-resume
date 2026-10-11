@@ -163,10 +163,16 @@ describe("v2: busy-stall stands down while a turn waits on the user", () => {
 	test("CONTROL: a wedged bare tool still recovers", async () => {
 		// A non-user tool stuck running with no events is exactly what the
 		// stall path exists for — the user-wait guard must not swallow it.
+		// "Wedged" means past the stuck-tool age gate (60s): a YOUNG running
+		// part is working, not wedged — the event-based young-tool guard already
+		// defers on it when its tool.called arrives, and the history-based
+		// young-unfinished guard defers when events were lost (e.g. reload).
+		// So this fixture uses a part old enough to actually be wedged; the
+		// young side of the boundary is pinned by the stall-shell-guard suite.
 		const now = Date.now()
 		const h = await setup(
 			{
-				[SID]: [userMessage("go", now - 60_000), assistantWithTool("shell", "running", now - 5_000)],
+				[SID]: [userMessage("go", now - 600_000), assistantWithTool("shell", "running", now - 120_000)],
 			},
 			[SID],
 		)

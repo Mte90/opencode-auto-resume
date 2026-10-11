@@ -78,7 +78,17 @@ const shellExited = (id: string) => ({ type: "shell.exited", data: { id, status:
 
 const userMessage = (at: number) => ({ type: "user", id: "msg_u", time: { created: at }, content: [{ type: "text", text: "run the suite" }] })
 
-type SetupOpts = { chunkTimeoutMs?: number; checkIntervalMs?: number }
+type SetupOpts = { chunkTimeoutMs?: number; checkIntervalMs?: number; history?: unknown[] }
+
+const assistantWithTool = (name: string, status: string, at: number, id = `call_${at}`) => ({
+	type: "assistant",
+	id: `msg_a_${at}`,
+	time: { created: at },
+	content: [
+		{ type: "text", text: "working on it" },
+		{ type: "tool", id, name, time: { created: at }, state: { status, input: {} } },
+	],
+})
 
 async function setup(opts: SetupOpts = {}): Promise<any> {
 	const injected: Array<{ text?: string }> = []
@@ -105,7 +115,7 @@ async function setup(opts: SetupOpts = {}): Promise<any> {
 			debug: true,
 		},
 		session: {
-			context: async () => [userMessage(Date.now() - 600_000)],
+			context: async () => opts.history ?? [userMessage(Date.now() - 600_000)],
 			active: async () => ({}),
 			interrupt: async (a: any) => (interrupted.push(a?.sessionID), {}),
 			synthetic: async (a: any) => (injected.push({ text: a?.text }), {}),
@@ -163,5 +173,83 @@ describe("v2: the STALL WATCHDOG defers while a shell is running", () => {
 		await wait(1600)
 		await teardown(h)
 		expect(h.injected.length).toBeGreaterThan(0)
+	})
+})
+
+/**
+ * The history half of the same guard.
+ *
+ * `openShells` and `inflightTools` are per-instance event derivations. A plugin
+ * reload — or any missed event — empties them while work is still running, and
+ * the stall ladder then fires on a live session. Observed 2026-10-11: sixteen
+ * consecutive `silent with 1 shell(s) still running` deferrals on a live
+ * `bun test`, then a reload adopted the watch without the shell registry and
+ * the ladder fired `stall detected (no activity for 186s)`.
+ *
+ * Message history survives reloads, so an unfinished tool part there is the
+ * durable form of the same signal. These tests push NO shell/tool events at
+ * all — simulating the reload having wiped the event-derived state — and assert
+ * on what history alone can prove.
+ */
+describe("v2: the STALL WATCHDOG defers on unfinished work in history", () => {
+	test("a young unfinished tool part suppresses the stall with no events at all", async () => {
+		// The reload-loss shape: no shell.created, no tool.called ever arrived,
+		// but history shows a running call from the current turn.
+		const now = Date.now()
+		const h = await setup({
+			history: [userMessage(now - 600_000), assistantWithTool("shell", "running", now)],
+		})
+		h.streamRef.push(ev("session.execution.started"))
+		await wait(10)
+		h.streamRef.push(ev("session.step.started"))
+		await wait(1600)
+		await teardown(h)
+		expect(h.injected).toEqual([])
+	})
+
+	test("a completed tool part does not suppress the stall", async () => {
+		// Without this, a green run above proves nothing about the history read:
+		// if history were never consulted, both would pass vacuously.
+		const now = Date.now()
+		const h = await setup({
+			history: [userMessage(now - 600_000), assistantWithTool("shell", "completed", now)],
+		})
+		h.streamRef.push(ev("session.execution.started"))
+		await wait(10)
+		h.streamRef.push(ev("session.step.started"))
+		await wait(1600)
+		await teardown(h)
+		expect(h.injected.length).toBeGreaterThan(0)
+	})
+
+	test("an OLD unfinished part does not suppress the stall (stuck-tool owns it)", async () => {
+		// The age gate matters: a part older than the stuck-tool window belongs
+		// to the stuck-tool pass, which already nudged the model to proceed
+		// without it. Letting the stall answer there is the designed backstop.
+		const now = Date.now()
+		const h = await setup({
+			history: [userMessage(now - 600_000), assistantWithTool("shell", "running", now - 120_000)],
+		})
+		h.streamRef.push(ev("session.execution.started"))
+		await wait(10)
+		h.streamRef.push(ev("session.step.started"))
+		await wait(1600)
+		await teardown(h)
+		expect(h.injected.length).toBeGreaterThan(0)
+	})
+
+	test("an exempt tool inside its stale TTL suppresses the stall", async () => {
+		// compress is exempt by default with a 30-minute stale TTL: a long
+		// compression past the 60s stuck gate is still work, not wedged.
+		const now = Date.now()
+		const h = await setup({
+			history: [userMessage(now - 600_000), assistantWithTool("compress", "running", now - 120_000)],
+		})
+		h.streamRef.push(ev("session.execution.started"))
+		await wait(10)
+		h.streamRef.push(ev("session.step.started"))
+		await wait(1600)
+		await teardown(h)
+		expect(h.injected).toEqual([])
 	})
 })

@@ -4976,6 +4976,60 @@ export default define({
 			return children.length > 0
 		}
 
+		/**
+	 * Durable liveness: is a tool call still unfinished in this session's HISTORY?
+	 *
+	 * `openShells` and `inflightTools` are per-instance event derivations: a
+	 * plugin reload (or a missed event) empties them while work is still running,
+	 * and the stall ladder then fires on a live session. Message history survives
+	 * reloads, so a tool part still unfinished there is the durable form of the
+	 * same signal. Observed 2026-10-11: sixteen consecutive
+	 * `silent with 1 shell(s) still running` deferrals on a live `bun test`,
+	 * then a reload adopted the watch without the shell registry and the ladder
+	 * fired `stall detected (no activity for 186s)`.
+	 *
+	 * Mirrors the event-based young-tool check and the stuck-tool pass: only
+	 * parts from the current turn (newer than the last user message) count, and
+	 * only young ones — or exempt names inside their stale TTL. An OLD
+	 * unfinished part is owned by the stuck-tool pass, which already nudged the
+	 * model to proceed without it; letting the stall answer there is the designed
+	 * backstop, not a bug.
+	 */
+		async function hasYoungUnfinishedWork(sid: string, now: number): Promise<boolean> {
+			const messages = await loadMessages(sid)
+			let lastUserAt = 0
+			for (const m of messages) {
+				if (msgRole(m) === "user") lastUserAt = Math.max(lastUserAt, msgAt(m))
+			}
+			for (const m of messages as Array<{
+				type?: string
+				time?: { created?: number }
+				content?: Array<{ type?: string; name?: string; state?: { status?: string }; time?: { created?: number } }>
+			}>) {
+				if (!m || msgRole(m) !== "assistant" || !Array.isArray(m.content)) continue
+				for (const part of m.content) {
+					if (part?.type !== "tool") continue
+					const st = part?.state?.status
+					if (st === "completed" || st === "error") continue
+					const created =
+						typeof part?.time?.created === "number"
+							? part.time.created
+							: typeof m?.time?.created === "number"
+								? m.time.created
+								: 0
+					if (created <= lastUserAt) continue
+					const name = typeof part?.name === "string" && part.name ? part.name.toLowerCase() : ""
+					const age = now - created
+					if (neverInterruptTools.includes(name)) {
+						if (age < NEVER_INTERRUPT_STALE_TTL_MS) return true
+						continue
+					}
+					if (age < stuckToolAgeMs) return true
+				}
+			}
+			return false
+		}
+
 		async function checkActiveSessions() {
 			const now = Date.now()
 
@@ -5155,6 +5209,16 @@ export default define({
 					if (age < stuckToolAgeMs) youngTool = true
 				}
 					if (youngTool) continue
+				}
+				// Durable form of the two guards above. Both read per-instance event
+				// derivations that a reload empties while work is still running;
+				// history survives, so an unfinished tool part there means the
+				// session is working no matter what the event counters say.
+				// Placed last so the cheap event checks run first and this history
+				// read happens only when they show nothing.
+				if (await hasYoungUnfinishedWork(sid, now)) {
+					dbg(`${short(sid)} tool call still unfinished in history — working, not stalled`)
+					continue
 				}
 				// If another session is actively running and this one went silent
 				// right after dispatching a task tool, treat it as a parent wait.
