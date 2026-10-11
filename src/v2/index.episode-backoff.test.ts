@@ -178,19 +178,23 @@ describe("v2: refire backoff across one episode", () => {
 		await teardown(h)
 		// The contract: each refire without genuine user input doubles the
 		// silence the next fire demands, so a slow-trickling session decays to
-		// patience instead of nagging on a fixed clock (ses_ed975114).
+		// patience instead of nagging on a fixed clock (ses_ed975114). With
+		// episodeRefires++ running inside recover() — after the threshold check
+		// — and a push after every fire, the ladder is 150 / 300 / 600 / 1200.
 		//
-		// Gaps grow monotonically and roughly double. Bounds are BELOW the
-		// nominal rung on purpose: a delayed watchdog tick can only push a fire
-		// later, never earlier, so every gap has a hard floor at chunkTimeout
-		// (150ms) and the growth factors are what actually carry the assertion.
+		// Each gap is bounded against its OWN nominal rung, never against the
+		// previous measurement. Comparing samples (gaps[k] > gaps[k-1] * 1.5)
+		// re-introduced the scheduler luck this test was rewritten to remove: a
+		// single late watchdog tick inflates one sample and the next nominal one
+		// then fails the ratio (2026-10-11: 449 vs 621, expected > 673).
+		// Jitter is one-sided — a tick can only fire LATER than its threshold,
+		// never earlier — so a floor per rung is the sound assertion, and a fuse
+		// stuck at the base 150ms still fails rungs 2-4 outright.
 		expect(gaps.length).toBe(4)
-		for (const g of gaps) {
-			expect(g).toBeGreaterThanOrEqual(140)
+		for (let k = 0; k < gaps.length; k++) {
+			const rung = OPTIONS.chunkTimeoutMs * 2 ** k
+			expect(gaps[k]).toBeGreaterThanOrEqual(rung * 0.75)
 		}
-		expect(gaps[1]).toBeGreaterThan(gaps[0] * 1.5)
-		expect(gaps[2]).toBeGreaterThan(gaps[1] * 1.5)
-		expect(gaps[3]).toBeGreaterThan(gaps[2] * 1.5)
 	}, 30000)
 
 	test("genuine user message resets the fuse to base", async () => {		const msgs: unknown[] = [userMsg("go", Date.now() - 60_000, "msg_u0"), assistantMsg("Working through the list.")]
