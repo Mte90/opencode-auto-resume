@@ -4,6 +4,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "./index"
 
+/** Unique per test FILE: bun runs every file in one process, so two files
+ *  starting their counters at 0 derive the SAME tmpdir log path and read each
+ *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
+const LOG_SALT = "IndexSendTimeoutTest"
+
 /**
  * v2: wedged sends time out instead of stacking into twins.
  *
@@ -61,7 +66,7 @@ const ev = (type: string, sid: string, data: Record<string, unknown> = {}) => ({
 async function setup(promptImpl: (a: any) => Promise<unknown>, opts: Record<string, unknown> = {}): Promise<any> {
 	const sends: Array<{ channel: string; at: number }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-sendtimeout-${process.pid}-${counter++}.log`)
+	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-sendtimeout-${process.pid}-${counter++}.log`)
 	rmSync(logFile, { force: true })
 	const now = Date.now()
 	const ctx: any = {

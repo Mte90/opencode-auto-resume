@@ -4,6 +4,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "./index"
 
+/** Unique per test FILE: bun runs every file in one process, so two files
+ *  starting their counters at 0 derive the SAME tmpdir log path and read each
+ *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
+const LOG_SALT = "IndexOrphanTest"
+
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_parent"
 const CHILD = "ses_child"
@@ -94,7 +99,7 @@ async function setup(
 	const injected: Array<{ sid?: string; text?: string }> = []
 	const interrupted: string[] = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-orphan-${process.pid}-${counter++}.log`)
+	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-orphan-${process.pid}-${counter++}.log`)
 	rmSync(logFile, { force: true })
 
 	const history: History = opts.history ?? { [SID]: [userMessage("go", Date.now() - 60_000)] }

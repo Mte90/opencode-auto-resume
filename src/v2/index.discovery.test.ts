@@ -4,12 +4,17 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "./index"
 
+/** Unique per test FILE: bun runs every file in one process, so two files
+ *  starting their counters at 0 derive the SAME tmpdir log path and read each
+ *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
+const LOG_SALT = "IndexDiscoveryTest"
+
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 /** Scratch log path per case, so parallel tests cannot read each other's lines. */
 let counter = 0
 function scratchLog(): string {
-	const p = join(tmpdir(), `auto-resume-discovery-${process.pid}-${counter++}.log`)
+	const p = join(tmpdir(), `auto-resume-${LOG_SALT}-discovery-${process.pid}-${counter++}.log`)
 	rmSync(p, { force: true })
 	return p
 }

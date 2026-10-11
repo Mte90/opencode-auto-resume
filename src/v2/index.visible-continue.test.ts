@@ -4,6 +4,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "./index"
 
+/** Unique per test FILE: bun runs every file in one process, so two files
+ *  starting their counters at 0 derive the SAME tmpdir log path and read each
+ *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
+const LOG_SALT = "IndexVisibleContinueTest"
+
 /**
  * v2: visible stall continue (cattleprod-style) + rich prod text +
  * exact-duplicate anti-repeat.
@@ -88,7 +93,7 @@ async function replay(
 ): Promise<Harness> {
 	const injected: Harness["injected"] = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-vis-${process.pid}-${counter++}.log`)
+	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-vis-${process.pid}-${counter++}.log`)
 	rmSync(logFile, { force: true })
 
 	const ctx: any = {

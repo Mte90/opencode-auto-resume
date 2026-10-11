@@ -4,6 +4,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "./index"
 
+/** Unique per test FILE: bun runs every file in one process, so two files
+ *  starting their counters at 0 derive the SAME tmpdir log path and read each
+ *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
+const LOG_SALT = "IndexSilentReasoningTest"
+
 /**
  * v2: reasoning-only turns with no output get a nudge.
  *
@@ -86,7 +91,7 @@ const toolPart = (id: string, name: string, status: string) => ({
 async function setup(history: unknown[], opts: { chunkTimeoutMs?: number } = {}): Promise<any> {
 	const injected: Array<{ text?: string }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-silreason-${process.pid}-${counter++}.log`)
+	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-silreason-${process.pid}-${counter++}.log`)
 	rmSync(logFile, { force: true })
 
 	const ctx: any = {

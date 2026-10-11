@@ -4,6 +4,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "./index"
 
+/** Unique per test FILE: bun runs every file in one process, so two files
+ *  starting their counters at 0 derive the SAME tmpdir log path and read each
+ *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
+const LOG_SALT = "IndexTaskCompleteTextTest"
+
 /**
  * v2: a bare "TASK COMPLETE" latches completion like a stop statement.
  *
@@ -78,7 +83,7 @@ async function setup(opts: {
 }): Promise<any> {
 	const injected: Array<{ sid?: string; text?: string }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-tc-${process.pid}-${counter++}.log`)
+	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-tc-${process.pid}-${counter++}.log`)
 	rmSync(logFile, { force: true })
 
 	const messages = opts.messages ?? []
@@ -183,6 +188,35 @@ describe("v2: bare TASK COMPLETE latches completion", () => {
 					id: "msg_a",
 					time: { created: Date.now() - 60_000 },
 					text: "Report written.\n\nTASK COMPLETE\n",
+				},
+			],
+		})
+		push(h, "session.execution.started", SID)
+		await wait(1200)
+		expect(h.injected.filter((i: any) => i.sid === SID)).toHaveLength(0)
+		await teardown(h)
+	}, 20000)
+
+	test("newest-first history (prod order) latches like oldest-first", async () => {
+		// ses_ed975114 (2026-10-10): the message API returns newest-first;
+		// every walk reads the END as newest. Without canonicalization the
+		// busy latch judged the oldest turn: a stale plain delivery masked
+		// the fresh TASK COMPLETE and the stall fired. Two assistant turns
+		// force the order to matter (a single turn reads the same either way).
+		const now = Date.now()
+		const h = await setup({
+			messages: [
+				{
+					role: "assistant",
+					id: "msg_new",
+					time: { created: now - 60_000 },
+					text: "Report written.\n\nTASK COMPLETE\n",
+				},
+				{
+					role: "assistant",
+					id: "msg_old",
+					time: { created: now - 120_000 },
+					text: "Still digging through the list.",
 				},
 			],
 		})

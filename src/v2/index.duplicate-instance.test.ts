@@ -5,6 +5,11 @@ import { join } from "node:path"
 import { tmpdir } from "node:os"
 import plugin from "./index"
 
+/** Unique per test FILE: bun runs every file in one process, so two files
+ *  starting their counters at 0 derive the SAME tmpdir log path and read each
+ *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
+const LOG_SALT = "IndexDuplicateInstanceTest"
+
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_dupinst"
 let counter = 0
@@ -68,7 +73,7 @@ async function bootStormed(instances: number, opts: Record<string, unknown> = {}
 	const injected: any[] = []
 	const streams = Array.from({ length: instances }, () => makeEventStream())
 	let next = 0
-	const logFile = join(tmpdir(), `auto-resume-dup-${process.pid}-${counter++}.log`)
+	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-dup-${process.pid}-${counter++}.log`)
 	rmSync(logFile, { force: true })
 
 	const ctx: any = {

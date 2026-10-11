@@ -4,6 +4,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "./index"
 
+/** Unique per test FILE: bun runs every file in one process, so two files
+ *  starting their counters at 0 derive the SAME tmpdir log path and read each
+ *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
+const LOG_SALT = "IndexQuotaRestoreTest"
+
 /**
  * v2: quota ladders survive a plugin reload.
  *
@@ -109,7 +114,7 @@ const OLD = Date.now() - 3600_000
 
 describe("v2: quota ladders survive a plugin reload", () => {
 	test("a fresh evaluation re-arms from the marker and retries", async () => {
-		const logFile = join(tmpdir(), `auto-resume-quota-restore-${process.pid}-${counter++}.log`)
+		const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-quota-restore-${process.pid}-${counter++}.log`)
 		rmSync(logFile, { force: true })
 
 		// First evaluation: quota failure arms the ladder (marker written).
@@ -137,7 +142,7 @@ describe("v2: quota ladders survive a plugin reload", () => {
 	})
 
 	test("CONTROL: a user message after the arm means no restore", async () => {
-		const logFile = join(tmpdir(), `auto-resume-quota-restore-${process.pid}-${counter++}.log`)
+		const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-quota-restore-${process.pid}-${counter++}.log`)
 		rmSync(logFile, { force: true })
 
 		const h1 = await setup(logFile)

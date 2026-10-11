@@ -4,6 +4,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "./index"
 
+/** Unique per test FILE: bun runs every file in one process, so two files
+ *  starting their counters at 0 derive the SAME tmpdir log path and read each
+ *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
+const LOG_SALT = "IndexFailureLoopTest"
+
 /**
  * v2: consecutive failure recoveries with no model output stand down.
  *
@@ -65,7 +70,7 @@ const fail = { error: { type: "provider.internal", message: "upstream command ex
 async function setup(): Promise<any> {
 	const injected: Array<{ text?: string }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-failloop-${process.pid}-${counter++}.log`)
+	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-failloop-${process.pid}-${counter++}.log`)
 	rmSync(logFile, { force: true })
 
 	const ctx: any = {

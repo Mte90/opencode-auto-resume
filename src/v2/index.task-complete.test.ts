@@ -4,6 +4,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "./index"
 
+/** Unique per test FILE: bun runs every file in one process, so two files
+ *  starting their counters at 0 derive the SAME tmpdir log path and read each
+ *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
+const LOG_SALT = "IndexTaskCompleteTest"
+
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_task_complete"
 
@@ -111,7 +116,7 @@ async function setup(
 ): Promise<Harness> {
 	const injected: Harness["injected"] = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-tc-${process.pid}-${counter++}.log`)
+	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-tc-${process.pid}-${counter++}.log`)
 	rmSync(logFile, { force: true })
 
 	let registered: Registered | null = null
@@ -378,7 +383,7 @@ describe("v2: task_complete degrades rather than failing the watchdog", () => {
 		// Registration failure is the one thing that must never take down the
 		// session recovery that the rest of this plugin exists for.
 		const stream = makeEventStream()
-		const logFile = join(tmpdir(), `auto-resume-tc-throw-${process.pid}-${counter++}.log`)
+		const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-tc-throw-${process.pid}-${counter++}.log`)
 		rmSync(logFile, { force: true })
 		const ctx: any = {
 			event: stream,

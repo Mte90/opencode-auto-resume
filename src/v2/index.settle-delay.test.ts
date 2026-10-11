@@ -4,6 +4,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "./index"
 
+/** Unique per test FILE: bun runs every file in one process, so two files
+ *  starting their counters at 0 derive the SAME tmpdir log path and read each
+ *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
+const LOG_SALT = "IndexSettleDelayTest"
+
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_settle"
 
@@ -73,7 +78,7 @@ const assistantTurn = (text: string | null) => ({
 async function setup(opts: { text?: string | null; toolTextCheckDelayMs?: number }): Promise<any> {
 	const injected: Array<{ text?: string; description?: string }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-settle-${process.pid}-${counter++}.log`)
+	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-settle-${process.pid}-${counter++}.log`)
 	rmSync(logFile, { force: true })
 
 	// Mutable on purpose: the point of several tests below is what the deferred

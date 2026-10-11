@@ -4,6 +4,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "./index"
 
+/** Unique per test FILE: bun runs every file in one process, so two files
+ *  starting their counters at 0 derive the SAME tmpdir log path and read each
+ *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
+const LOG_SALT = "IndexOptionsTest"
+
 const SOURCE = readFileSync(join(import.meta.dir, "index.ts"), "utf8")
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_opts"
@@ -103,7 +108,7 @@ async function replay(
 	// v2 removed v1's server log endpoint, so the plugin writes to a file. Point
 	// it at a scratch path and read the lines back after teardown — this is also
 	// what proves the file sink works, rather than assuming it does.
-	const logFile = join(tmpdir(), `auto-resume-test-${process.pid}-${counter++}.log`)
+	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-test-${process.pid}-${counter++}.log`)
 	rmSync(logFile, { force: true })
 
 	const ctx: any = {

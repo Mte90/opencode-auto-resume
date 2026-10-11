@@ -4,6 +4,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "./index"
 
+/** Unique per test FILE: bun runs every file in one process, so two files
+ *  starting their counters at 0 derive the SAME tmpdir log path and read each
+ *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
+const LOG_SALT = "IndexSaturationTest"
+
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_saturation"
 const PROVIDER = "llama-server"
@@ -107,7 +112,7 @@ async function replay(h: HarnessOpts) {
 	const commands: Array<{ sessionID: string; name: string }> = []
 	const compacted: string[] = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-saturation-${process.pid}-${counter++}.log`)
+	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-saturation-${process.pid}-${counter++}.log`)
 	rmSync(logFile, { force: true })
 
 	const limit = h.limit ?? { context: 200_000, output: 32_000 }
@@ -224,7 +229,7 @@ describe("v2: context saturation — parent sessions", () => {
 	test("a host with no plugin inventory treats magic-context as absent", async () => {
 		const logs: string[] = []
 		const stream = makeEventStream()
-		const logFile = join(tmpdir(), `auto-resume-saturation-${process.pid}-${counter++}.log`)
+		const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-saturation-${process.pid}-${counter++}.log`)
 		rmSync(logFile, { force: true })
 		const ctx: any = {
 			event: stream,
@@ -329,7 +334,7 @@ describe("v2: the saturation arithmetic matches v1", () => {
 
 	test("an unknown model yields no limit, so no intervention", async () => {
 		const stream = makeEventStream()
-		const logFile = join(tmpdir(), `auto-resume-saturation-${process.pid}-${counter++}.log`)
+		const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-saturation-${process.pid}-${counter++}.log`)
 		rmSync(logFile, { force: true })
 		const ctx: any = {
 			event: stream,

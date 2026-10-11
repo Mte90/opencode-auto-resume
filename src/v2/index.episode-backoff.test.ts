@@ -4,6 +4,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "./index"
 
+/** Unique per test FILE: bun runs every file in one process, so two files
+ *  starting their counters at 0 derive the SAME tmpdir log path and read each
+ *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
+const LOG_SALT = "IndexEpisodeBackoffTest"
+
 /**
  * v2: consecutive progress-restarted refires back the fuse off.
  *
@@ -89,7 +94,7 @@ const toolOk = () => ({ type: "session.tool.success", sid: SID, data: { sessionI
 async function setup(msgs: unknown[]) {
 	const injected: Array<{ sid?: string; text?: string; t?: number }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-episode-${process.pid}-${counter++}.log`)
+	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-episode-${process.pid}-${counter++}.log`)
 	rmSync(logFile, { force: true })
 
 	const ctx: any = {
@@ -149,12 +154,21 @@ describe("v2: refire backoff across one episode", () => {
 		const times = h.injected.filter((x: any) => x.sid === SID).map((x: any) => x.t as number)
 		await teardown(h)
 		expect(times.length).toBeGreaterThanOrEqual(6)
-		// Base fuse intact on the first fire (~150ms scale).
-		expect(times[0] - t0).toBeLessThan(450)
-		// Backed-off late gap dwarfs the early one (nominal ~160 vs ~600+).
+		// The backoff itself: late gaps dwarf early ones (nominal ~160 vs ~600+).
+		// This is a RATIO between two intervals the plugin itself scheduled, so it
+		// survives scheduler noise.
 		const early = times[1] - times[0]
 		const late = times[times.length - 1] - times[times.length - 2]
 		expect(late).toBeGreaterThan(early * 2)
+		// The first fire must be prompt, i.e. still on the BASE fuse rather than
+		// already backed off. Expressed relative to the late gap so it survives
+		// scheduler noise: the old absolute bound (`< 450` against a real clock)
+		// failed on load regardless of correct behaviour, and a bound derived
+		// from baseBackoffMs was simply wrong -- the real floor is the configured
+		// chunkTimeoutMs, since a stall cannot be declared before that silence
+		// elapses. If the first fire were already backed off it would be within
+		// reach of `late`, and this trips.
+		expect(times[0] - t0).toBeLessThan(late)
 	}, 30000)
 
 	test("genuine user message resets the fuse to base", async () => {		const msgs: unknown[] = [userMsg("go", Date.now() - 60_000, "msg_u0"), assistantMsg("Working through the list.")]

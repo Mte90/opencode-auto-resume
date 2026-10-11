@@ -4,6 +4,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "./index"
 
+/** Unique per test FILE: bun runs every file in one process, so two files
+ *  starting their counters at 0 derive the SAME tmpdir log path and read each
+ *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
+const LOG_SALT = "IndexDupProgressTest"
+
 /**
  * v2: silent tool completions defeat the exact-duplicate skip.
  *
@@ -59,7 +64,7 @@ const ev = (type: string, data: Record<string, unknown> = {}) => ({ type, data: 
 async function setup(extraEvents: Array<{ at: number; event: any }>, waitMs: number): Promise<any> {
 	const injected: Array<{ text?: string }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-dupprog-${process.pid}-${counter++}.log`)
+	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-dupprog-${process.pid}-${counter++}.log`)
 	rmSync(logFile, { force: true })
 
 	const ctx: any = {

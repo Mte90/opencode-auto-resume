@@ -4,6 +4,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "./index"
 
+/** Unique per test FILE: bun runs every file in one process, so two files
+ *  starting their counters at 0 derive the SAME tmpdir log path and read each
+ *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
+const LOG_SALT = "IndexTodoTest"
+
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_todo"
 
@@ -138,7 +143,7 @@ async function replay(
 	const storageWrites: string[] = []
 	const storageReads: string[] = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-todo-${process.pid}-${counter++}.log`)
+	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-todo-${process.pid}-${counter++}.log`)
 	rmSync(logFile, { force: true })
 
 	// The history grows turn by turn, exactly as a real session's does.
@@ -325,7 +330,7 @@ describe("v2: the todo list, read from the tool that owns it", () => {
 		// Both malformed shapes must fall back to the old behaviour instead.
 		for (const bad of [{ todos: "nope" }, { todos: [null, 7] }, null]) {
 			const stream = makeEventStream()
-			const logFile = join(tmpdir(), `auto-resume-todo-bad-${process.pid}-${counter++}.log`)
+			const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-todo-bad-${process.pid}-${counter++}.log`)
 			rmSync(logFile, { force: true })
 			const injected: unknown[] = []
 			const ctx: any = {

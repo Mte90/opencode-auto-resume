@@ -4,6 +4,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "./index"
 
+/** Unique per test FILE: bun runs every file in one process, so two files
+ *  starting their counters at 0 derive the SAME tmpdir log path and read each
+ *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
+const LOG_SALT = "IndexLatchPersistTest"
+
 /**
  * v2: durable latch state (R1, audit 2026-10-10 finding 6).
  *
@@ -153,7 +158,7 @@ async function setup(
 }
 
 const freshLog = () => {
-	const logFile = join(tmpdir(), `auto-resume-latch-${process.pid}-${counter++}.log`)
+	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-latch-${process.pid}-${counter++}.log`)
 	rmSync(logFile, { force: true })
 	return logFile
 }

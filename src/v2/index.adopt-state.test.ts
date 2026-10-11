@@ -4,6 +4,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "./index"
 
+/** Unique per test FILE: bun runs every file in one process, so two files
+ *  starting their counters at 0 derive the SAME tmpdir log path and read each
+ *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
+const LOG_SALT = "IndexAdoptStateTest"
+
 /**
  * v2: a successor setup inherits the watch map instead of starting blank.
  *
@@ -79,7 +84,7 @@ const OPTIONS = {
 }
 
 function makeCtx(stream: any, injected: Array<{ sid?: string; text?: string }>, tag: number) {
-	const logFile = join(tmpdir(), `auto-resume-adopt-${process.pid}-${tag}.log`)
+	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-adopt-${process.pid}-${tag}.log`)
 	rmSync(logFile, { force: true })
 	return {
 		event: stream,

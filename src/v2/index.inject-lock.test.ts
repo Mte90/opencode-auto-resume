@@ -4,6 +4,11 @@ import { join } from "node:path"
 import { tmpdir } from "node:os"
 import plugin from "./index"
 
+/** Unique per test FILE: bun runs every file in one process, so two files
+ *  starting their counters at 0 derive the SAME tmpdir log path and read each
+ *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
+const LOG_SALT = "IndexInjectLockTest"
+
 const SOURCE = readFileSync(join(import.meta.dir, "index.ts"), "utf8")
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_lock"
@@ -15,7 +20,7 @@ let counter = 0
  * real ones and the live log stops being usable as forensics.
  */
 function privateLog(tag: string): string {
-	const f = join(tmpdir(), `auto-resume-${tag}-${process.pid}-${counter++}.log`)
+	const f = join(tmpdir(), `auto-resume-${LOG_SALT}-${tag}-${process.pid}-${counter++}.log`)
 	rmSync(f, { force: true })
 	return f
 }

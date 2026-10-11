@@ -4,6 +4,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "./index"
 
+/** Unique per test FILE: bun runs every file in one process, so two files
+ *  starting their counters at 0 derive the SAME tmpdir log path and read each
+ *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
+const LOG_SALT = "IndexDeliveryOnceTest"
+
 /**
  * v2: a send that throws after delivering must not send again.
  *
@@ -94,7 +99,7 @@ async function setup(opts: {
 }): Promise<any> {
 	const sends: Array<{ channel: string; text?: string }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-delivery-${process.pid}-${counter++}.log`)
+	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-delivery-${process.pid}-${counter++}.log`)
 	rmSync(logFile, { force: true })
 
 	const logMessages: unknown[] = opts.logMessages ?? []
@@ -170,7 +175,7 @@ describe("v2: a disposed instance sends nothing more", () => {
 		const sent: string[] = []
 		const now = Date.now()
 		const stream = makeEventStream()
-		const logFile = join(tmpdir(), `auto-resume-disposed-${process.pid}-${counter++}.log`)
+		const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-disposed-${process.pid}-${counter++}.log`)
 		rmSync(logFile, { force: true })
 		const ctx: any = {
 			event: stream,
