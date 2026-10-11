@@ -93,10 +93,20 @@ interface AutoResumePluginInput {
 	plugin?: { list: () => Promise<unknown> }
 	/**
 	 * Key/value store scoped to the plugin (`ctx.storage.get/set/remove/scan`).
-	 * Read-only here: auto-resume does not own a todo list, it reads the one the
-	 * installed todo tool writes, so this only ever calls `get`.
+	 *
+	 * Two consumers. It READS the todo list the installed todo tool writes —
+	 * auto-resume does not own that list. And since R1 it WRITES its own
+	 * `resume-quota/<sid>` records, so the rate-limit ladder survives a real
+	 * process restart. That used to ride on the log file, which is the worst
+	 * available channel: a 2MB rotation cap and a fixed 3000-line tail can drop
+	 * a live arm. `set`/`remove` are optional so a host that only offers `get`
+	 * still works — the ladder then simply falls back to the log markers.
 	 */
-	storage?: { get: (key: string) => Promise<unknown> }
+	storage?: {
+		get: (key: string) => Promise<unknown>
+		set?: (key: string, value: unknown) => Promise<unknown>
+		remove?: (key: string) => Promise<unknown>
+	}
 	/**
 	 * Tool registry (`ctx.tool.transform` / `ctx.tool.list` / `ctx.tool.hook`).
 	 * v2 plugins register their own tools here, which is how `task_complete`
@@ -574,6 +584,14 @@ const DEFAULT_CONTEXT_SATURATION_THRESHOLD = 0.85
 /** Cap on the remembered tool-part ids. Bounds a set that is otherwise fed one
  * entry per tool part, on every idle, for the life of the session. */
 const CHECKED_TOOL_PART_IDS_MAX = 500
+
+/** Where the rate-limit ladder is mirrored so it survives a process restart
+ * (R1). A log file was the previous channel and is a bad one: a 2MB rotation
+ * cap plus a fixed 3000-line tail can drop a live arm. */
+const QUOTA_STATE_PREFIX = "resume-quota/"
+/** Generous ceiling on a stored arm. The ladder horizon is minutes; this only
+ * exists so an abandoned record cannot haunt a session days later. */
+const QUOTA_STATE_MAX_AGE_MS = 48 * 3600_000
 
 const TODO_CACHE_TTL_MS = 3_000
 const DEFAULT_MAX_RECOVERY_RETRIES = 2
@@ -2059,6 +2077,7 @@ export default define({
 				// Each rung then carries at most one notice.
 				w.quotaNoticedAt = 0
 				log("info", `${short(sid)} ${tag} cooldown served — retrying (attempt ${n + 1}/${ladder.length})`)
+				void syncQuotaState(sid, w)
 				void recover(sid, "rate-limit cooldown served")
 				return
 			}
@@ -2080,6 +2099,8 @@ export default define({
 			// 14:31:49, plugin reloaded 14:37:28, gate due 14:46:49 never fired).
 			// Full sid: short() truncates and suffixes can collide across sessions.
 			log("warn", `quota-armed sid=${sid} at=${now} rung=${n} ladder=${ladder.length}`)
+			// Mirror into storage so the arm survives a real process restart (R1).
+			void syncQuotaState(sid, w)
 		}
 
 		/** Remaining plugin-initiated interrupts allowed in the current window. */
@@ -4719,6 +4740,7 @@ export default define({
 				// announces itself afresh.
 				rw.quotaNoticedAt = 0
 				log("info", `${short(rsid)} ${tag} cooldown served — retrying (attempt ${rn + 1}/${ladder.length}) mod=${MODULE_INSTANCE}`)
+				void syncQuotaState(rsid, rw)
 				void recover(rsid, "rate-limit cooldown served")
 			}
 			cleanupIdleSessions()
@@ -5063,6 +5085,64 @@ export default define({
 		 * the watchdog serves it on schedule, possibly immediately if overdue.
 		 */
 		async function restoreQuotaLadders(): Promise<void> {
+			let listed: Set<string>
+			try {
+				listed = new Set(unwrapList(await callSessionApi<unknown>("list")).map((r) => r.id).filter((id): id is string => typeof id === "string"))
+			} catch {
+				return
+			}
+			const horizon = rateLimitCooldownsMs.reduce((a, b) => a + b, 0)
+
+			// Primary channel: the plugin's own storage record. No history read —
+			// `syncQuotaState` deletes the record the moment a genuine user
+			// message resets the ladder, so its absence is the answer to "did
+			// they speak after the arm?" That is what removes the per-session
+			// loadMessages() at boot, which was N sequential HTTP round-trips
+			// during startup.
+			const restored = new Set<string>()
+			if (ctx.storage?.set) {
+				for (const sid of listed) {
+					let rec: unknown
+					try {
+						rec = await ctx.storage.get(`${QUOTA_STATE_PREFIX}${sid}`)
+					} catch (e) {
+						dbg(`${short(sid)} quota record read failed:`, e instanceof Error ? e.message : String(e))
+						continue
+					}
+					const r = rec as { v?: number; at?: unknown; rung?: unknown; noticed?: unknown } | null
+					if (!r || typeof r.at !== "number") continue
+					if (Date.now() - r.at >= QUOTA_STATE_MAX_AGE_MS) {
+						void syncQuotaState(sid, ensureWatch(sid), true)
+						continue
+					}
+					if (Date.now() - r.at >= horizon) continue
+					const w = ensureWatch(sid)
+					if (w.awaitingQuotaRetry || w.rateLimitedAt > 0) continue
+					// Never arm a session that is already working. A user who
+					// messaged while the plugin was still starting has a busy
+					// watch by the time the watchdog sweeps it, and serving a
+					// restored ladder into that turn is the false nag this
+					// whole change exists to remove. Status is already in
+					// memory, so this guard costs no history read.
+					if (w.status === "busy") {
+						dbg(`${short(sid)} busy — skipping quota restore`)
+						continue
+					}
+					w.rateLimitedAt = r.at
+					w.rateLimitAttempts = typeof r.rung === "number" ? r.rung : 0
+					w.awaitingQuotaRetry = true
+					// The arm that wrote this record also sent the user-visible
+					// notice, so carry that across the restart — otherwise the
+					// next hit re-announces a stand-down already announced.
+					w.quotaNoticedAt = typeof r.noticed === "number" && r.noticed > 0 ? r.noticed : r.at
+					restored.add(sid)
+					log("warn", `${short(sid)} quota ladder restored (armed ${Math.round((Date.now() - r.at) / 1000)}s ago, rung ${w.rateLimitAttempts}) — retry due on schedule`)
+				}
+			}
+
+			// Fallback for arms written before R1 shipped, or by a host whose
+			// storage has no `set`. Costs a history read per session, so it runs
+			// only for sessions the storage channel did not already settle.
 			let text: string
 			try {
 				text = readFileSync(logFile, "utf8")
@@ -5075,15 +5155,8 @@ export default define({
 				if (m) marks.set(m[1], { at: Number(m[2]), rung: Number(m[3]) })
 			}
 			if (marks.size === 0) return
-			let listed: Set<string>
-			try {
-				listed = new Set(unwrapList(await callSessionApi<unknown>("list")).map((r) => r.id).filter((id): id is string => typeof id === "string"))
-			} catch {
-				return
-			}
-			const horizon = rateLimitCooldownsMs.reduce((a, b) => a + b, 0)
 			for (const [sid, mark] of marks) {
-				if (!listed.has(sid)) continue
+				if (!listed.has(sid) || restored.has(sid)) continue
 				const w = ensureWatch(sid)
 				if (w.awaitingQuotaRetry || w.rateLimitedAt > 0) continue
 				if (Date.now() - mark.at >= horizon) continue
@@ -5096,11 +5169,39 @@ export default define({
 				w.rateLimitedAt = mark.at
 				w.rateLimitAttempts = mark.rung
 				w.awaitingQuotaRetry = true
-				// The arm that wrote this marker also sent the user-visible notice,
-				// so carry that across the reload — otherwise the next hit in the
-				// restored episode re-announces a stand-down already announced.
 				w.quotaNoticedAt = mark.at
 				log("warn", `${short(sid)} quota ladder restored (armed ${Math.round((Date.now() - mark.at) / 1000)}s ago, rung ${mark.rung}) — retry due on schedule`)
+			}
+		}
+
+		/**
+		 * Mirror the rate-limit ladder into `ctx.storage` so it survives a real
+		 * process restart. Writes only while an episode is armed, deletes the
+		 * record as soon as a genuine turn resets the ladder — so a restored
+		 * ladder can never outlive the user having spoken.
+		 *
+		 * Best-effort by design: a storage failure must never block recovery, so
+		 * every path here swallows and logs at debug. When `set` is missing
+		 * (a host that only offers `get`) this is a no-op and the log markers
+		 * remain the channel.
+		 */
+		async function syncQuotaState(sid: string, w: SessionWatch, force = false): Promise<void> {
+			try {
+				const st = ctx.storage
+				if (!st?.set) return
+				const key = `${QUOTA_STATE_PREFIX}${sid}`
+				if (!w.rateLimitedAt) {
+					if (force || st.remove) await st.remove?.(key)
+					return
+				}
+				await st.set(key, {
+					v: 1,
+					at: w.rateLimitedAt,
+					rung: w.rateLimitAttempts,
+					noticed: w.quotaNoticedAt,
+				})
+			} catch (e) {
+				dbg(`${short(sid)} quota state sync failed:`, e instanceof Error ? e.message : String(e))
 			}
 		}
 
@@ -5126,6 +5227,10 @@ export default define({
 						w.rateLimitAttempts = 0
 						w.quotaNoticedAt = 0
 						w.awaitingQuotaRetry = false
+						// Drop the durable arm with the in-memory one. This delete is
+						// what lets restore skip the history read: no record means the
+						// user has spoken since the arm, so there is nothing to serve.
+						void syncQuotaState(sid, w)
 						// A genuine turn is also a new episode for the stall
 						// ladder (the reset lives here and in the progress check,
 						// never on lifecycle transitions) — unless our inject is

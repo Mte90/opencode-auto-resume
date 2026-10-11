@@ -283,8 +283,26 @@ describe("v2: the todo list, read from the tool that owns it", () => {
 	test("the plugin never writes to that key", async () => {
 		// It is a consumer, not a second owner. A write here would mean auto-resume
 		// was maintaining a copy that could drift from the real one.
+		//
+		// Scoped to the todo domain, deliberately. The plugin DOES write storage
+		// since R1 (audit 2026-10-10): `resume-quota/<sid>` records carry the
+		// rate-limit ladder across a process restart, replacing a scheme that
+		// grepped the log file. The invariant that matters is that auto-resume
+		// never takes ownership of a list it does not own — asserted here, and
+		// the write-confinement is pinned by the next test.
 		const { storageWrites } = await replay([{ text: CELEBRATED }], OPEN)
-		expect(storageWrites).toEqual([])
+		expect(storageWrites.filter((k) => k.startsWith("todos/"))).toEqual([])
+	})
+
+	test("storage writes are confined to the plugin's own quota domain", async () => {
+		// The counterpart to the assertion above: writing is allowed, writing
+		// anywhere else is not. A future feature reaching for someone else's
+		// storage namespace fails here rather than silently mutating state it
+		// does not own.
+		const { storageWrites } = await replay([{ text: CELEBRATED }], OPEN)
+		for (const key of storageWrites) {
+			expect(key.startsWith("resume-quota/")).toBe(true)
+		}
 	})
 
 	test("the list is read once per turn, not once per check", async () => {
