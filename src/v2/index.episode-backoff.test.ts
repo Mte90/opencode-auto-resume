@@ -228,8 +228,14 @@ describe("v2: refire backoff across one episode", () => {
 		push(h, "session.execution.started", SID)
 		await wait(60)
 		push(h, "session.tool.success", SID)
-		await wait(1200)
-		const logs = existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : ""
+		// Poll for the line instead of sleeping: the reset is logged when the
+		// NEXT stall is judged, which is watchdog-driven and takes at least
+		// one rung of silence. A fixed 1200ms assumed the watchdog always got
+		// scheduled promptly; under 79-file suite contention it does not, and
+		// the line simply had not been written yet (failed 2026-10-11).
+		const readLogs = () => (existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : "")
+		await waitFor(() => /restarting the stall ladder/.test(readLogs()), 10_000)
+		const logs = readLogs()
 		await teardown(h)
 		expect(logs).toMatch(/restarting the stall ladder/)
 	}, 20000)

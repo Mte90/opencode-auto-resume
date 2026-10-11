@@ -1,4 +1,4 @@
-import { describe, test, expect } from "bun:test"
+import { describe, test, expect, setDefaultTimeout } from "bun:test"
 import { rmSync, readFileSync, existsSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -25,6 +25,17 @@ const LOG_SALT = "IndexStuckToolTest"
  */
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+/**
+ * The idle inspection is promise-chained and event-driven, and this file runs
+ * while the suite runs 79 files in parallel. Measured on 2026-10-11: under full
+ * suite contention the nudge for a stuck call was DECIDED at ~2.65s (the
+ * plugin's own log line "tool call(s) ... stuck unfinished — nudging" lands
+ * there) even though every mock resolves instantly — the whole process is
+ * simply starved. Bun's 5s default leaves no room for that, so the six tests
+ * that wait on a nudge get a real budget instead of racing one.
+ */
+setDefaultTimeout(20_000)
 const SID = "ses_parent"
 
 let counter = 17000
@@ -138,12 +149,32 @@ async function teardown(h: any) {
 	rmSync(h.logFile, { force: true })
 }
 
-async function goIdle(h: any) {
+/**
+ * Drive the session idle, then wait for the idle inspection's async chain.
+ *
+ * The nudge path is promise-chained — history read, then prompt build, then
+ * inject — so the old fixed `wait(300)` raced it: under the suite's parallel
+ * load it sometimes returned before the nudge landed and the test saw zero
+ * nudges (2026-10-10, 1 run in 3). `expectNudge` polls for the outcome instead.
+ *
+ * The CONTROLs deliberately keep the short fixed wait: their assertion is that
+ * NOTHING was sent, so waiting longer could only make them weaker, and a slow
+ * idle inspection is not evidence of a nudge.
+ */
+async function goIdle(h: any, expectNudge = false) {
 	for (const e of ["session.execution.started", "session.step.started", "session.step.ended", "session.idle"]) {
 		h.streamRef.push(ev(e, SID))
 		await wait(10)
 	}
-	await wait(300)
+	if (!expectNudge) {
+		await wait(300)
+		return
+	}
+	const deadline = Date.now() + 8000
+	while (Date.now() < deadline) {
+		if (h.injected.some((i: any) => /never returned a result|Retry it now/.test(i.text ?? ""))) return
+		await wait(25)
+	}
 }
 
 const stuckNudges = (h: any) => h.injected.filter((i: any) => /never returned a result/.test(i.text ?? ""))
@@ -155,7 +186,7 @@ describe("v2: turns parked on an unanswered tool call", () => {
 			userMessage("do the sync job", OLD),
 			assistantWith(OLD + 1000, toolPart("call_1", "compress", "streaming", OLD + 2000)),
 		])
-		await goIdle(h)
+		await goIdle(h, true)
 		const said = stuckNudges(h)
 		await teardown(h)
 		expect(said).toHaveLength(1)
@@ -167,7 +198,7 @@ describe("v2: turns parked on an unanswered tool call", () => {
 			userMessage("go", OLD),
 			assistantWith(OLD + 1000, toolPart("call_1", "write", "running", OLD + 2000)),
 		])
-		await goIdle(h)
+		await goIdle(h, true)
 		const said = stuckNudges(h)
 		await teardown(h)
 		expect(said).toHaveLength(1)
@@ -225,7 +256,7 @@ describe("v2: turns parked on an unanswered tool call", () => {
 			userMessage("go", now - 120_000),
 			assistantWith(now - 61_000, toolPart("call_1", "shell", "running", now - 61_000)),
 		])
-		await goIdle(h)
+		await goIdle(h, true)
 		const said = stuckNudges(h)
 		await teardown(h)
 		expect(said).toHaveLength(1)
@@ -254,7 +285,7 @@ describe("v2: turns parked on an unanswered tool call", () => {
 			],
 			{ chunkTimeoutMs: 600_000 },
 		)
-		await goIdle(h)
+		await goIdle(h, true)
 		const said = retryNudges(h)
 		await teardown(h)
 		expect(said).toHaveLength(1)
@@ -403,7 +434,7 @@ describe("v2: turns parked on an unanswered tool call", () => {
 			],
 			{ chunkTimeoutMs: 600_000 },
 		)
-		await goIdle(h)
+		await goIdle(h, true)
 		const said = retryNudges(h)
 		await teardown(h)
 		expect(said).toHaveLength(1)
@@ -415,7 +446,7 @@ describe("v2: turns parked on an unanswered tool call", () => {
 			userMessage("go", OLD),
 			assistantWith(OLD + 1000, toolPart("call_1", "compress", "streaming", OLD + 2000)),
 		])
-		await goIdle(h)
+		await goIdle(h, true)
 		const said = stuckNudges(h)
 		await teardown(h)
 		expect(said).toHaveLength(1)
