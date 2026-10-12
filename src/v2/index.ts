@@ -3970,8 +3970,15 @@ export default define({
 			// (the reset lives here, on genuine execution.started, and in the
 			// progress check — never on lifecycle transitions). Recorded
 			// separately from lastUserMessageSeenAt, which our own prompts also
-			// advance: only non-own messages mark a user takeover.
-			w.lastGenuineUserAt = typeof latest.at === "number" ? latest.at : Date.now()
+			// advance: only non-own messages mark a user takeover. Clamped to
+			// now: message timestamps come from the server clock, and a forged
+			// or skewed future timestamp would otherwise keep
+			// `lastGenuineUserAt > armedAt` true indefinitely, parking every
+			// later recovery (the fuse suite forges +35s deliberately; a skewed
+			// server clock does it by accident). Clamping only pulls futures
+			// back to the present — genuine past timestamps pass through.
+			w.lastGenuineUserAt =
+				typeof latest.at === "number" ? Math.min(latest.at, Date.now()) : Date.now()
 			// A genuine new user message is also what re-opens a latched
 			// completion: new instructions mean the "done" being tracked is no
 			// longer the question. This is the ONLY place the latch clears besides
