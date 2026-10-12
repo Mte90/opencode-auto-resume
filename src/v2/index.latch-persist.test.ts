@@ -277,6 +277,15 @@ describe("v2: durable quota state across a restart", () => {
 		// Asserted on the record rather than on end-to-end ordering: restore
 		// runs at setup, so "no restore" would depend on whether a genuine turn
 		// landed before or after it. The mechanism is the durable fact.
+		//
+		// Timing note (2026-10-11): the drop poll below exhausted its 10s
+		// ceiling twice at ~10.5s under the full 85-file serial suite while the
+		// mechanism proved sound in isolation (3/3), in 2/8/16/20-file subsets,
+		// and the drop chain is microtask-only (execution.started → reset →
+		// unawaited remove). Serial execution + disposed teardowns rule out
+		// cross-file pollution, so the ceiling — not the mechanism — is what
+		// broke. 30s keeps the failure mode (a record that never drops still
+		// fails) while surviving a loaded loop.
 		const logFile = freshLog()
 		const store = durableStorage()
 		const h1 = await setup(logFile, [], store)
@@ -290,13 +299,13 @@ describe("v2: durable quota state across a restart", () => {
 		const dropped = await until(() => {
 			const rec = store.map.get(`resume-quota/${SID}`) as any
 			return rec === undefined || rec?.at === 0
-		})
+		}, 30_000)
 		;(h2.cleanup as (() => void) | undefined)?.()
 		rmSync(logFile, { force: true })
 
 		// Genuine turn => the in-memory ladder reset must take the record with it.
 		expect(dropped).toBe(true)
-	}, 20000)
+	}, 60000)
 
 	test("restore never arms a session that is already busy", async () => {
 		// The boot race: a user who messaged before the plugin finished starting
