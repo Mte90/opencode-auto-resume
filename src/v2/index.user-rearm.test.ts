@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test"
-import { rmSync } from "node:fs"
+import { rmSync, existsSync, readFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "./index"
@@ -90,7 +90,7 @@ const assistantText = (text: string, at: number) => ({
 	content: [{ type: "text", text }],
 })
 
-async function setup(history: Record<string, unknown[]>): Promise<any> {
+async function setup(history: Record<string, unknown[]>, extraOpts: Record<string, unknown> = {}): Promise<any> {
 	const injected: Array<{ sid?: string; text?: string }> = []
 	const stream = makeEventStream()
 	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-rearm-${process.pid}-${counter++}.log`)
@@ -98,7 +98,7 @@ async function setup(history: Record<string, unknown[]>): Promise<any> {
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile, registryScope: LOG_SALT },
+		options: { ...OPTIONS, logFile, registryScope: LOG_SALT, ...extraOpts },
 		session: {
 			context: async (a: any) => history[a?.sessionID ?? SID] ?? [],
 			active: async () => ({ [SID]: {} }),
@@ -127,6 +127,20 @@ async function teardown(h: any) {
 }
 
 const push = (h: any, type: string, sid: string, data: Record<string, unknown> = {}) => h.streamRef.push(ev(type, sid, data))
+
+/** Poll the log file for a line instead of sleeping a fixed span. */
+async function waitForLog(logFile: string, needle: string, timeoutMs = 5000): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs
+	for (;;) {
+		try {
+			if (readFileSync(logFile, "utf8").includes(needle)) return true
+		} catch {
+			// Log file not written yet.
+		}
+		if (Date.now() >= deadline) return false
+		await wait(25)
+	}
+}
 
 describe("v2: genuine user message re-arms after user interrupt", () => {
 	test("interrupt latches, then a new user message re-arms recovery", async () => {
@@ -169,5 +183,47 @@ describe("v2: genuine user message re-arms after user interrupt", () => {
 		await wait(900)
 		expect(h.injected.filter((i: any) => i.sid === SID)).toHaveLength(0)
 		await teardown(h)
+	})
+
+	test("a genuine user message inside the backoff wait parks the recovery", async () => {
+		// The race this pins: stall declared arms the recover timer (200ms
+		// here so the window is drivable); a genuine user message landing
+		// before it fires must park the turn instead of injecting into the
+		// user's live turn ("Step interrupted"). The busy-freshness check
+		// cannot see it — event-pump lag means their execution.started may
+		// not have been processed yet — so the timer compares
+		// lastGenuineUserAt against its own arm time. (2026-10-11: continues
+		// landing right after user statements.)
+		//
+		// Deliberately NO second execution.started: the freshness guard would
+		// park on processed activity and the test would prove nothing. The
+		// user message arrives as history only — exactly the case the guard
+		// exists for — picked up by the watchdog's own history reads.
+		const now = Date.now()
+		const history: Record<string, unknown[]> = {
+			[SID]: [userMessage("go", now - 60_000, "msg_u1")],
+		}
+		const h = await setup(history, { baseBackoffMs: 1000, maxBackoffMs: 1000, debug: true })
+		push(h, "session.execution.started", SID)
+		// Wait for the watch to actually go busy before the silence window
+		// starts: under a saturated event loop the started event can sit
+		// unprocessed, and everything after it (chunk silence, declaration,
+		// arm) shifts by the same lag. Polling the precondition beats
+		// assuming it (1-in-14 flake, 2026-10-11).
+		expect(await waitForLog(h.logFile, "idle/unknown -> busy", 5000)).toBe(true)
+		// Wait out the 300ms chunk timeout until the watchdog declares the
+		// stall and arms the timer (200ms fuse from there).
+		const armed = await waitForLog(h.logFile, "resume attempt 1/3", 5000)
+		expect(armed).toBe(true)
+		history[SID] = [
+			userMessage("go", now - 60_000, "msg_u1"),
+			userMessage("go on, I am here", Date.now(), "msg_u2"),
+		]
+		// The guard logs when it parks; absence of injection alone would not
+		// distinguish "parked" from "never fired".
+		const parked = await waitForLog(h.logFile, "parking recovery", 5000)
+		await teardown(h)
+		expect(parked).toBe(true)
+		expect(h.injected.filter((i: any) => i.sid === SID)).toHaveLength(0)
 	})
 })

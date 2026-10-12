@@ -3159,6 +3159,12 @@ export default define({
 				`${short(sid)} stall detected (${reason}) — resume attempt ${attempt}/${maxRetries} in ${delay}ms`,
 			)
 			if (w.recoverTimer) clearTimeout(w.recoverTimer)
+			// When this timer was armed: a genuine user message arriving after
+			// this point means the user took over mid-backoff, and firing into
+			// their live turn would interrupt it ("Step interrupted"). The
+			// freshness check below cannot see it — event-pump lag means their
+			// execution.started may not have been processed yet when we fire.
+			const armedAt = Date.now()
 			w.recoverTimer = setTimeout(async () => {
 				w.recoverTimer = null
 				// Disposed instances must stay silent: a superseded setup's
@@ -3170,6 +3176,15 @@ export default define({
 					// (a normal completion clears pendingRecoveryArmed) or the
 					// user took over.
 					if (w.userCancelled || w.gaveUp) return
+					// A genuine user message newer than the arm means the user took
+					// over during the backoff wait — park this recovery, do not fire
+					// into their turn. Own prompts never advance lastGenuineUserAt,
+					// so our own injections cannot trip this. (2026-10-11: continues
+					// landing right after user statements.)
+					if (w.lastGenuineUserAt > armedAt) {
+						dbg(`${short(sid)} genuine user message after arm — parking recovery`)
+						return
+					}
 					if (w.status === "idle" && !w.pendingRecoveryArmed) return // recovered by itself meanwhile
 					// A turn sent to a busy session interrupts its in-flight step
 					// ("Step interrupted"). Never interrupt mid-compaction, and
