@@ -169,10 +169,12 @@ describe("v2: busy-stall stands down while a turn waits on the user", () => {
 		// young-unfinished guard defers when events were lost (e.g. reload).
 		// So this fixture uses a part old enough to actually be wedged; the
 		// young side of the boundary is pinned by the stall-shell-guard suite.
+		// Uses `write`, not `shell`: shells get a longer stall-path TTL of
+		// their own (10 min), so a 120s shell is still working, not wedged.
 		const now = Date.now()
 		const h = await setup(
 			{
-				[SID]: [userMessage("go", now - 600_000), assistantWithTool("shell", "running", now - 120_000)],
+				[SID]: [userMessage("go", now - 600_000), assistantWithTool("write", "running", now - 120_000)],
 			},
 			[SID],
 		)

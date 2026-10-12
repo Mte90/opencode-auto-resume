@@ -597,6 +597,21 @@ const DEFAULT_GRACE_PERIOD_MS = 3_000
  * design). 60s gives 20x margin over that while cutting the ~3min stall-window
  * wait the pass used before (ses_edf403f5: parked 94 min on a wedged compress). */
 const DEFAULT_STUCK_TOOL_AGE_MS = 60_000
+/**
+ * Stall-path patience for tools that are legitimately long. A 60s gate fits
+ * interactive tools (read/write/edit: seconds-scale work), but a `shell`
+ * call is routinely minutes long — a full test suite runs 400s+ while
+ * emitting no events. Judging it by the 60s gate declared live work wedged:
+ * 2026-10-11, three stall injections in nineteen minutes onto a session
+ * running `bun test`, one telling the user to abandon the run. Shells get
+ * 10 minutes on the STALL path only: past that a shell is wedged for real
+ * and the stall answers normally. The idle stuck pass (turn already ended —
+ * an unfinished call there is abandoned, not running) keeps the flat 60s
+ * gate for every tool, so this changes WHEN a busy stall fires, never
+ * whether an abandoned call gets nudged.
+ */
+const LONG_RUNNING_TOOL_STALE_TTL_MS = 10 * 60_000
+const LONG_RUNNING_TOOLS = ["shell"]
 const DEFAULT_MAX_RETRIES = 3
 /** Consecutive failure-driven recoveries tolerated before the failure-loop
  * latch stands the session down. Counts recoveries with no model output
@@ -3182,7 +3197,7 @@ export default define({
 						dbg(`${short(sid)} waiting on user input at inject time — not interrupting`)
 						return
 					}
-const stallText = await buildStallContinueText(sid, reason, attempt)
+					const stallText = await buildStallContinueText(sid, reason, attempt)
 					const ok = await injectOnce(sid, stallText, "stalled — retrying", false, true)
 					w.pendingRecoveryArmed = false
 					if (ok) {
@@ -5071,6 +5086,16 @@ const stallText = await buildStallContinueText(sid, reason, attempt)
 		}
 
 		/**
+		 * Stall-path young gate, per tool. Interactive tools answer in seconds,
+		 * so 60s of event-silence means wedged; shells routinely run minutes
+		 * with no events, so they get the long TTL. Exempt names are handled
+		 * by their own branch at each call site, never here.
+		 */
+		function stallYoungAgeMsFor(name: string): number {
+			return LONG_RUNNING_TOOLS.includes(name) ? LONG_RUNNING_TOOL_STALE_TTL_MS : stuckToolAgeMs
+		}
+
+		/**
 	 * Durable liveness: is a tool call still unfinished in this session's HISTORY?
 	 *
 	 * `openShells` and `inflightTools` are per-instance event derivations: a
@@ -5118,7 +5143,7 @@ const stallText = await buildStallContinueText(sid, reason, attempt)
 						if (age < NEVER_INTERRUPT_STALE_TTL_MS) return true
 						continue
 					}
-					if (age < stuckToolAgeMs) return true
+					if (age < stallYoungAgeMsFor(name)) return true
 				}
 			}
 			return false
@@ -5317,7 +5342,7 @@ const stallText = await buildStallContinueText(sid, reason, attempt)
 						}
 							continue
 					}
-					if (age < stuckToolAgeMs) youngTool = true
+					if (age < stallYoungAgeMsFor(rec.name)) youngTool = true
 				}
 					if (youngTool) continue
 				}

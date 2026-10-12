@@ -236,9 +236,11 @@ describe("v2: the STALL WATCHDOG defers on unfinished work in history", () => {
 		// The age gate matters: a part older than the stuck-tool window belongs
 		// to the stuck-tool pass, which already nudged the model to proceed
 		// without it. Letting the stall answer there is the designed backstop.
+		// Uses `write` (60s gate), not `shell`: shells get a longer stall-path
+		// TTL of their own (10 min), pinned by the test below.
 		const now = Date.now()
 		const h = await setup({
-			history: [userMessage(now - 600_000), assistantWithTool("shell", "running", now - 120_000)],
+			history: [userMessage(now - 600_000), assistantWithTool("write", "running", now - 120_000)],
 		})
 		h.streamRef.push(ev("session.execution.started"))
 		await wait(10)
@@ -410,5 +412,48 @@ describe("v2: a stalled turn parked on a wedged tool gets the stuck prompt", () 
 		await teardown(h)
 		expect(h.injected.length).toBeGreaterThan(0)
 		expect(h.injected[0]?.text ?? "").toMatch(/stalled \(attempt/)
+	})
+})
+
+/**
+ * Shells get stall-path patience of their own.
+ *
+ * Production 2026-10-11, three injections in nineteen minutes onto a session
+ * running `bun test`: a shell stays event-silent for its whole run (437s),
+ * so the flat 60s young gate declared live work wedged. A shell younger than
+ * the long TTL is working, not stalled — even past the interactive gate.
+ * Past the TTL a shell is wedged for real and the stall answers normally.
+ * (An earlier attempt gated the stall timer on user recency instead; two
+ * CONTROLs with 60s-old fixtures proved that wrong and it was reverted —
+ * recency cannot separate a live conversation from a stall the user just
+ * fed. Tool age can.)
+ */
+describe("v2: the stall timer gives shells their own TTL", () => {
+	test("a 120s-old running shell still defers the stall", async () => {
+		const now = Date.now()
+		const h = await setup({
+			history: [userMessage(now - 600_000), assistantWithTool("shell", "running", now - 120_000)],
+		})
+		h.streamRef.push(ev("session.execution.started"))
+		await wait(10)
+		h.streamRef.push(ev("session.step.started"))
+		await wait(1600)
+		await teardown(h)
+		expect(h.injected).toEqual([])
+	})
+
+	test("CONTROL: a 120s-old running write still stalls", async () => {
+		// Without this, the test above could pass by the history read never
+		// engaging: the interactive gate must still fire past 60s.
+		const now = Date.now()
+		const h = await setup({
+			history: [userMessage(now - 600_000), assistantWithTool("write", "running", now - 120_000)],
+		})
+		h.streamRef.push(ev("session.execution.started"))
+		await wait(10)
+		h.streamRef.push(ev("session.step.started"))
+		await wait(1600)
+		await teardown(h)
+		expect(h.injected.length).toBeGreaterThan(0)
 	})
 })
