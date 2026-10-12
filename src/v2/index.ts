@@ -2908,6 +2908,8 @@ export default define({
 			w.gaveUp = false
 			// Same observable-episode rule for the empty-idle single-shot.
 			w.emptyIdleNudged = false
+			// A genuine turn is also a new counting episode.
+			w.episodeRecovers = 0
 			// Deliberately does not recordContinue(): our own escalation must not feed
 			// the loop guard that triggered it, or the guard trips on its own output.
 			// Through the same choke point as every other path. The runtime
@@ -5949,6 +5951,8 @@ export default define({
 						w.gaveUp = false
 						// Same for the empty-idle single-shot: a genuine turn is
 						// a new episode, so the instant nudge re-arms here.
+						// Same for the recovery count.
+						w.episodeRecovers = 0
 						w.emptyIdleNudged = false
 						// Drop the durable arm with the in-memory one. This delete is
 						// what lets restore skip the history read: no record means the

@@ -233,6 +233,32 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		expect(attempts.slice(0, 2)).toEqual(["1", "1"])
 	})
 
+	test("a genuine turn restarts the retry count but not the ladder", async () => {
+		// The count answers "which recovery of the episode", and a model turn
+		// not caused by us is a new episode — even when the stall ladder
+		// correctly keeps climbing through it (own inject newer than any
+		// genuine user message, so no ladder reset). Fires read attempt 1/3
+		// then 2/3, but retry #1 both times.
+		const retryOf = (text: string | undefined): string | null => {
+			const m = /retry #(\d+)/.exec(text ?? "")
+			return m ? m[1] : null
+		}
+		const h = await setup()
+		push(h, "session.execution.started", SID)
+		await wait(10)
+		await waitFor(() => h.injected.length >= 1)
+		push(h, "session.idle", SID)
+		await wait(10)
+		// No new user message: the next start is the model acting on its own
+		// (selfRecovery was cleared as stale by the idle above), so genuine.
+		push(h, "session.execution.started", SID)
+		await waitFor(() => h.injected.length >= 2)
+		const attempts = h.injected.map((i: any) => attemptOf(i.text))
+		const retries = h.injected.map((i: any) => retryOf(i.text))
+		await teardown(h)
+		expect(attempts.slice(0, 2)).toEqual(["1", "2"])
+		expect(retries.slice(0, 2)).toEqual(["1", "1"])
+	})
 	test("each fire carries its episode retry number", async () => {
 		// The ladder rung restarts on progress, so consecutive fires can all
 		// read "attempt 1/3" while being the 1st, 2nd, ... recovery of the
