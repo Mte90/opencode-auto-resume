@@ -5936,6 +5936,14 @@ export default define({
 				case "session.idle": {
 					const sid = sidOf(ev)
 					if (!sid) return
+					// Turn-identity probe (2026-10-12): the idle evaluation judges
+					// "whatever is newest" (w.lastAssistantText || history read),
+					// which goes stale across markBusy transitions and lets stale
+					// tails defeat every guard, including the approval-question
+					// ones. If this event carries the ended turn's message id,
+					// the evaluation can read THAT turn instead of a snapshot.
+					// Logging only — remove once answered.
+					dbg(`${short(sid)} idle event data keys: ${JSON.stringify(Object.keys((ev as { data?: unknown })?.data ?? {}))}`)
 					// Counted across every tracked session, and read *before* this one goes
 					// idle, because the transition is the signal: a session leaving a crowd
 					// of busy sessions behind it. Sampling after markIdle would make every
