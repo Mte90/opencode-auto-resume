@@ -233,6 +233,32 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		expect(attempts.slice(0, 2)).toEqual(["1", "1"])
 	})
 
+	test("each fire carries its episode retry number", async () => {
+		// The ladder rung restarts on progress, so consecutive fires can all
+		// read "attempt 1/3" while being the 1st, 2nd, ... recovery of the
+		// episode. Without the retry count those fires read byte-identically
+		// and cannot be reconciled from the transcript (2026-10-12: fourteen
+		// 1/3s in a row, never climbing, never explained).
+		const retryOf = (text: string | undefined): string | null => {
+			const m = /retry #(\d+)/.exec(text ?? "")
+			return m ? m[1] : null
+		}
+		const h = await setup()
+		push(h, "session.execution.started", SID)
+		await wait(10)
+		await waitFor(() => h.injected.length >= 1)
+		h.streamRef.push({
+			type: "shell.created",
+			data: { info: { id: "sh_1", command: "sleep 1", status: "running", metadata: { sessionID: SID } } },
+		})
+		await wait(10)
+		h.streamRef.push({ type: "shell.exited", data: { id: "sh_1", status: "exited", exit: 0 } })
+		await waitFor(() => h.injected.length >= 2)
+		const retries = h.injected.map((i: any) => retryOf(i.text))
+		await teardown(h)
+		expect(retries.slice(0, 2)).toEqual(["1", "2"])
+	})
+
 	test("an idle between our send and the model's start does not restart the ladder", async () => {
 		// ses_ee14d727, 2026-10-09: 1/3, then 1/3 again. Resets live only
 		// where a new episode is observable — a genuine user message newer than

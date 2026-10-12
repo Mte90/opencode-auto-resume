@@ -3058,9 +3058,14 @@ export default define({
 			// (Predicate hoisted to module scope: recover reuses it for the
 			// success-progress episode reset.)
 			const isSilence = isSilenceReason(reason)
+			// The retry count is the episode-scoped fire number, not the ladder
+			// rung: after N progress restarts the next fire still reads
+			// "attempt 1/3" while being the (N+1)-th recovery of the episode.
+			// Without it every fire in a filler loop reads identically and the
+			// numbers cannot be reconciled from the transcript.
 			const head = [
 				isSilence ? null : reason,
-				`attempt ${attempt}/${maxRetries}`,
+				`attempt ${attempt}/${maxRetries} (retry #${w.episodeRefires + 1})`,
 				isSilence ? `idle ${hms(elapsed)}` : null,
 				now,
 			]
