@@ -164,6 +164,11 @@ interface SessionWatch {
 	 * only by a genuine user message — never by lifecycle transitions.
 	 */
 	episodeRefires: number
+	/** Recoveries sent this episode, all paths that build stall text. Unlike the
+	 * ladder rung (which progress restarts) and episodeRefires (which counts only
+	 * progress restarts), this counts every fire so the nudge text can say which
+	 * recovery of the episode it is. Reset at the same genuine-episode sites. */
+	episodeRecovers: number
 	lastRetryAt: number
 	/** Last wall-clock a user-visible quota notice was sent (first arm +
 	 * budget-exhausted). One notice per episode: the stand-down itself is
@@ -2018,6 +2023,7 @@ export default define({
 					userCancelledAt: 0,
 					resumeAttempts: 0,
 					episodeRefires: 0,
+					episodeRecovers: 0,
 					lastRetryAt: 0,
 					quotaNoticedAt: 0,
 					gaveUp: false,
@@ -3058,14 +3064,14 @@ export default define({
 			// (Predicate hoisted to module scope: recover reuses it for the
 			// success-progress episode reset.)
 			const isSilence = isSilenceReason(reason)
-			// The retry count is the episode-scoped fire number, not the ladder
-			// rung: after N progress restarts the next fire still reads
-			// "attempt 1/3" while being the (N+1)-th recovery of the episode.
-			// Without it every fire in a filler loop reads identically and the
-			// numbers cannot be reconciled from the transcript.
+			// The retry count is the episode's recovery number, not the ladder
+			// rung: after N recoveries the next fire reads "attempt 1/3" just
+			// the same when progress restarted the rung. Without it every fire
+			// in a filler loop reads identically and the numbers cannot be
+			// reconciled from the transcript.
 			const head = [
 				isSilence ? null : reason,
-				`attempt ${attempt}/${maxRetries} (retry #${w.episodeRefires + 1})`,
+				`attempt ${attempt}/${maxRetries} (retry #${w.episodeRecovers})`,
 				isSilence ? `idle ${hms(elapsed)}` : null,
 				now,
 			]
@@ -3222,6 +3228,10 @@ export default define({
 						dbg(`${short(sid)} waiting on user input at inject time — not interrupting`)
 						return
 					}
+					// Count this fire now: the text below reads the count, and every
+					// return past this point still decided to recover (declines all
+					// returned earlier), so the number matches injections decided.
+					w.episodeRecovers++
 					const stallText = await buildStallContinueText(sid, reason, attempt)
 					const ok = await injectOnce(sid, stallText, "stalled — retrying", false, true)
 					w.pendingRecoveryArmed = false
@@ -4019,6 +4029,7 @@ export default define({
 			// A genuine user message also closes any refire episode: the next
 			// stall starts back at the base fuse.
 			w.episodeRefires = 0
+			w.episodeRecovers = 0
 			// And it re-opens a stood-down session: the stall gaveUp latch
 			// clears on genuine user takeovers, never on transitions.
 			w.gaveUp = false
