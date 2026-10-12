@@ -3186,7 +3186,12 @@ export default define({
 					// into their turn. Own prompts never advance lastGenuineUserAt,
 					// so our own injections cannot trip this. (2026-10-11: continues
 					// landing right after user statements.)
-					if (w.lastGenuineUserAt > armedAt) {
+					// >=, not >: a message processed in the SAME sweep as the
+					// declaration carries the sweep's own timestamp, so strict >
+					// would let it through and fire into the user's live turn
+					// within the same minute (2026-10-12: comment 19:27, fire
+					// 19:28). Equal timestamps mean same-sweep causality.
+					if (w.lastGenuineUserAt >= armedAt) {
 						dbg(`${short(sid)} genuine user message after arm — parking recovery`)
 						return
 					}
@@ -3984,6 +3989,13 @@ export default define({
 			// back to the present — genuine past timestamps pass through.
 			w.lastGenuineUserAt =
 				typeof latest.at === "number" ? Math.min(latest.at, Date.now()) : Date.now()
+			// A genuine user message is activity: it resets the silence clock,
+			// not just the ladder count. Without this, a message the plugin
+			// only learns about via a history read leaves lastActivityAt stale,
+			// and the watchdog declares a stall on a session the user just
+			// spoke to. touch() itself debounces bursts (minActivityGapMs), and
+			// this runs only for genuinely-new, non-own messages.
+			touch(sid)
 			// A genuine new user message is also what re-opens a latched
 			// completion: new instructions mean the "done" being tracked is no
 			// longer the question. This is the ONLY place the latch clears besides
