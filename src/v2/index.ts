@@ -6000,6 +6000,12 @@ export default define({
 					const total = tokenTotalOf(ev.data?.tokens)
 					if (total <= 0) return
 					const w = ensureWatch(sid)
+					// Token flow is activity: a turn generating for minutes straight
+					// must not read as idle. Touch ONLY on growth — a flat total
+					// means nothing resumed, so the clock goes stale and the
+					// stall answers on schedule (2026-10-13: three recoveries
+					// into a live 1.9M-token turn).
+					if (total > w.lastTokenTotal) touch(sid)
 					w.lastTokenTotal = total
 					dbg(`${short(sid)} usage: ${total} tokens`)
 					return
