@@ -2014,6 +2014,19 @@ export default define({
 
 		function ensureWatch(sid: string): SessionWatch {
 			let w = sessions.get(sid)
+			// Migrate watches adopted from older builds. The sessions map is shared
+			// across setup re-runs (and the loader re-evaluates this bundle on every
+			// config reload), so a watch created before a field existed reads it as
+			// undefined: `undefined++` is NaN (shipped as "retry #NaN", 2026-10-12)
+			// and `for..of undefined` throws. Every field added after registry
+			// sharing began needs a default here, not just in the constructor below.
+			if (w) {
+				w.emptyIdleNudged ??= false
+				w.episodeRecovers ??= 0
+				w.inflightTools ??= new Map()
+				w.lastStuckToolCheck ??= 0
+				return w
+			}
 			if (!w) {
 				w = {
 					createdAt: Date.now(),
@@ -5384,7 +5397,10 @@ export default define({
 				{
 					const now = Date.now()
 					let youngTool = false
-					for (const [, rec] of w.inflightTools) {
+					// ?? []: a watch adopted from a pre-map build may reach this loop
+					// before any ensureWatch call migrates it (the sweep iterates the
+					// map directly). A missing map reads as no tools, never a throw.
+					for (const [, rec] of w.inflightTools ?? []) {
 						const age = now - rec.at
 						if (neverInterruptTools.includes(rec.name)) {
 							if (age < NEVER_INTERRUPT_STALE_TTL_MS) {

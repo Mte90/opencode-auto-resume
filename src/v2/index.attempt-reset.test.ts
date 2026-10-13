@@ -367,4 +367,34 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		expect(text).not.toMatch(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/)
 	})
 
+	test("watches adopted from older builds get migrated, never NaN", async () => {
+		// The sessions map survives reloads, so a watch created before a field
+		// existed reads it as undefined: `undefined++` rendered as "retry #NaN"
+		// in production (2026-10-12), and `for..of undefined` would throw the
+		// whole sweep. Stripping the new fields off the live watch simulates
+		// the adopted old-build object; the next stall must still fire with a
+		// numeric retry count.
+		//
+		// Own scope + shared map: the default harness keeps its sessions map
+		// in the setup closure (unreachable from here), so this test opts
+		// into the shared map to reach the live object, on a scope no other
+		// test uses.
+		const SCOPE = `${LOG_SALT}-migrate`
+		const h = await setup({ shareWatchState: true, registryScope: SCOPE })
+		push(h, "session.execution.started", SID)
+		await wait(10)
+		await waitFor(() => h.injected.length >= 1)
+		const reg = (globalThis as any)[`__auto_resume_singleton__:${process.pid}:${SCOPE}`]
+		const w = reg.sessions.get(SID)
+		delete (w as any).episodeRecovers
+		delete (w as any).inflightTools
+		delete (w as any).emptyIdleNudged
+		delete (w as any).lastStuckToolCheck
+		await waitFor(() => h.injected.length >= 2)
+		const text = (h.injected[1] as any)?.text ?? ""
+		await teardown(h)
+		expect(text).toMatch(/retry #\d+/)
+		expect(text).not.toContain("NaN")
+	})
+
 })
