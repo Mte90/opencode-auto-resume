@@ -1,7 +1,7 @@
 # Installing opencode-auto-resume on OpenCode v2
 
 This guide installs the **v2 port** of the plugin. It targets the stable v2
-plugin API (`@opencode/plugin` 2.0.5, shipped with `opencode` v2.0.5).
+plugin API (`@opencode/plugin` 2.0.5+, shipped with `opencode` v2.0.5; live-verified on 2.0.27 — the 2.0.5→2.0.27 surface diff is additive-only).
 
 > Coming from OpenCode v1? Read [`migration.md`](./migration.md) first — the v1
 > plugin file does **not** run on v2 and must be replaced by the v2 port.

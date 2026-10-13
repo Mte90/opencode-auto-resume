@@ -2,9 +2,19 @@
 
 **Plugin for [OpenCode](https://github.com/anomalyco/opencode) that automatically detects and recovers from LLM session failures — stalls, broken tool calls, hallucination loops, stuck subagent parents, and more. Fully silent, zero UI pollution.**
 
+> **Which instructions?** This README covers both builds: unmarked sections
+> describe behavior shared by v1 and v2, and build-specific notes say so
+> inline ("On v2…", "Both builds…"). On **v2**, install first via
+> [docs/v2/installing.md](docs/v2/installing.md), then read here — the
+> [Architecture](#architecture) section is v2's flow with the v1 shape kept
+> as a three-line historical note.
+
 > **OpenCode v2 is here (stable).** This repo ships both the v1 plugin
 > (`src/index.ts`) and a complete v2 port (`src/v2/index.ts`) targeting the
-> stable `@opencode/plugin` 2.0.5 API. Install it with the
+> stable `@opencode/plugin` 2.0.5+ API (verified live against 2.0.27; the
+> 2.0.5→2.0.27 surface diff is additive-only — new experimental WS hooks,
+> `remove`/`compact` on the session domain, tool `list()` — nothing the
+> plugin uses was removed or reshaped). Install it with the
 > [v2 install guide](docs/v2/installing.md); see
 > [docs/v2/migration.md](docs/v2/migration.md) for the full migration notes.
 
@@ -50,7 +60,7 @@ The model generates the same broken output repeatedly. Each `continue` just pick
 
 A separate **tool-call loop detector** catches the model calling the same tool 3+ consecutive times (or repeating patterns of length 2-5 occurring at least three times). When detected, it emits `TOOL_LOOP_RECOVERY_PROMPT` (at most twice per busy turn) to break the loop instead of blindly continuing.
 
-Loop detection runs in two places. At idle, tool names are scanned from recent assistant messages. **Live**, every `tool.execute.before` hook fingerprints the call as `tool name + arguments` — so a subagent stuck re-reading the same file/range (even alternating between two near-identical argument sets, which never produces 3 consecutive identical calls) is caught after 6+ calls in the repeating cycle. On live detection the plugin aborts the running turn immediately (this is the sanctioned exception to the never-abort-busy rule: 6+ identical name+args fingerprints prove a hallucinated loop, and the current call has not started yet) and then sends `TOOL_LOOP_RECOVERY_PROMPT`. Esc-cancelled sessions are never touched.
+Loop detection runs in two places. At idle, tool names are scanned from recent assistant messages. **Live**, every `tool.execute.before` hook fingerprints the call as `tool name + arguments` — so a subagent stuck re-reading the same file/range (even alternating between two near-identical argument sets, which never produces 3 consecutive identical calls) is caught after 6+ calls in the repeating cycle. (v1 hooks; v2 fingerprints the same way from `session.tool.called` events via `trackToolCall`.) On live detection the plugin aborts the running turn immediately (this is the sanctioned exception to the never-abort-busy rule: 6+ identical name+args fingerprints prove a hallucinated loop, and the current call has not started yet) and then sends `TOOL_LOOP_RECOVERY_PROMPT`. Esc-cancelled sessions are never touched.
 
 ---
 
@@ -101,7 +111,7 @@ _Motivated by:_
 
 ### Streaming failure recovery
 
-The AI provider's streaming response can fail mid-stream (connection reset, timeout, socket close). When the provider reports an error whose **name** matches `streamingFailureErrorNames` (exact, case-sensitive) or whose **message** matches `streamingFailureMessagePatterns` (regex, case-insensitive), the plugin arms a deferred recovery instead of relying only on the generic stall timeout. Invalid regex patterns fall back to substring matching.
+The AI provider's streaming response can fail mid-stream (connection reset, timeout, socket close). When the provider reports an error whose **name** matches `streamingFailureErrorNames` (exact, case-sensitive) or whose **message** matches `streamingFailureMessagePatterns` (regex, case-insensitive), the plugin arms a deferred recovery instead of relying only on the generic stall timeout. Invalid regex patterns fall back to substring matching. (Same classification on both builds; what happens *after* classification differs — v1 flow below, v2 differences noted inline.)
 
 **Default error names:**
 - `ProviderError`, `APIError`, `StreamError`, `ConnectionError`, `TimeoutError`
@@ -110,6 +120,12 @@ The AI provider's streaming response can fail mid-stream (connection reset, time
 - `streaming response failed`, `stream.*fail`, `connection.*reset`, `connection.*closed`
 
 #### Recovery behavior
+
+v1 flow (v2 classifies identically — same option names — but feeds the
+unified `recover()` ladder instead: consecutive failure recoveries with no
+model output between them count up in `consecFailureRecovers` and latch
+`failureLoopLatched` rather than cycling forever; there is no
+`pendingRecovery*` state on v2):
 
 1. **Detection**: `session.error` is classified via `isStreamingFailure()` against the configured error names and message patterns
 2. **State transition**: the session's `pendingRecovery` flag is armed with the error name (`pendingRecoveryReason`) and timestamp (`pendingRecoveryAt`)
@@ -125,26 +141,28 @@ Add to your plugin options (in `opencode.jsonc`):
 {
   "streamingFailureErrorNames": ["ProviderError", "APIError", "StreamError", "ConnectionError", "TimeoutError"],
   "streamingFailureMessagePatterns": ["streaming response failed", "stream.*fail", "connection.*reset", "connection.*closed"],
-  "maxRecoveryRetries": 2,
+  "maxRetries": 2,
   "baseBackoffMs": 1000,
   "maxBackoffMs": 8000
 }
 ```
+(`maxRetries` is the canonical name on both builds; v2 still accepts the v1
+alias `maxRecoveryRetries`.)
 
-#### State machine addition
+#### State machine addition (v1; v2 equivalents in parentheses)
 
 New per-session recovery fields added to the state machine:
-- `pendingRecovery` — failure detected, recovery armed
-- `pendingRecoveryReason` — error name that triggered the recovery
-- `pendingRecoveryAt` — detection timestamp (backoff anchor)
-- `recoveryAttempts` — recovery attempt counter
-- `watchdogRetryGuard` — watchdog retry in progress (keeps the recovery armed)
+- `pendingRecovery` — failure detected, recovery armed (v2: `pendingRecoveryArmed` latch)
+- `pendingRecoveryReason` — error name that triggered the recovery (v2: folded into the recover reason string)
+- `pendingRecoveryAt` — detection timestamp (backoff anchor) (v2: same role, unnamed — the timer closure holds it)
+- `recoveryAttempts` — recovery attempt counter (v2: `resumeAttempts`, plus `consecFailureRecovers` for the failure loop)
+- `watchdogRetryGuard` — watchdog retry in progress (keeps the recovery armed) (v2: `recovering` flag + `recoverTimer` handle)
 
 Recovery chain: `pendingRecovery` → recovery attempt → `recoveryAttempts` retry → `abort+resume` → `gaveUp`.
 
-See [Recovery Flow Documentation](docs/architecture/recovery-flow.md) for the full state machine.
+See [Architecture](#architecture) for the v2 flow.
 
-#### Example scenario
+#### Example scenario (v1 flow; v2 answers the same scenario through the unified ladder above)
 
 ```
 1. AI provider starts streaming response
@@ -186,7 +204,7 @@ A session can fill its usable context window without stalling — it just keeps 
 
 ### Active-tool safety guard
 
-Before **any** abort, two guards run in order: the primary deterministic in-flight counter maintained by the `tool.execute.before`/`tool.execute.after` hooks (`hasInflightTools()`), then a polled `checkSessionHasActiveTool()` fallback for sessions discovered without hooks. If a tool is running, the abort is skipped. This prevents the plugin from killing a long-running build, test suite, or command — even when it looks like a stall.
+Before **any** abort, two guards run in order: the primary deterministic in-flight counter maintained by the `tool.execute.before`/`tool.execute.after` hooks (`hasInflightTools()`), then a polled `checkSessionHasActiveTool()` fallback for sessions discovered without hooks. (v1 hooks; v2 derives the same state from `session.tool.called`/`success`/`failed` events — `pendingTools` plus per-call start times.) If a tool is running, the abort is skipped. This prevents the plugin from killing a long-running build, test suite, or command — even when it looks like a stall.
 
 _Motivated by:_
 - [#26063](https://github.com/anomalyco/opencode/issues/26063) — Tool execution aborted/terminated
@@ -208,9 +226,9 @@ _Motivated by:_
 
 ### ESC cancel respected
 
-User presses ESC to cancel a request. The plugin detects `MessageAbortedError` and marks sessions as cancelled — regardless of their tracked status, so a late status flip to idle before the error cannot miss the latch — and never resumes them. Aborts initiated by the plugin itself (`pluginAbortInFlight`) are excluded, so recovery aborts are not mistaken for ESC. The grace period (`gracePeriodMs`) also lets late ESC/status events arrive before any action.
+User presses ESC to cancel a request. The plugin detects `MessageAbortedError` and marks sessions as cancelled — regardless of their tracked status, so a late status flip to idle before the error cannot miss the latch — and never resumes them. Aborts initiated by the plugin itself (`pluginAbortInFlight`) are excluded, so recovery aborts are not mistaken for ESC. (v1 mechanism; v2 reads `session.execution.interrupted` by reason — only genuine user stops latch — and tracks own aborts with the self-abort window instead.) The grace period (`gracePeriodMs`) also lets late ESC/status events arrive before any action.
 
-The back-off lifts as soon as the user sends a new prompt in that session (`chat.message` hook): a fresh user message starts a new round of work, so auto-resume re-arms. The plugin's own recovery prompts do not re-arm it. The same applies to the `task_complete` latch.
+The back-off lifts as soon as the user sends a new prompt in that session (`chat.message` hook; v2 reads new inbound messages out of history instead): a fresh user message starts a new round of work, so auto-resume re-arms. The plugin's own recovery prompts do not re-arm it. The same applies to the `task_complete` latch.
 
 _Motivated by:_
 - [#28453](https://github.com/anomalyco/opencode/issues/28453) — ACP session/cancel emits agent_error for MessageAbortedError before cancelled result
@@ -231,11 +249,43 @@ Repeat calls with no new user message in between are guarded: the first acknowle
 
 The todo gate is skipped for subagents: a child was never asked to do the parent's open items, so gating its report on them would block it on work outside its scope.
 
+**Recommended operator instructions.** A) is for global use. B) is for
+scheduled-job prompts where stalls cost real time:
+
+A) When all requested work is finished: if todo tools are available,
+mark every todo complete first — unfinished items will block the completion
+signal and you'll be asked to continue them instead. Then call the
+`task_complete` tool if one exists; otherwise end your reply with TASK
+COMPLETE on its own last line (a trailing 🎉 is also accepted). Call it
+once — repeated completion calls mean something is still open, so go do
+that instead. Do not end with a question unless you actually need the user.
+Put A) in your AGENTS.md if you have one, or create one — at your project
+root for that project, or at `~/.config/opencode/AGENTS.md` for global
+effect across every session.
+
+B) When the work is done, in order: (1) if todo tools are available,
+mark all todos complete; (2) call `task_complete` if the tool exists, else
+end your reply with TASK COMPLETE on its own last line (a trailing 🎉 is
+also accepted); (3) do not end with a question unless you actually need the
+user — an unanswered question reads as still-working. Never call
+`task_complete` with items still open; it will be sent back with the list.
+Put B) in the scheduled-job prompt itself, next to the deliverables list.
+
+Every capability above is conditional on existing — the text fallback is
+the only step with zero dependencies, so a bare setup degrades to "end
+with TASK COMPLETE" rather than misfiring. Nothing else is guaranteed to
+exist, so these two locations cover it: the global file catches every
+session, the job prompt catches the runs that cost real time.
+
 ---
 
 ### 🎉 emoji completion
 
-An assistant message ending with 🎉 resets the tool-text timer and prevents a trigger — the emoji signals the agent considers the task complete.
+An assistant message ending with 🎉 latches completion exactly the way a
+trailing `TASK COMPLETE` does — todo cross-check first, latch plus early
+return on success, reminder nudge instead when work is listed. Neither path
+touches the tool-text timer directly; both prevent triggers by latching and
+ending the inspection. The emoji signals the agent considers the task complete.
 
 The emoji alone is not trusted: a model that finishes early celebrates early, and latching on that turns a false positive into silence. Both builds cross-check the session's todo list first, and with items still open the 🎉 is treated as a false positive — the reminder names what is unfinished instead. See [The todo list](docs/known-issues-v2.md#the-todo-list) for how v2 reads that list.
 
@@ -255,15 +305,41 @@ When the assistant ends a line with `:` ("Next, I will edit the file:") — anno
 
 ### Done-claim verification
 
-If the assistant claims the task is done ("task done", "finished", "all complete") but open todos remain, the plugin sends `DONE_WITHOUT_WORK_PROMPT` asking the agent to verify and finish remaining work. If it claims done with **no** open todos and the response carries no work description, the plugin sends `DONE_WITHOUT_DETAILS_PROMPT` — an imperative prompt demanding a concrete report (files changed, commands run, results). A response that already contains file paths, verification output, or result sections satisfies the demand on its own and never triggers the prompt. The budget is capped at `maxRetries` across busy cycles (going busy no longer re-arms it); only a genuinely new inbound user message re-arms it. Both use the real `todo.updated` event state — not regex on the message text.
+If the assistant claims the task is done ("task done", "finished", "all complete") but open todos remain, the plugin sends `DONE_WITHOUT_WORK_PROMPT` asking the agent to verify and finish remaining work. If it claims done with **no** open todos and the response carries no work description, the plugin sends `DONE_WITHOUT_DETAILS_PROMPT` — an imperative prompt demanding a concrete report (files changed, commands run, results). A response that already contains file paths, verification output, or result sections satisfies the demand on its own and never triggers the prompt. The budget is capped at `maxRetries` across busy cycles (going busy no longer re-arms it); only a genuinely new inbound user message re-arms it. v1 reads the real `todo.updated` event state; v2 reads the message log (newest completed `todowrite` call) — neither uses regex on the message text for the list itself.
+
+---
+
+### Stop statements (v2 only — v1 has no stop vocabulary)
+
+v1 never matched on stop phrasing: the closest it gets is noticing a "task
+completed" text without 🎉 or tool call, and one prompt that tells the model
+*not* to reply with 'done'/'task completed'. Everything below is v2.
+
+End-anchored patterns over the last three lines: bare `TASK COMPLETE`,
+`no action needed`, `stopping here/there/now`, `nothing further/else/pending…`,
+`no further action/work…`, `none pending/left…`, `stopping/halted/pausing…`,
+`that's all…`, `parked/not started…`. A connective clause after the stop
+("Stopping here for a moment, then continuing") disqualifies it — a stop is
+only a stop if it is the last clause. Like every text signal, a stop claim
+with open todos produces the reminder nudge instead of latching.
+
+Mined from live stall replies, all end-anchored the same way: "Stopping
+here." (covered), "Standing by.", "Nothing in progress …" (bare "in
+progress" alone must never match — "work is still in progress" is the
+opposite), bare "Done.". Conversely "I'll report X when it lands" is future
+intent, not completion, and matches nothing — documented here so a future
+widening doesn't swallow it.
 
 ---
 
 ### Todo list nudges
 
-OpenCode v2 removed the built-in `todowrite` and `todoread` tools, the `todo` table, and the `todo.updated` event, so a v2 session has no todo list by default. auto-resume does not own one either. It reads the session message log, where every `todowrite` call is persisted as a tool part carrying the whole list, and the newest completed call is the current list.
+Opencode v1 ships todos out of the box — built-in `todowrite`/`todoread`
+tools, a `todo` table, and a `todo.updated` event the plugin subscribes to
+directly. OpenCode v2 removed all of it (tools, table, and event), so a v2
+session has no todo list by default. auto-resume does not own one either. It reads the session message log, where every `todowrite` call is persisted as a tool part carrying the whole list, and the newest completed call is the current list.
 
-The writer is the todo plugin you install. The upstream [opencode-todolist](https://github.com/aiev/opencode-todolist) restores `todowrite` and `todoread` in v2 and adds a sidebar strip; the confirmed pairing here is `opencode-todo-fork`, verified live. Any plugin that persists `todowrite` calls to the message log should work, but only the fork has been tested.
+The writer is the todo plugin you install. The upstream [opencode-todolist](https://github.com/aiev/opencode-todolist) restores `todowrite` and `todoread` in v2 (its sidebar strip appears in opencode-cli only — no other surface shows it); the confirmed pairing here is `opencode-todo-fork`, verified live. You can view the list at any time with the `/todo` command. Any plugin that persists `todowrite` calls to the message log should work, but only the fork has been tested.
 
 The todo plugin is optional, and without it the unfinished-task nudges never trigger. Every other recovery path runs fine on its own; the list gates exactly the nudges that check it. With no `todowrite` call in the log, auto-resume sees no list and falls back to the older behaviour (latch on the 🎉 emoji, demand a report on a bare done-claim). It never nudges on the strength of a list it failed to read.
 
@@ -296,7 +372,7 @@ Long tool execution or active subagents can look like a stall. Only the session 
 
 ### Spurious error suppression
 
-After normal completion, OpenCode sometimes fires a `session.error`. All logging goes through `ctx.client.app.log()` (zero `console.log`), and errors on already-idle sessions are silently ignored.
+After normal completion, OpenCode sometimes fires a `session.error`. All logging goes through `ctx.client.app.log()` (zero `console.log`) on v1; v2 has no server log sink (`ctx.app` is just name/version/channel), so it appends to its own log file and mirrors to console — errors via `console.error`, the rest via `console.log`. Errors on already-idle sessions are silently ignored on both builds.
 
 _Motivated by:_
 - [#33687](https://github.com/anomalyco/opencode/issues/33687) — Interrupted assistant messages retain non-error finish value (orphan tool-input-start abort)
@@ -336,6 +412,14 @@ Fires when the session still reports **busy** but no events arrived for `chunkTi
 
 **Why `"continue"` cannot unblock a live runner:** in OpenCode ≥ 1.18, `session.prompt()` while the runner is `Running` joins the existing run — the message is admitted to the session inbox and promoted at the next provider-turn boundary. A hung stream never reaches that boundary, so the parked message cannot unblock it; if the run later exits, the message may surface as an unwanted extra turn (token cost, race risk). True transport stalls need abort-first.
 
+**What the prompt looks like.** Stall continues are rich by default
+(`richContinuePrompt`, v2 only): reason, attempt and episode-retry count
+(`attempt 1/3 (retry #4)`), idle duration, local timestamp, open todos, and
+the no-new-work / no-destructive-actions guardrails, e.g.
+`continue — stalled (no activity for 186s). attempt 1/3 (retry #1); idle 3m 6s; Oct 12, 7:37 PM EDT. Only continue…`.
+Set `richContinuePrompt: false` for the bare `"continue"` (v1 behavior), or
+set `continuePrompt` to any custom text, which always wins verbatim.
+
 ### 3. Abort-first recovery
 
 Aborts the active run, then continues. The only family that can unblock a live runner.
@@ -344,11 +428,14 @@ Paths: orphan parent, subagent stuck (parent side), hallucination loop, streamin
 
 ## Architecture
 
-The diagram below is v1's: it is drawn against the v1 SSE event stream, the v1
-`todo.updated` event and the v1 `session.todo()` API. The v2 build reads the same
-information through different doors — `session.usage.updated` for tokens,
-`ctx.model.get()` for the window, `ctx.plugin.list()` to detect magic-context,
-and `ctx.session.context()` for message history.
+v1 consumed the SSE event stream (`session.status`, `session.created`,
+`session.updated`, `session.idle`, `session.interrupted`, `session.error`,
+`todo.updated`, `command.executed`) plus the `chat.message` and tool hooks
+and the `session.todo()` API. v2 has none of those doors: it reads the
+`ctx.event` stream, registers `ctx.session.hook("context"/"prompt")` and
+`ctx.tool.transform`, and gets everything else through the client surfaces
+below. The diagram is v2's; the v1 shape survives only in the prose that
+follows it.
 
 The todo list is the substitution with teeth. The v2 `todo` table has no route and
 emits no event, and **`ctx.storage` cannot be used to read another plugin's todo
@@ -373,45 +460,54 @@ Confirmed working setup: `opencode-todo-fork` (a fork of
 [opencode-todolist](https://github.com/aiev/opencode-todolist)) — verified live (list resolved
 from the log, `/todo` round-trip green). Other todo plugins are unconfirmed:
 anything that persists `todowrite` calls to the message log should read, but
-only the fork has been tested.
+only `opencode-todo-fork` has been tested.
 
 ```
-Any SSE Event
-  ├─ has sessionID? → touchSession(sid) — reset only that session's timer
-  └─ no sessionID → ignore
+V2 event flow (ctx.event stream; every handler resolves the session first):
 
-session.status events:
-  ├─ busy → reset timer, clear retry counters
-  ├─ retry → touch session
-  ├─ interrupted → user cancel: back off until the next user message
-  └─ idle → schedule tool-text check (3s delay)
-              └─ fetch messages → scan for XML / thinking-tool patterns
-                  ├─ found → send recovery prompt (with backoff)
-                  └─ not found → check ready-to-continue / done-claim patterns
-              └─ orphan check: busyCount dropped from >1 to 1?
-                  └─ subagentWaitMs watch → abort + continue
+session.execution.started
+  ├─ own recovery turn (selfRecovery flag)? → consume flag, preserve episode
+  └─ genuine turn → clearLocks, reset quota ladder + stall ladder + gaveUp,
+     refresh model ref; then markBusy either way (per-turn budgets)
 
-todo.updated events:
-  └─ track real todo state (not regex on message text)
-     └─ if missing (no event received): idle path + task_complete
-        fetch on-demand via session.todo() API so the
-        open-todos reminder and the 🎉 completion latch see
-        real state, not a stale empty array.
+session.step.started / .ended, session.tool.progress → touch (activity clock)
+session.tool.called → pendingTools++, record id+name+start in inflightTools
+session.tool.success / .failed → decrement, drop the in-flight record
+session.execution.interrupted (reason=user) → userCancelled: stand down
+  (shutdown/superseded/inactivity reasons do NOT latch)
+session.idle → markIdle → inspectOnIdle:
+  structural (no text needed): dead-stream → stuck-tool → silent-reasoning
+  empty-idle instant nudge (no reply at all, single-shot per episode)
+  then text/pattern: handoff, stand-down, done-claims, celebration/stop latch,
+  unknown-tool check; orphan arming when the busy set drains to one parent
 
-Timer loop (every 5s):
-  for each busy session:
-    ├─ orphan watch active? → wait or abort+continue
-    ├─ busyCount > 1? → skip (subagent running)
-    ├─ active tool running? → skip (never abort tools)
-    └─ idle > 48s? → busyStallStrategy:
-         off → skip · abort → abort+continue
-         else → hallucination loop? abort : continue with backoff
+Watchdog (every checkIntervalMs, default 5s), per busy session:
+  ├─ locks / permission / self-abort window? → skip
+  ├─ open shells running? → wait (working, not stalled)
+  ├─ young in-flight tools (or fresh exempt names)? → wait
+  ├─ waiting on subagents / task-tool children? → wait
+  ├─ user input pending? → wait
+  └─ silence ≥ chunkTimeoutMs(+grace) × fuse → busyStallStrategy:
+       off → skip · abort → abort+resume · else → continue with backoff
+       (a genuine user message inside the backoff parks the recovery)
 
-Periodic (every 60s): session.list() to discover missed sessions
-Periodic: cleanup idle sessions older than 10min or >50 entries
+Discovery (every 60s): session list → adopt missed sessions (markBusy,
+stall clock starts now, never backdated)
+Cleanup: idle sessions older than 10min, or past 50 idle entries (oldest first)
+Singleton: every setup disposes its predecessor (last wins) via a
+process-global registry; watch state is shared across re-evaluations so
+stall memory survives reloads. Test harnesses scope the registry per file.
+
+Events consumed: session.execution.*, session.step.*, session.tool.*,
+session.idle, session.revert.*, session.compaction.*, session.usage.updated,
+session.deleted, permission.asked/replied, shell.created/exited; hooks:
+session "context"/"prompt", tool transform.
 ```
 
-Events consumed: `session.status`, `session.created`, `session.updated`, `session.idle`, `session.interrupted`, `session.error`, `todo.updated`, `command.executed`; hooks: `chat.message`, `tool.execute.before`/`after`, `command.execute.before`.
+The v1 shape this replaced: per-event timer resets off `session.status`
+(busy/idle), tool-text checks on a 3s idle delay, `todo.updated` tracking
+with a `session.todo()` API fallback, and a 48s busy threshold. Tokens now
+come from `session.usage.updated` and the window from `ctx.model.get()`.
 
 ## Installation
 
@@ -522,7 +618,7 @@ Defaults are the same on v1 and v2 unless a row says otherwise.
 | `loopWindowMs` | `600000` | Hallucination loop detection window (10 min) |
 | `streamingFailureErrorNames` | `["ProviderError","APIError","StreamError","ConnectionError","TimeoutError"]` | Error names that classify as streaming failures (exact match) |
 | `streamingFailureMessagePatterns` | `["streaming response failed","stream.*fail","connection.*reset","connection.*closed"]` | Regex patterns (case-insensitive) in error messages indicating streaming failure |
-| `maxRecoveryRetries` | `2` | Max streaming-failure recovery attempts before abort+resume escalation |
+| `maxRecoveryRetries` | `2` | v1 name for the streaming-failure retry budget; v2 canonical is `maxRetries` (alias still accepted) |
 | `toolTextCheckDelayMs` | `3000` | Settle delay before a finished turn's closing text is judged against the done/tool patterns; also the recovery watchdog delay. On v2 only the pattern half is deferred — dead streams are still caught on the idle event, because a stream that died before delivering any text has nothing for those patterns to read. Set `0` to judge on the idle event |
 | `minActivityGapMs` | `1000` | Skip recovery if the session was active within this gap |
 | `warmupMs` | `15000` | Action-intent detection disabled while a session is younger than this |
@@ -549,6 +645,11 @@ Defaults are the same on v1 and v2 unless a row says otherwise.
 | `configProbe` | v2 only, inert | Delivery probe: echoed as `probe=<value>` in the `ready` startup line and read nowhere else. Bump the token to prove `plugins[].options` reaches the plugin without touching a live knob |
 | `rateLimitCooldownsMs` | v2 only | Per-attempt cooldowns (ms) before a rate-limited session may be retried, evaluated as gates on each failure and watchdog tick (no armed timers to lose on reload). Default `[900000, 1800000, 3600000, 7200000 ×5]` ≈ 12h coverage; past the ladder the session stays silent until a genuine user turn. Quota hits never consume the normal retry budget |
 | `sendTimeoutMs` | `30000` | Bound (ms) on any single recovery send (prompt/synthetic); expiry flows into the normal throw path instead of stacking wedged sends |
+| `stuckToolAgeMs` | `60000`, v2 only | A tool call with no result older than this reads as stuck (idle path nudges immediately instead of waiting out the stall window) |
+| `neverInterruptTools` | `["compress"]`, v2 only | Tool names the busy-stall path never interrupts while fresh (case-insensitive); older than 30min they count as wedged like any other tool |
+| `shareWatchState` | `false`, v2 only | Share the session watch map across setup re-runs in one process, so stall memory survives reloads |
+| `registryScope` | unset, v2 only | Selects the process-global registry slot; test-only — production uses the pid-wide slot so reloads supersede cleanly |
+| `quietCorrections` | `true`, v2 only | Feature-correction nudges (unknown-tool, stuck-tool, pattern recoveries) go through the invisible synthetic channel instead of a visible prompt; stall recovery always stays visible |
 
 Message patterns are matched case-insensitively. Error names use exact match.
 
@@ -576,6 +677,6 @@ The plugin handles all recovery automatically — no manual intervention needed.
 | Too slow to react | Decrease `checkIntervalMs` to `2000` |
 | Orphan parent not detected | Increase `subagentWaitMs` to `20000` |
 | Hallucination loop not caught | Decrease `loopMaxContinues` to `2` |
-| Tool-text not detected | Check server logs — requires SDK message fetching |
+| Tool-text not detected | Check server logs — requires SDK message fetching (v1). On v2 the history comes from the client message surface or loopback HTTP — check the plugin log file instead |
 | Long-running tool killed | Should not happen — active-tool guard prevents it. Report a bug. |
 | `Unexpected server error` on startup | Update to v1.1.8+. Caused by non-Plugin exports being treated as plugin entrypoints by OpenCode's loader. Clear the plugin cache (`~/.cache/opencode/packages/opencode-auto-resume@*`) and restart. |

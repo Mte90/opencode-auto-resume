@@ -2,7 +2,7 @@
 
 > Drop this into the PR description (or keep as docs/v2-migration.md upstream).
 > Target: https://github.com/Mte90/opencode-auto-resume
-> Runtime: **opencode v2.0.5 (stable)**. The port has no runtime dependency —
+> Runtime: **opencode v2.0.5+ (stable; live-verified on 2.0.27)**. The port has no runtime dependency —
 > `src/v2/index.ts` imports only `node:fs`, `node:os` and `node:path`, and
 > defines its own `{ id, setup }` helper. `@opencode/plugin@2.0.5` is used to
 > typecheck the source, not to run it.
