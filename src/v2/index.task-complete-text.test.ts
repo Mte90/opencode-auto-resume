@@ -225,4 +225,34 @@ describe("v2: bare TASK COMPLETE latches completion", () => {
 		expect(h.injected.filter((i: any) => i.sid === SID)).toHaveLength(0)
 		await teardown(h)
 	}, 20000)
+
+	test("trailing @N@ boundary marker does not defeat the latch (parts shape)", async () => {
+		// ses_ecca0ad6 (2026-10-13): the harness appends @12@-style boundary
+		// ids to stored message text. Nine "TASK COMPLETE" deliveries ended
+		// with a marker and the stall ladder fired on every one — the
+		// end-anchored match never saw the literal. Markers are metadata,
+		// not model prose, so the predicates strip trailing runs.
+		const h = await setup({ messages: [assistantMsg("Report written.\n\nTASK COMPLETE\n\n@75@")] })
+		push(h, "session.execution.started", SID)
+		await wait(1200)
+		expect(h.injected.filter((i: any) => i.sid === SID)).toHaveLength(0)
+		await teardown(h)
+	}, 20000)
+
+	test("trailing @N@ boundary marker does not defeat the latch (flat shape)", async () => {
+		const h = await setup({
+			messages: [
+				{
+					role: "assistant",
+					id: "msg_a",
+					time: { created: Date.now() - 60_000 },
+					text: "Report written.\n\nTASK COMPLETE\n\n@80@",
+				},
+			],
+		})
+		push(h, "session.execution.started", SID)
+		await wait(1200)
+		expect(h.injected.filter((i: any) => i.sid === SID)).toHaveLength(0)
+		await teardown(h)
+	}, 20000)
 })

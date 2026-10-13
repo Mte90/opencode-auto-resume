@@ -32,6 +32,8 @@ The `busyStallStrategy` option controls this path: `"continue"` (default), `"abo
 
 The plugin extracts the **agent, model, and provider** from the last session message, so it resumes with the exact same configuration the user was using (build, sisyphus, prometheus, etc.).
 
+Token flow counts as activity. The watchdog measures silence from events, but a turn generating tokens for minutes emits no other events — so every `session.usage.updated` event whose token total grew resets the silence clock. A flat total (nothing resumed) does not reset it, so a genuinely wedged session still trips the watchdog on schedule.
+
 _Motivated by:_
 - [#34214](https://github.com/anomalyco/opencode/issues/34214) — Opencode freezes / becomes unresponsive mid-session
 - [#35207](https://github.com/anomalyco/opencode/issues/35207) — Session hangs indefinitely after MCP tool-call — no timeout recovery (deadlock)

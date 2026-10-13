@@ -1089,6 +1089,19 @@ function stripCodeBlocks(text: string): string {
 	return text.replace(/```[\s\S]*?```/g, "").replace(/`[^`\n]+`/g, "")
 }
 
+/**
+ * Trailing environment boundary markers (`@12@`-style ids the harness
+ * appends to stored message text) are metadata, not model prose. Left in
+ * place they defeat every end-anchored completion test: ses_ecca0ad6
+ * (2026-10-13) ended nine "TASK COMPLETE" deliveries with a marker and the
+ * stall ladder fired on every one despite the latch code being live and
+ * latching clean tails the same day. Strip trailing runs only — a mid-text
+ * mention is model prose and keeps its meaning.
+ */
+function stripBoundaryMarkers(text: string): string {
+	return text.replace(/(?:\s*@\d+@)+\s*$/, "")
+}
+
 function containsToolCallAsText(text: string): boolean {
 	if (text.length <= 10) return false
 	const stripped = stripCodeBlocks(text)
@@ -1154,7 +1167,7 @@ const STOP_STATEMENT_PATTERNS: RegExp[] = [
 	/\btask completed?\s*[.!]*\s*$/i,
 ]
 function containsStopStatement(text: string): boolean {
-	const lines = text.split("\n")
+	const lines = stripBoundaryMarkers(text).split("\n")
 	const lastLines = lines.slice(-3).join("\n")
 	// A stop claim that is immediately followed by a comma and a CONTINUING
 	// connective is not the end of the turn — the model kept going. Two shapes
@@ -1235,7 +1248,7 @@ function containsWorkDescription(text: string): boolean {
  * is in hand.
  */
 function endsWithCelebration(text: string): boolean {
-	const lastLine = text.split("\n").filter((l) => l.trim().length > 0).pop() ?? ""
+	const lastLine = stripBoundaryMarkers(text).split("\n").filter((l) => l.trim().length > 0).pop() ?? ""
 	return lastLine.trim().replace(/[.!?]+$/, "").endsWith("🎉")
 }
 
