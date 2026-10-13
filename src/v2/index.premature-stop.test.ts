@@ -266,6 +266,30 @@ describe("v2: celebration latches completion", () => {
 		const { injected } = await replay(turnEvents("Wrapped it up. 🎉."))
 		expect(injected).toEqual([])
 	})
+
+	test("a leading emoji latches completion instead of nudging", async () => {
+		// Models celebrate where they please; the old end-anchored check saw
+		// only a trailing emoji and every other placement got nudged (2026-10-12:
+		// a reply ending in emoji still drew a stall nudge).
+		const { injected, logs } = await replay(turnEvents("🎉 All set. Changed the parser."))
+		expect(injected).toEqual([])
+		expect(logs.some((l) => l.includes("latching completion"))).toBe(true)
+	})
+
+	test("a mid-tail emoji latches completion instead of nudging", async () => {
+		const { injected, logs } = await replay(turnEvents("Done with the migration. 🎉 Summary of changes above."))
+		expect(injected).toEqual([])
+		expect(logs.some((l) => l.includes("latching completion"))).toBe(true)
+	})
+
+	test("an emoji outside the tail does not latch", async () => {
+		// More than three lines back it belongs to earlier work, not this turn's
+		// close — and the turn below ends mid-task with no other signal.
+		const { logs } = await replay(
+			turnEvents("🎉 Step one done.\n\nLine one.\nLine two.\nLine three.\nLine four.\nStill working on step two."),
+		)
+		expect(logs.some((l) => l.includes("latching completion"))).toBe(false)
+	})
 })
 
 describe("v2: premature-stop detection does not fight the other idle guards", () => {

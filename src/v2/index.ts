@@ -1190,7 +1190,7 @@ function containsStopStatement(text: string): boolean {
  * must judge the same tail from history before firing.
  */
 function turnEndsWithCompletionClaim(text: string): boolean {
-	return endsWithCelebration(text) || containsStopStatement(text)
+	return containsCelebration(text) || containsStopStatement(text)
 }
 
 /**
@@ -1223,17 +1223,19 @@ function containsWorkDescription(text: string): boolean {
 }
 
 /**
- * True when the last assistant turn closes with a celebration emoji.
+ * True when the tail of the last assistant turn carries a celebration emoji.
  *
- * A 🎉 is the model's own "I finished" signal, used to latch completion rather
- * than keep nudging. The emoji alone is not trustworthy: a model that finishes
- * early celebrates early, and latching on that turns a false positive into
- * silence. The todo cross-check that catches it lives at the call site, where
- * the fetched list is in hand.
+ * The model celebrates where it pleases — leading ("🎉 Done!"), trailing
+ * ("All set. 🎉"), mid-sentence — so the check looks for the emoji anywhere
+ * in the last three lines, not just at the very end. The old end-anchored
+ * check missed every non-final placement, and each miss meant nudges against
+ * a session the model had already closed (operators resorted to appending
+ * "TASK COMPLETE" by hand). The todo cross-check at the call sites is what
+ * makes the wider net safe: with work still listed, no placement latches.
  */
-function endsWithCelebration(text: string): boolean {
-	const normalized = text.trim().replace(/[.!?]+$/, "")
-	return normalized.endsWith("🎉")
+function containsCelebration(text: string): boolean {
+	const tail = text.split("\n").slice(-3).join("\n")
+	return tail.includes("🎉")
 }
 
 /**
@@ -4604,7 +4606,7 @@ export default define({
 			// on that turns a false positive into permanent silence. With work still
 			// listed, the celebration is a false positive and the right answer is to
 			// name what is unfinished.
-			if (endsWithCelebration(text)) {
+			if (containsCelebration(text)) {
 				const open = getOpenTodos(await readTodos(sid))
 				if (open.length > 0) {
 					// Deliberately not latching: the list is still open, so this turn is
