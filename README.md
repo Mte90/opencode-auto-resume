@@ -259,6 +259,26 @@ If the assistant claims the task is done ("task done", "finished", "all complete
 
 ---
 
+### Todo list nudges
+
+OpenCode v2 removed the built-in `todowrite` and `todoread` tools, the `todo` table, and the `todo.updated` event, so a v2 session has no todo list by default. auto-resume does not own one either. It reads the session message log, where every `todowrite` call is persisted as a tool part carrying the whole list, and the newest completed call is the current list.
+
+The writer is the todo plugin you install. The upstream [opencode-todolist](https://github.com/aiev/opencode-todolist) restores `todowrite` and `todoread` in v2 and adds a sidebar strip; the confirmed pairing here is `opencode-todo-fork`, verified live. Any plugin that persists `todowrite` calls to the message log should work, but only the fork has been tested.
+
+The todo plugin is optional, and without it the unfinished-task nudges never trigger. Every other recovery path runs fine on its own; the list gates exactly the nudges that check it. With no `todowrite` call in the log, auto-resume sees no list and falls back to the older behaviour (latch on the 🎉 emoji, demand a report on a bare done-claim). It never nudges on the strength of a list it failed to read.
+
+When a turn ends with items still open, the nudge names them:
+
+> You have 2 unfinished tasks:
+> 1. [pending] Verify the plugin loads under v2
+> 2. [in_progress] Write the todo-nudges section of the README
+>
+> Please continue working on these tasks.
+
+`buildOpenTodosReminder` sends that verbatim, numbering each open item (`pending` or `in_progress`) and falling back to a bare `continue` when the list is unusable. Four paths send it: a 🎉 celebration with items still open, a `task_complete` with items still open, a stop statement with work listed, and a completion claim with work listed. The ready-to-continue check reads the same list in reverse: a "ready" claim while every todo is already closed gets two chances before a plain `continue`. Full mechanics, including the `ctx.storage` namespacing that rules storage out as a shared store: [The todo list](docs/known-issues-v2.md#the-todo-list).
+
+---
+
 ### User-input awareness
 
 The session is not stalled while the ball is in the user's court. Two gates stand down idle nudges:
@@ -349,7 +369,8 @@ answers `{ data, cursor }`, never a bare array, and orders results newest first)
 `ctx.storage` survives only as a last-resort fallback, for a host that writes the
 list itself.
 
-Confirmed working setup: `opencode-todo-fork` — verified live (list resolved
+Confirmed working setup: `opencode-todo-fork` (a fork of
+[opencode-todolist](https://github.com/aiev/opencode-todolist)) — verified live (list resolved
 from the log, `/todo` round-trip green). Other todo plugins are unconfirmed:
 anything that persists `todowrite` calls to the message log should read, but
 only the fork has been tested.
