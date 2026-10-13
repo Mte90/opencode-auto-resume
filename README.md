@@ -275,7 +275,10 @@ Every capability above is conditional on existing — the text fallback is
 the only step with zero dependencies, so a bare setup degrades to "end
 with TASK COMPLETE" rather than misfiring. Nothing else is guaranteed to
 exist, so these two locations cover it: the global file catches every
-session, the job prompt catches the runs that cost real time.
+session, the job prompt catches the runs that cost real time. A copy-paste
+version of the A wording plus the two structural companions (todos,
+questions) ships with the plugin at [docs/AGENTS-snippet.md](docs/AGENTS-snippet.md)
+for operators who have no AGENTS.md at all.
 
 ---
 
