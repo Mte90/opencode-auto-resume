@@ -18,6 +18,33 @@
 > [v2 install guide](docs/v2/installing.md); see
 > [docs/v2/migration.md](docs/v2/migration.md) for the full migration notes.
 
+## Installation
+
+### Opencode
+
+Add to your `opencode.jsonc`:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["opencode-auto-resume"]
+}
+```
+
+With options:
+
+```jsonc
+{
+  "plugin": [
+    ["opencode-auto-resume", {
+      "chunkTimeoutMs": 180000,
+      "gracePeriodMs": 3000,
+      "maxRetries": 3
+    }]
+  ]
+}
+```
+
 ## What it does
 
 LLM sessions fail in predictable ways. This plugin monitors all sessions and automatically recovers without user intervention. Each recovery path below references the upstream OpenCode issues that motivated it — these are problems not yet resolved in the official project.
@@ -513,33 +540,6 @@ The v1 shape this replaced: per-event timer resets off `session.status`
 (busy/idle), tool-text checks on a 3s idle delay, `todo.updated` tracking
 with a `session.todo()` API fallback, and a 48s busy threshold. Tokens now
 come from `session.usage.updated` and the window from `ctx.model.get()`.
-
-## Installation
-
-### Opencode
-
-Add to your `opencode.jsonc`:
-
-```jsonc
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": ["opencode-auto-resume"]
-}
-```
-
-With options:
-
-```jsonc
-{
-  "plugin": [
-    ["opencode-auto-resume", {
-      "chunkTimeoutMs": 180000,
-      "gracePeriodMs": 3000,
-      "maxRetries": 3
-    }]
-  ]
-}
-```
 
 ## Configuration
 
