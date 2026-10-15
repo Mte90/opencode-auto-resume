@@ -169,6 +169,11 @@ interface SessionWatch {
 	 * progress restarts), this counts every fire so the nudge text can say which
 	 * recovery of the episode it is. Reset at the same genuine-episode sites. */
 	episodeRecovers: number
+	/** Lifetime stall continues this genuine user episode. Unlike
+	 * `resumeAttempts` (restarted by model text) this only resets on a
+	 * genuine user message, so a model that keeps answering "done" cannot
+	 * stretch 1/3 forever. Past the max the session stands down. */
+	lifetimeContinues: number
 	lastRetryAt: number
 	/** Last wall-clock a user-visible quota notice was sent (first arm +
 	 * budget-exhausted). One notice per episode: the stand-down itself is
@@ -411,6 +416,11 @@ export interface AutoResumeOptions {
 	maxBackoffMs?: number
 	loopMaxContinues?: number
 	loopWindowMs?: number
+	/** Lifetime stall continues per genuine user episode. The per-stall
+	 * `maxRetries` ladder restarts on model text, so a model that keeps
+	 * replying "done" reads 1/3 forever — this caps total fires until a
+	 * genuine user message clears it. Default 9. */
+	lifetimeMaxContinues?: number
 	/** Minimum gap between recovery injections for one session. */
 	injectIntervalMs?: number
 	continuePrompt?: string
@@ -626,6 +636,7 @@ const DEFAULT_BASE_BACKOFF_MS = 1_000
 const DEFAULT_MAX_BACKOFF_MS = 8_000
 const DEFAULT_LOOP_MAX_CONTINUES = 3
 const DEFAULT_LOOP_WINDOW_MS = 10 * 60_000
+const DEFAULT_LIFETIME_MAX_CONTINUES = 9
 const DEFAULT_DEBUG = false
 // Mirrors v1 (Mte90 e1b8374): an inbound user message this recent means the
 // user is engaged (likely composing), so idle nudges stand down. Was 15min here.
@@ -1789,6 +1800,7 @@ export default define({
 		const maxBackoff = opts.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS
 		const loopMaxContinues = opts.loopMaxContinues ?? DEFAULT_LOOP_MAX_CONTINUES
 		const loopWindowMs = opts.loopWindowMs ?? DEFAULT_LOOP_WINDOW_MS
+		const lifetimeMaxContinues = opts.lifetimeMaxContinues ?? DEFAULT_LIFETIME_MAX_CONTINUES
 		const debug = opts.debug ?? DEFAULT_DEBUG
 		const activeUserWindowMs = opts.activeUserWindowMs ?? DEFAULT_ACTIVE_USER_WINDOW_MS
 		const injectIntervalMs = opts.injectIntervalMs ?? DEFAULT_INJECT_INTERVAL_MS
@@ -1903,6 +1915,7 @@ export default define({
 			"maxBackoffMs",
 			"loopMaxContinues",
 			"loopWindowMs",
+			"lifetimeMaxContinues",
 			"debug",
 			"activeUserWindowMs",
 			"injectIntervalMs",
@@ -2042,6 +2055,7 @@ export default define({
 			if (w) {
 				w.emptyIdleNudged ??= false
 				w.episodeRecovers ??= 0
+				w.lifetimeContinues ??= 0
 				w.inflightTools ??= new Map()
 				w.lastStuckToolCheck ??= 0
 				return w
@@ -2056,6 +2070,7 @@ export default define({
 					resumeAttempts: 0,
 					episodeRefires: 0,
 					episodeRecovers: 0,
+					lifetimeContinues: 0,
 					lastRetryAt: 0,
 					quotaNoticedAt: 0,
 					gaveUp: false,
@@ -2269,6 +2284,7 @@ export default define({
 			if (!w) return
 			const now = Date.now()
 			w.continueTimestamps.push(now)
+			w.lifetimeContinues = (w.lifetimeContinues ?? 0) + 1
 			const cutoff = now - loopWindowMs
 			while (w.continueTimestamps.length > 0 && w.continueTimestamps[0] < cutoff) {
 				w.continueTimestamps.shift()
@@ -2281,6 +2297,21 @@ export default define({
 				w.continueTimestamps.shift()
 			}
 			return w.continueTimestamps.length
+		}
+
+		/** Lifetime cap: total stall continues this genuine user episode.
+		 * The per-stall ladder restarts on model text, so without this a
+		 * model that keeps replying "done" reads 1/3 forever. Only a
+		 * genuine user message clears it — never model output. */
+		function lifetimeExhausted(sid: string, w: SessionWatch): boolean {
+			if ((w.lifetimeContinues ?? 0) >= lifetimeMaxContinues) {
+				if (!w.gaveUp) {
+					log("warn", `${short(sid)} lifetime cap (${lifetimeMaxContinues} continues, no genuine user message) — standing down`)
+					w.gaveUp = true
+				}
+				return true
+			}
+			return false
 		}
 
 		/**
@@ -3193,6 +3224,7 @@ export default define({
 				if (w.resumeAttempts > 0) w.episodeRefires++
 				w.resumeAttempts = 0
 			}
+			if (lifetimeExhausted(sid, w)) return
 			recordContinue(sid)
 			if (w.resumeAttempts >= maxRetries) {
 				log("warn", `${short(sid)} giving up after ${maxRetries} attempts (${reason}) mod=${MODULE_INSTANCE}`)
@@ -3469,6 +3501,7 @@ export default define({
 				w.continueTimestamps = []
 				return
 			}
+			if (lifetimeExhausted(sid, w)) return
 			recordContinue(sid)
 			if (w[budgetKey] >= maxRetries) {
 				dbg(`${short(sid)} ${kind} budget exhausted`)
@@ -3784,6 +3817,7 @@ export default define({
 				return true
 			}
 			w.emptyIdleNudged = true
+			if (lifetimeExhausted(sid, w)) return true
 			recordContinue(sid)
 			// Send DIRECTLY, not through recover(): recover() schedules on a
 			// backoff timer (the opposite of instant) and arms selfRecovery
@@ -4068,6 +4102,10 @@ export default define({
 			// stall starts back at the base fuse.
 			w.episodeRefires = 0
 			w.episodeRecovers = 0
+			// Lifetime cap is also per genuine user episode: new instructions
+			// mean a new task, so the total-fire count starts over here — and
+			// only here (plus genuine execution.started), never on model text.
+			w.lifetimeContinues = 0
 			// And it re-opens a stood-down session: the stall gaveUp latch
 			// clears on genuine user takeovers, never on transitions.
 			w.gaveUp = false
@@ -5992,6 +6030,10 @@ export default define({
 						// a new episode, so the instant nudge re-arms here.
 						// Same for the recovery count.
 						w.episodeRecovers = 0
+						// Lifetime cap is per genuine episode too: a real turn
+						// is new work, not our nudge looping. Own recovery
+						// turns skip this branch entirely, so they keep counting.
+						w.lifetimeContinues = 0
 						w.emptyIdleNudged = false
 						// Drop the durable arm with the in-memory one. This delete is
 						// what lets restore skip the history read: no record means the

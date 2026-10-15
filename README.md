@@ -55,6 +55,8 @@ LLM sessions fail in predictable ways. This plugin monitors all sessions and aut
 
 The stream goes silent but the session stays "busy". The UI shows a blinking cursor with no progress. If no events arrive for ~3 minutes (`chunkTimeoutMs` + `gracePeriodMs`), the plugin sends `"continue"` with exponential backoff. After 3 failed attempts it gives up.
 
+Three budgets bound this path, because each answers a different question: `maxRetries` (default 3) is the per-episode ladder — it restarts when the model produces text, so a model that keeps replying "everything is done" reads 1/3 forever. `loopMaxContinues` (default 3 per `loopWindowMs`, 10 min) catches rapid-fire loops and escalates to abort+resume. `lifetimeMaxContinues` (default 9) is the lifetime cap per genuine user episode — it only resets on a genuine user message or genuine turn, never on model text, so the "done" loop above stops at 9 total continues and the session stands down until you speak.
+
 The `busyStallStrategy` option controls this path: `"continue"` (default), `"abort"` (abort-first), or `"off"` — see [Recovery model](#recovery-model) for what a busy prompt can and cannot do while the runner is live.
 
 The plugin extracts the **agent, model, and provider** from the last session message, so it resumes with the exact same configuration the user was using (build, sisyphus, prometheus, etc.).
@@ -621,6 +623,7 @@ Defaults are the same on v1 and v2 unless a row says otherwise.
 | `subagentDeadMs` | `1800000` | Outer bound: quiet past this with no error evidence reads as dead (v2 only). Inside it, a quiet child is waited on, not aborted — 30 min default for long-thinking models |
 | `loopMaxContinues` | `3` | Continues in window before triggering abort |
 | `loopWindowMs` | `600000` | Hallucination loop detection window (10 min) |
+| `lifetimeMaxContinues` | `9` | Lifetime stall continues per genuine user episode before standing down; resets only on a genuine user message/turn, never on model text — stops the "keeps saying done" loop that restarts the `maxRetries` ladder at 1/3 forever |
 | `streamingFailureErrorNames` | `["ProviderError","APIError","StreamError","ConnectionError","TimeoutError"]` | Error names that classify as streaming failures (exact match) |
 | `streamingFailureMessagePatterns` | `["streaming response failed","stream.*fail","connection.*reset","connection.*closed"]` | Regex patterns (case-insensitive) in error messages indicating streaming failure |
 | `maxRecoveryRetries` | `2` | v1 name for the streaming-failure retry budget; v2 canonical is `maxRetries` (alias still accepted) |
@@ -682,6 +685,7 @@ The plugin handles all recovery automatically — no manual intervention needed.
 | Too slow to react | Decrease `checkIntervalMs` to `2000` |
 | Orphan parent not detected | Increase `subagentWaitMs` to `20000` |
 | Hallucination loop not caught | Decrease `loopMaxContinues` to `2` |
+| Model keeps saying "done", nudged forever | Decrease `lifetimeMaxContinues` (e.g. `5`); raise it for long unattended runs |
 | Tool-text not detected | Check server logs — requires SDK message fetching (v1). On v2 the history comes from the client message surface or loopback HTTP — check the plugin log file instead |
 | Long-running tool killed | Should not happen — active-tool guard prevents it. Report a bug. |
 | `Unexpected server error` on startup | Update to v1.1.8+. Caused by non-Plugin exports being treated as plugin entrypoints by OpenCode's loader. Clear the plugin cache (`~/.cache/opencode/packages/opencode-auto-resume@*`) and restart. |

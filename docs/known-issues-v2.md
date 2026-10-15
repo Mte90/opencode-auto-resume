@@ -44,6 +44,13 @@ delivered. v1 incremented first and lost the budget when a send was rejected;
 the fix is mte090's `e1b8374`, applied to the v2 code path. The stall path
 (`recover`) keeps v1's ordering — it escalates on a stall, not on a send.
 
+Lifetime cap: `lifetimeMaxContinues` (default 9) bounds total stall continues
+per genuine user episode. The `maxRetries` ladder restarts on model text, so a
+model that keeps answering "everything is done" reads 1/3 forever — the
+lifetime count keeps climbing through that chatter and stands the session down
+(`gaveUp`) at the cap. It resets only on a genuine user message or genuine
+turn, never on text growth, progress, or abort+resume.
+
 ## Renamed and aliased
 
 - `maxRetries` is the v2 name. `maxRecoveryRetries` is v1's name for the same
@@ -65,6 +72,8 @@ the fix is mte090's `e1b8374`, applied to the v2 code path. The stall path
 
 - `injectIntervalMs` — minimum gap between recovery injections for one session.
   No v1 equivalent.
+- `lifetimeMaxContinues` (default 9) — lifetime stall continues per genuine user
+  episode; see "Counter semantics changed from v1".
 - `logFile` — where this build writes its log. See "Logging" below.
 
 ## Logging: there is no server log sink in v2
