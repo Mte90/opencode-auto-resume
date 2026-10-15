@@ -812,8 +812,11 @@ const PERMANENT_UNKNOWN_MODEL_RE =
 /** Quota/rate-limit errors (observed: `{type:"provider.quota", message:"Rate
  * limit exceeded. Please try again later."}`). An immediate continue retries
  * straight into the ban, so these stand down on a gate ladder instead of the
- * normal backoff. Gates, not timers: armed timeouts do not survive a reload. */
-const RATE_LIMIT_RE = /rate limit exceeded|too many requests|\b429\b|quota exceeded|provider\.quota/i
+ * normal backoff. Gates, not timers: armed timeouts do not survive a reload.
+ * Throttle phrasing also matches (issue #46: "sent too many tokens ... in a
+ * short period, please wait before retrying") so it never reaches the OOC
+ * latch — maybeLockOoc defers to isRateLimitError first. */
+const RATE_LIMIT_RE = /rate limit exceeded|too many requests|\b429\b|quota exceeded|provider\.quota|throttl|slow down|please wait|try again later|too many tokens.{0,120}(short period|wait|retr|throttl|slow|per (second|minute|hour|day)|rate|limit|quota)/i
 /** Per-attempt cooldowns before a rate-limited session may be retried: 15m,
  * 30m, 1h, then 2h out to ~12h of unattended coverage. Past the ladder the
  * session stays silent until a genuine user turn. */
@@ -3037,9 +3040,13 @@ export default define({
 			}
 		}
 
-		function maybeLockOoc(sid: string, errMsg: string) {
+		function maybeLockOoc(sid: string, errMsg: string, errType = "") {
 			const w = ensureWatch(sid)
 			if (w.oocLocked) return
+			// Transient throttles are not context overflow (issue #46) — the
+			// rate-limit ladder owns them. Checked here (not just at the
+			// execution.failed call site) so session.retry.scheduled is covered too.
+			if (isRateLimitError(errType, errMsg)) return
 			if (!OOC_ERROR_RE.test(errMsg)) return
 			w.oocLocked = true
 			w.oocLockReason = errMsg.slice(0, 200)
@@ -6376,7 +6383,7 @@ export default define({
 					touch(sid) // provider-level retry is progress of its own kind
 					const errType = String(ev.data?.error?.type ?? "")
 					const errMsg = String(ev.data?.error?.message ?? "")
-					maybeLockOoc(sid, errMsg)
+					maybeLockOoc(sid, errMsg, errType)
 					if (maybeLockPermanent(sid, errMsg, errType, ev.data?.error?.status)) return
 					log("info", `${short(sid)} provider retry #${ev.data?.attempt ?? "?"}: ${errType || errMsg}`)
 					if (!isStreamingFailure(errMsg, streamingFailureMessagePatterns) && !isStreamingFailureName(errType, streamingFailureErrorNames) && errType !== "retryable") return
@@ -6416,7 +6423,7 @@ export default define({
 						handleRateLimitFailure(sid, w, errType, errMsg)
 						return
 					}
-					maybeLockOoc(sid, errMsg)
+					maybeLockOoc(sid, errMsg, errType)
 					// Permanent failures still go idle — the session really is done —
 					// but nothing arms behind them, so no watchdog pass revives it.
 					if (maybeLockPermanent(sid, errMsg, errType, ev.data?.error?.status)) {
