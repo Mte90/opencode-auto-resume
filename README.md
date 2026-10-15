@@ -45,6 +45,21 @@ With options:
 }
 ```
 
+Requires opencode v2.0+ (any 2.0.x server; verified live 2.0.27–2.0.29).
+Uses core session/model APIs only — no experimental hooks. No release
+bundle is published yet, so install is manual (clone, build, copy `dist`;
+see the v2 install guide above) — there is currently no one-line install.
+
+## Updating
+
+Manual installs have no auto-update: `git pull` the branch, rebuild,
+re-copy the bundle over the installed one, restart the server.
+
+## Uninstall
+
+Remove the plugin directory (or its bundle), delete the entry from
+`opencode.jsonc`, restart the server.
+
 ## What it does
 
 LLM sessions fail in predictable ways. This plugin monitors all sessions and automatically recovers without user intervention. Each recovery path below references the upstream OpenCode issues that motivated it — these are problems not yet resolved in the official project.
