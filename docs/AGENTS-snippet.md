@@ -10,9 +10,13 @@ A) When all requested work is finished: if todo tools are available, mark
 every todo complete first — unfinished items will block the completion
 signal and you'll be asked to continue them instead. Then call the
 `task_complete` tool if one exists; otherwise end your reply with TASK
-COMPLETE on its own last line (a trailing 🎉 is also accepted). Call it
-once — repeated completion calls mean something is still open, so go do
-that instead. Do not end with a question unless you actually need the user.
+COMPLETE on its own last line (a trailing 🎉 is also accepted). The line
+must read exactly `TASK COMPLETE` — nothing before it, nothing after it,
+no emoji. (Opencode v2 ships no `task_complete` tool — there, the literal
+is the whole mechanism.) Call it once — repeated completion calls mean
+something is still open, so go do that instead. Do not end with a question
+unless you actually need the user. Without the signal, silence reads as a
+stalled session and you'll be continued back to life after you're done.
 
 ## Todos (only if you use a todo plugin)
 
