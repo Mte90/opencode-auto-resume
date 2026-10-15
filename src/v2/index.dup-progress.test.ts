@@ -78,6 +78,11 @@ async function setup(extraEvents: Array<{ at: number; event: any }>, waitMs: num
 			baseBackoffMs: 1,
 			maxBackoffMs: 2,
 			maxRetries: 12,
+			// Open-ended lifetime budget: this test exercises the exact-duplicate
+			// skip gate, not the lifetime cap. With 20ms ticks the default cap
+			// of 9 burns in ~230ms — before the tool event below — and the
+			// session stands down no matter what the skip does (2026-10-15).
+			lifetimeMaxContinues: 99,
 			loopMaxContinues: 99,
 			injectIntervalMs: 0,
 			continuePrompt: "go",
@@ -128,8 +133,10 @@ describe("v2: silent tool completions defeat the exact-duplicate skip", () => {
 		// thing standing between the next stall and its prod). Pre-fix the
 		// next identical prod was suppressed as no-progress and recovery
 		// died after one shot; post-fix the completion counts as progress.
+		// Fired at 100ms: late enough to land mid-ladder (first prod ~60ms),
+		// early enough to beat the lifetime-cap burn (~230ms at 20ms ticks).
 		const { injected } = await setup(
-			[{ at: 300, event: ev("session.tool.success", { tool: "read", id: "c1" }) }],
+			[{ at: 100, event: ev("session.tool.success", { tool: "read", id: "c1" }) }],
 			900,
 		)
 		expect(injected.length).toBeGreaterThanOrEqual(2)
