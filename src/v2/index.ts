@@ -704,22 +704,39 @@ const DEFAULT_STREAMING_FAILURE_MESSAGE_PATTERNS = [
 	"aborted due to timeout",
 ]
 
-const DEFAULT_DONE_CLAIM_PATTERNS = [
-	"task\\s+done[.!]*",
-	"done[.!]*",
-	"all\\s+done[.!]*",
-	"finished[.!]*",
-	"complete[.!]*",
-	"task\\s+complete[.!]*",
-	"task\\s+completed[.!]*",
-	"all\\s+tasks?\\s+complete[.!]*",
-	"all\\s+tasks?\\s+completed[.!]*",
-	"(?:i['’]?m\\s+)?done\\s+with\\s+task",
-	"done\\s+with\\s+(?:the\\s+)?(?:task|work|implementation)",
-	"finished\\s+(?:the\\s+)?(?:task|work|implementation)",
-	"(?:all|everything)\\s+(?:is\\s+)?(?:complete|done|finished)",
-	"nothing\\s+(?:else\\s+)?(?:left|remaining|to do)",
+/**
+ * Canonical done-claim sources — single source of truth for the "task claims
+ * it is done" vocabulary. Two consumers build from this one list, which is
+ * why it exists: the string fallback below (compiled with flags "im" for the
+ * user-overridable `doneClaimPatterns` option) and the RegExp hard default
+ * (DONE_CLAIM_PATTERNS) drifted apart — the fallback lost its ^$ anchors and
+ * matched strictly more than the tested default. Both are now derived here,
+ * so the live path and the tested path can never disagree again.
+ */
+const DONE_CLAIM_PATTERN_SOURCES = [
+	"^task\\s+done[.!]*$",
+	"^done[.!]*$",
+	"^all\\s+done[.!]*$",
+	"^finished[.!]*$",
+	"^complete[.!]*$",
+	"^task\\s+complete[.!]*$",
+	"^task\\s+completed[.!]*$",
+	"^all\\s+tasks?\\s+complete[.!]*$",
+	"^all\\s+tasks?\\s+completed[.!]*$",
+	"^(?:i['’]?m\\s+)?done\\s+with\\s+task",
+	"\\bdone\\s+with\\s+(?:the\\s+)?(?:task|work|implementation)",
+	"\\bfinished\\s+(?:the\\s+)?(?:task|work|implementation)",
+	// ses_f2e3370c (2026-10-14): "All work complete." — a noun between
+	// all/everything and the verdict broke the match, and the stall ladder
+	// fired on a finished session. One optional word covers the shapes real
+	// deliveries take ("all work complete", "everything is finished");
+	// the verdict word is still required, so mid-work lines like "all tests
+	// pass so far, running integration next" still match nothing.
+	"\\b(?:all|everything)\\s+(?:[\\w-]+\\s+)?(?:is\\s+)?(?:complete|done|finished)",
+	"\\bnothing\\s+(?:else\\s+)?(?:left|remaining|to do)",
 ]
+
+const DEFAULT_DONE_CLAIM_PATTERNS = [...DONE_CLAIM_PATTERN_SOURCES]
 
 const DEFAULT_READY_TO_CONTINUE_PATTERNS = [
 	"ready to continue with task",
@@ -1062,22 +1079,7 @@ const READY_TO_CONTINUE_PATTERNS = [
 	/moving on to task/i,
 ]
 
-const DONE_CLAIM_PATTERNS = [
-	/^task\s+done[.!]*$/im,
-	/^done[.!]*$/im,
-	/^all\s+done[.!]*$/im,
-	/^finished[.!]*$/im,
-	/^complete[.!]*$/im,
-	/^task\s+complete[.!]*$/im,
-	/^task\s+completed[.!]*$/im,
-	/^all\s+tasks?\s+complete[.!]*$/im,
-	/^all\s+tasks?\s+completed[.!]*$/im,
-	/^(?:i['’]?m\s+)?done\s+with\s+task/im,
-	/\bdone\s+with\s+(?:the\s+)?(?:task|work|implementation)/im,
-	/\bfinished\s+(?:the\s+)?(?:task|work|implementation)/im,
-	/\b(?:all|everything)\s+(?:is\s+)?(?:complete|done|finished)/im,
-	/\bnothing\s+(?:else\s+)?(?:left|remaining|to do)/im,
-]
+const DONE_CLAIM_PATTERNS = DONE_CLAIM_PATTERN_SOURCES.map((s) => new RegExp(s, "im"))
 
 // Error signatures that indicate a transient streaming/provider failure worth retrying
 const STREAMING_FAILURE_MESSAGE_PATTERNS = [
@@ -1178,7 +1180,28 @@ const STOP_STATEMENT_PATTERNS: RegExp[] = [
 	// trailing "TASK COMPLETE" and the stall ladder fired 186s later — the
 	// system's own completion vocabulary written as text latched nothing.
 	// End-anchored like the stop patterns so mid-text mentions don't fire.
-	/\btask completed?\s*[.!]*\s*$/i,
+	//
+	// Case discipline (2026-10-15): every completion pattern in this file is
+	// case-insensitive EXCEPT the system's own literal — bare "TASK COMPLETE"
+	// must read byte-exact, per the operator contract in docs/AGENTS-snippet.md
+	// ("The line must read exactly `TASK COMPLETE`"). A lowercase "task
+	// complete" is model prose, not the signal, and does not latch. The past
+	// tense ("task completed", any case) stays insensitive — it was never
+	// the literal.
+	/\bTASK COMPLETE\s*[.!]*\s*$/,
+	/\btask completed\s*[.!]*\s*$/i,
+	// Mined from live session tails (2026-10-15 review of the last model
+	// message of all 16 live sessions + 6 archived transcripts): standby
+	// phrasing is completion, not a pause. ses_f2ea7b7a "All done. Standing
+	// by for next instructions." latched only on the "All done" half — a bare
+	// "Standing by …" with no done-claim beside it matched nothing.
+	/\bstanding by\b[^.;:!?—–\n]*[.!]*$/i,
+	// ses_f2ea7797 "Ready when you have the next task." — the model is out of
+	// work and waiting on the user, which is done, not ready-to-continue
+	// (that family auto-sends `continue`; this one latches quiet). Deliberately
+	// NOT in READY_TO_CONTINUE_PATTERNS. The tail class excludes "?" — a
+	// question ("Ready for the next task?") is still-working, never a stop.
+	/\bready (?:when you have the|for your|for the) (?:next\s+)?(?:task|instruction)s?\b[^.;:!?—–\n]*[.!]*$/i,
 ]
 function containsStopStatement(text: string): boolean {
 	const lines = stripBoundaryMarkers(text).split("\n")

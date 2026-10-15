@@ -355,7 +355,13 @@ End-anchored patterns over the last three lines: bare `TASK COMPLETE`,
 `that's all…`, `parked/not started…`. A connective clause after the stop
 ("Stopping here for a moment, then continuing") disqualifies it — a stop is
 only a stop if it is the last clause. Like every text signal, a stop claim
-with open todos produces the reminder nudge instead of latching.
+with open todos produces the reminder nudge instead of latching. Standby
+phrasing (`standing by for next instructions`) and ready-and-waiting phrasing
+(`ready when you have the next task`, `ready for your next instruction`)
+latch the same way: the model is out of work, which is done, not
+ready-to-continue (that family auto-sends `continue`; this one stays quiet).
+A question mark disqualifies the ready pattern — `ready for the next task?`
+is still-working, never a stop.
 
 Mined from live stall replies, all end-anchored the same way: "Stopping
 here." (covered), "Standing by.", "Nothing in progress …" (bare "in
@@ -363,6 +369,13 @@ progress" alone must never match — "work is still in progress" is the
 opposite), bare "Done.". Conversely "I'll report X when it lands" is future
 intent, not completion, and matches nothing — documented here so a future
 widening doesn't swallow it.
+
+Case discipline: the system's own literal is the one case-sensitive pattern
+in the build — bare `TASK COMPLETE` must read byte-exact, per
+[docs/AGENTS-snippet.md](docs/AGENTS-snippet.md). Every other completion
+pattern is case-insensitive. A lowercase `task complete` is model prose and
+latches nothing; past-tense `task completed` (any case) still latches — it
+was never the literal.
 
 ---
 

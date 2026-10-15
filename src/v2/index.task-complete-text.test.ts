@@ -255,4 +255,48 @@ describe("v2: bare TASK COMPLETE latches completion", () => {
 		expect(h.injected.filter((i: any) => i.sid === SID)).toHaveLength(0)
 		await teardown(h)
 	}, 20000)
+
+	test("noun between all and the verdict still latches (S14 Schwab tail)", async () => {
+		// 2026-10-15 session-tail review: "All work complete. Ready for your
+		// next instruction." matched nothing — the all/everything pattern
+		// admitted no noun — and the stall ladder fired on a finished session.
+		const h = await setup({
+			messages: [assistantMsg("Reviewed the positions.\n\nAll work complete. Ready for your next instruction.")],
+		})
+		push(h, "session.execution.started", SID)
+		await wait(1200)
+		expect(h.injected.filter((i: any) => i.sid === SID)).toHaveLength(0)
+		await teardown(h)
+	}, 20000)
+
+	test("standby phrasing latches without a done-claim beside it (S15 tail)", async () => {
+		// "Standing by for next instructions." carries no all/done/finished
+		// word, so only the standby stop pattern can latch it.
+		const h = await setup({ messages: [assistantMsg("PR merged and verified.\n\nStanding by for next instructions.")] })
+		push(h, "session.execution.started", SID)
+		await wait(1200)
+		expect(h.injected.filter((i: any) => i.sid === SID)).toHaveLength(0)
+		await teardown(h)
+	}, 20000)
+
+	test("ready-for-next-task latches instead of continuing (S3 tail)", async () => {
+		// "Ready when you have the next task." means out of work, not
+		// ready-to-continue — it must latch quiet, never draw a `continue`.
+		const h = await setup({ messages: [assistantMsg("Stack session done.\n\nReady when you have the next task.")] })
+		push(h, "session.execution.started", SID)
+		await wait(1200)
+		expect(h.injected.filter((i: any) => i.sid === SID)).toHaveLength(0)
+		await teardown(h)
+	}, 20000)
+
+	test("CONTROL: lowercase task complete is model prose, not the signal", async () => {
+		// Case discipline (2026-10-15): only byte-exact TASK COMPLETE latches.
+		// A lowercase "task complete" must NOT latch — the stall ladder stays
+		// armed and recovers on schedule like any unfinished delivery.
+		const h = await setup({ messages: [assistantMsg("Still working through it.\n\ntask complete")] })
+		push(h, "session.execution.started", SID)
+		await wait(1200)
+		expect(h.injected.filter((i: any) => i.sid === SID).length).toBeGreaterThan(0)
+		await teardown(h)
+	}, 20000)
 })
