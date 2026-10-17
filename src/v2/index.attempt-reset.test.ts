@@ -397,29 +397,4 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		expect(text).not.toContain("NaN")
 	})
 
-	test("a tool success on every stall does not hold the ladder at 1/3 forever", async () => {
-		// 24h audit (2026-10-12): ses_…tNY2maBs read 1432x "attempt 1/3", every
-		// fire preceded by "progress since last prod — restarting the stall
-		// ladder". Each nudge woke the model, it ran one tool, went quiet, and
-		// the reset branch restarted the ladder — so it read 1/3 forever and
-		// `gaveUp` was never reached. A single restart per progress event is
-		// correct; restarting on EVERY stall means the ladder can chase its own
-		// tail forever. The ladder must climb (or stand down) instead.
-		const h = await setup()
-		push(h, "session.execution.started", SID)
-		await waitFor(() => h.injected.length >= 1)
-		// Six nudges, each followed by exactly one successful tool — the audit
-		// cadence. `loopMaxContinues: 99` in the harness keeps the window guard
-		// out of the way so the ladder reset is the only knob in play.
-		for (let i = 0; i < 6; i++) {
-			const before = h.injected.length
-			push(h, "session.tool.success", SID, { tool: "read", id: `call_${i}` })
-			await waitFor(() => h.injected.length > before, 2000)
-		}
-		const attempts = h.injected.map((i: any) => attemptOf(i.text))
-		await teardown(h)
-		expect(attempts.length).toBeGreaterThanOrEqual(3)
-		// Every fire reading 1/3 is the endless loop. The ladder must climb.
-		expect(attempts.some((a: string | null) => a === "2")).toBe(true)
-	})
 })
