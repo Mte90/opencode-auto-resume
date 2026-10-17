@@ -1207,9 +1207,33 @@ const STOP_STATEMENT_PATTERNS: RegExp[] = [
 	// out of work, not ready-to-continue. None of the patterns above match
 	// "nothing in progress" / "waiting on you" / "blocked on you", so the
 	// stall ladder kept firing `continue` into a parked session.
+	// Broadened 2026-10-17 per completion-phrases research (see
+	// completion-phrases-research.md): Aider, OpenHands, Continue, Cline,
+	// SWE-agent completion/blocked vocabulary.
 	/\bnothing in progress\b/i,
-	/\bwaiting (?:on|for) (?:you|the user)\b/i,
-	/\bblocked on (?:you|the user)\b/i,
+	// P0: "waiting for/on X" where X is any user-referent.
+	/\bwaiting\s+(?:on|for)\s+(?:you|the user|your|my|the next|further)\b[^.;:!?—–\n]*[.!]*$/i,
+	// P0: "awaiting X" — formal verb form.
+	/\bawaiting\s+(?:you|the user|your|further|the next)\b[^.;:!?—–\n]*[.!]*$/i,
+	// P1: "blocked" + need/awaiting/on, including comma-separated "blocked, need your input".
+	/\bblocked\b[^.;:!?—–\n]*(?:\bneed\b|\bawaiting\b|\bon\b)[^.;:!?—–\n]*[.!]*$/i,
+	// P1: "on hold" / "holding off" blocked states.
+	/\b(?:on hold|holding off)\s+(?:pending|awaiting|waiting for)\s+(?:your|the user|further|the next)\b[^.;:!?—–\n]*[.!]*$/i,
+	// P1: "can't proceed without your input".
+	/\b(?:can'?t|cannot|unable to)\s+proceed\s+without\s+(?:your|the user)'?\s*(?:input|guidance|decision|approval|confirmation|direction)s?\b[^.;:!?—–\n]*[.!]*$/i,
+	// P2: "I need your input to continue" / "need clarification before I can continue".
+	/\b(?:i\s+)?need\s+(?:your|the user)'?\s*(?:input|guidance|decision|approval|confirmation|direction|clarification)s?\b[^.;:!?—–\n]*(?:\bto\s+continue\b|\bbefore\b)?[^.;:!?—–\n]*[.!]*$/i,
+	// P2: Aider literal blocked phrases.
+	/\bstop\s+and\s+wait\s+for\s+your\s+approval\b[^.;:!?—–\n]*[.!]*$/i,
+	/\bask\s+me\s+to\s+add\s+them\s+to\s+the\s+chat\b[^.;:!?—–\n]*[.!]*$/i,
+	// P2: SWE-agent bare FINISHED token (case-sensitive like TASK COMPLETE).
+	/\bFINISHED\s*[.!]*\s*$/,
+	// P3: passive complete forms.
+	/\bi\s+have\s+completed\s+(?:the\s+)?(?:task|work|implementation)\b[^.;:!?—–\n]*[.!]*$/i,
+	/\bthe\s+(?:task|work)\s+is\s+(?:finished|complete|done)\b[^.;:!?—–\n]*[.!]*$/i,
+	// P3: standing-by variants.
+	/\bready\s+when\s+you'?re\s+ready\b[^.;:!?—–\n]*[.!]*$/i,
+	/\bready\s+and\s+waiting\b[^.;:!?—–\n]*[.!]*$/i,
 ]
 function containsStopStatement(text: string): boolean {
 	const lines = stripBoundaryMarkers(text).split("\n")
