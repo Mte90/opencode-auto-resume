@@ -1202,6 +1202,14 @@ const STOP_STATEMENT_PATTERNS: RegExp[] = [
 	// NOT in READY_TO_CONTINUE_PATTERNS. The tail class excludes "?" — a
 	// question ("Ready for the next task?") is still-working, never a stop.
 	/\bready (?:when you have the|for your|for the) (?:next\s+)?(?:task|instruction)s?\b[^.;:!?—–\n]*[.!]*$/i,
+	// Waiting-for-user-input stop states (2026-10-17): when the model is
+	// blocked on user input (VM details, IP, SSH confirmation, etc.) it is
+	// out of work, not ready-to-continue. None of the patterns above match
+	// "nothing in progress" / "waiting on you" / "blocked on you", so the
+	// stall ladder kept firing `continue` into a parked session.
+	/\bnothing in progress\b/i,
+	/\bwaiting (?:on|for) (?:you|the user)\b/i,
+	/\bblocked on (?:you|the user)\b/i,
 ]
 function containsStopStatement(text: string): boolean {
 	const lines = stripBoundaryMarkers(text).split("\n")
