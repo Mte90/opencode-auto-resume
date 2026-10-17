@@ -164,6 +164,14 @@ interface SessionWatch {
 	 * only by a genuine user message — never by lifecycle transitions.
 	 */
 	episodeRefires: number
+	/** Consecutive mid-ladder restarts with no climb between them. A ladder that
+	 * restarts on every stall and never climbs is chasing its own tail (audit
+	 * 2026-10-12: ses_…tNY2maBs, 1432x 1/3, a successful tool on every cycle).
+	 * Past MAX_LADDER_RESTARTS a progress-driven restart is refused so the rung
+	 * climbs toward gaveUp instead of resetting forever. Reset whenever a fire
+	 * does not restart the ladder (the rung moved) or a genuine user message
+	 * arrives. */
+	ladderRestarts: number
 	/** Recoveries sent this episode, all paths that build stall text. Unlike the
 	 * ladder rung (which progress restarts) and episodeRefires (which counts only
 	 * progress restarts), this counts every fire so the nudge text can say which
@@ -279,6 +287,7 @@ interface SessionWatch {
 	/** The session's todo list, read from the todo tool's storage key. */
 	todos: Todo[]
 	todosFetchedAt: number
+	todosDirty: boolean
 	/** Consecutive `task_complete` acks with no new user message or other tool
 	 * work between them. Guards the ack self-loop, where the ack tool-result is
 	 * fed back and the model re-emits the tool instead of ending its turn. Persists
@@ -637,6 +646,12 @@ const DEFAULT_MAX_BACKOFF_MS = 8_000
 const DEFAULT_LOOP_MAX_CONTINUES = 3
 const DEFAULT_LOOP_WINDOW_MS = 10 * 60_000
 const DEFAULT_LIFETIME_MAX_CONTINUES = 9
+/** Consecutive progress-driven ladder restarts allowed before the ladder is
+ * forced to climb. Restarting on progress is correct for one episode; restarting
+ * on EVERY stall means a model that runs a tool per nudge reads 1/3 forever and
+ * gaveUp is never reached (audit 2026-10-12). Generous: the lifetime continue
+ * cap already bounds total fires, so this only catches the tail-chasing tail. */
+const MAX_LADDER_RESTARTS = 3
 const DEFAULT_DEBUG = false
 // Mirrors v1 (Mte90 e1b8374): an inbound user message this recent means the
 // user is engaged (likely composing), so idle nudges stand down. Was 15min here.
@@ -1375,6 +1390,8 @@ function buildOpenTodosReminder(todos: Todo[]): string {
  *  attempted at all. Same mechanism the prompt-polisher uses, which is why its
  *  HTTP DELETE reaches this same server.
  */
+let _serverBaseUrlsCache: { key: string; value: string[] } | null = null
+
 function serverBaseUrls(cmdline?: string): string[] {
 	const out: string[] = []
 	const push = (v: string | undefined) => {
@@ -1388,8 +1405,18 @@ function serverBaseUrls(cmdline?: string): string[] {
 	push(env.OPENCODE_SERVER_PORT)
 	push(env.OPENCODE_PORT)
 	push(env.PORT)
+
+	let rawProc: string | null = null
+	if (cmdline === undefined) {
+		try { rawProc = readFileSync("/proc/self/cmdline", "utf8") } catch { rawProc = "" }
+		const key = `${env.OPENCODE_SERVER_URL ?? ""}|${env.OPENCODE_URL ?? ""}|${env.OPENCODE_SERVER_PORT ?? ""}|${env.OPENCODE_PORT ?? ""}|${env.PORT ?? ""}|${rawProc}`
+		if (_serverBaseUrlsCache && _serverBaseUrlsCache.key === key) {
+			return _serverBaseUrlsCache.value
+		}
+	}
+
 	try {
-		const raw = cmdline ?? readFileSync("/proc/self/cmdline", "utf8")
+		const raw = cmdline ?? (rawProc as string)
 		const argv = raw.split("\0")
 		const portFlag = argv.indexOf("--port")
 		if (portFlag !== -1 && argv[portFlag + 1]) {
@@ -1400,8 +1427,14 @@ function serverBaseUrls(cmdline?: string): string[] {
 	} catch {
 	// /proc unavailable (non-Linux): env vars only
 	}
+
+	if (cmdline === undefined) {
+		const key = `${env.OPENCODE_SERVER_URL ?? ""}|${env.OPENCODE_URL ?? ""}|${env.OPENCODE_SERVER_PORT ?? ""}|${env.OPENCODE_PORT ?? ""}|${env.PORT ?? ""}|${rawProc}`
+		_serverBaseUrlsCache = { key, value: [...out] }
+	}
 	return out
 }
+
 /** HTTP Basic for the local server, same derivation the prompt-polisher uses. */
 function serverHeaders(): Record<string, string> {
 	const pw = process.env.OPENCODE_SERVER_PASSWORD || process.env.OPENCODE_PASSWORD
@@ -2110,9 +2143,11 @@ export default define({
 			if (w) {
 				w.emptyIdleNudged ??= false
 				w.episodeRecovers ??= 0
+				w.ladderRestarts ??= 0
 				w.lifetimeContinues ??= 0
 				w.inflightTools ??= new Map()
 				w.lastStuckToolCheck ??= 0
+				w.todosDirty ??= true
 				return w
 			}
 			if (!w) {
@@ -2124,6 +2159,7 @@ export default define({
 					userCancelledAt: 0,
 					resumeAttempts: 0,
 					episodeRefires: 0,
+					ladderRestarts: 0,
 					episodeRecovers: 0,
 					lifetimeContinues: 0,
 					lastRetryAt: 0,
@@ -2164,6 +2200,7 @@ export default define({
 					emptyIdleNudged: false,
 					todos: [],
 					todosFetchedAt: 0,
+					todosDirty: true,
 					taskCompleteSignals: 0,
 					taskCompleteOverrides: 0,
 					orphanWatchStartAt: null,
@@ -2239,6 +2276,7 @@ export default define({
 				// list is new information each turn, not a model that keeps saying the
 				// same thing.
 				w.todoNudgeAttempts = 0
+				w.todosDirty = true
 				w.intentNudgeAttempts = 0
 				// NOTE: emptyIdleNudged is deliberately NOT reset here. The
 				// flag is single-shot per observable episode, and markBusy runs
@@ -2287,6 +2325,7 @@ export default define({
 				w.textParts.clear()
 				w.lastAssistantText = ""
 			}
+			invalidateContextCache(sid)
 			w.status = "busy"
 			w.idleSince = null
 			w.lastActivityAt = Date.now()
@@ -2296,6 +2335,7 @@ export default define({
 			const w = ensureWatch(sid)
 			if (w.status !== "idle") {
 				dbg(`${short(sid)} ${w.status} -> idle`)
+				invalidateContextCache(sid)
 				w.status = "idle"
 				w.idleSince = Date.now()
 				// Idle means nothing is in flight. Any slot still held belongs to a tool
@@ -3265,20 +3305,56 @@ export default define({
 			// stalls must keep climbing toward gaveUp, else every cycle reads
 			// 1/3 forever). gaveUp itself is left alone: only a fresh turn
 			// (markBusy) clears that latch.
-			if (w.lastProdText !== "" && w.lastAssistantText !== w.prodAssistantSnapshot) {
+			// A stall after fresh model output is a NEW episode, not a deeper
+			// one: restart the ladder so it reads attempt 1/3 again
+			// (ses_ee7dade1 — 2/3 landed after real work). Assistant TEXT growth
+			// always counts. Successful tool/shell work counts only for
+			// silence-triggered stalls (ses_ede9b725 — 1/3 woke the model, it
+			// read a file, then went quiet): a wake-up that produced work is a
+			// new episode. Failure/dead-stream triggers never reset on tool
+			// progress (ses_edf403f5 — tool completion between dead-stream
+			// stalls must keep climbing toward gaveUp, else every cycle reads
+			// 1/3 forever). gaveUp itself is left alone: only a fresh turn
+			// (markBusy) clears that latch.
+			//
+			// Tail-chasing guard: a session that produces *something* on every
+			// cycle (a tool on each nudge) resets the ladder on every fire and
+			// so reads 1/3 forever while `gaveUp` is never reached (audit
+			// 2026-10-12: ses_…tNY2maBs, 1432x 1/3). A single restart per
+			// progress event is correct; an unbroken run of them is a tail
+			// chase. Past MAX_LADDER_RESTARTS the reset is refused so the rung
+			// climbs and the ladder can reach gaveUp. The run clears the moment
+			// a fire does NOT restart the ladder (the rung moved).
+			const textGrowth = w.lastProdText !== "" && w.lastAssistantText !== w.prodAssistantSnapshot
+			const toolProgress = !textGrowth && isSilenceReason(reason) && w.succeededSinceProd > 0
+			let ladderRestarted = false
+			if ((textGrowth || toolProgress) && w.resumeAttempts > 0 && w.ladderRestarts >= MAX_LADDER_RESTARTS) {
+				log(
+					"warn",
+					`${short(sid)} ladder restarted ${w.ladderRestarts}x with no climb — refusing restart so the rung climbs (reason: ${reason}) mod=${MODULE_INSTANCE}`,
+				)
+			} else if (textGrowth) {
 				// Every reset logs: silent restarts hid the endless-1/3 loop
 				// for weeks (ses_ef3a2ba2 — resets visible only once in six
 				// fires). Observability before economy here.
 				log("info", `${short(sid)} text growth since last prod — restarting the stall ladder`)
 				// Only count mid-ladder restarts: a first fire after genuine
 				// work (attempts still 0) is a fresh episode, not a refire.
-				if (w.resumeAttempts > 0) w.episodeRefires++
+				if (w.resumeAttempts > 0) {
+					w.episodeRefires++
+					ladderRestarted = true
+				}
 				w.resumeAttempts = 0
-			} else if (isSilenceReason(reason) && w.succeededSinceProd > 0) {
+			} else if (toolProgress) {
 				log("info", `${short(sid)} progress since last prod — restarting the stall ladder`)
-				if (w.resumeAttempts > 0) w.episodeRefires++
+				if (w.resumeAttempts > 0) {
+					w.episodeRefires++
+					ladderRestarted = true
+				}
 				w.resumeAttempts = 0
 			}
+			w.ladderRestarts = ladderRestarted ? w.ladderRestarts + 1 : 0
+
 			if (lifetimeExhausted(sid, w)) return
 			recordContinue(sid)
 			if (w.resumeAttempts >= maxRetries) {
@@ -3409,11 +3485,15 @@ export default define({
 		async function readTodos(sid: string): Promise<Todo[]> {
 			const w = ensureWatch(sid)
 			const now = Date.now()
-			if (w.todosFetchedAt && now - w.todosFetchedAt < TODO_CACHE_TTL_MS) return w.todos
+			// Turn-boundary cache: todos can only change while the model works,
+			// so a clean cache is valid until the next markBusy (or a todowrite
+			// tool success) sets todosDirty. The TTL stays as a safety net.
+			if (w.todosFetchedAt && !w.todosDirty && now - w.todosFetchedAt < TODO_CACHE_TTL_MS * 100) return w.todos
 			const fromMessages = await todosFromMessageSources(sid)
 			if (fromMessages) {
 			w.todos = fromMessages
 			w.todosFetchedAt = now
+			w.todosDirty = false
 			return w.todos
 			}
 			if (!ctx.storage) return w.todos
@@ -3427,6 +3507,7 @@ export default define({
 			typeof (t as Todo).status === "string",
 			)
 			w.todosFetchedAt = now
+			w.todosDirty = false
 			return w.todos
 			} catch (e) {
 			dbg(`${short(sid)} todo read failed:`, e instanceof Error ? e.message : String(e))
@@ -3508,6 +3589,7 @@ export default define({
 					return
 				}
 				if (w.userCancelled) return
+				invalidateContextCache(sid)
 				void inspectOnIdle(sid, "pattern")
 			}, toolTextCheckDelayMs)
 			dbg(`${short(sid)} pattern pass armed for +${toolTextCheckDelayMs}ms`)
@@ -3599,6 +3681,28 @@ export default define({
 		 * Returns `[]` on any failure: this is forensic, and every caller already
 		 * treats "no history" as "cannot conclude".
 		 */
+		// Short-lived cache for the raw `session.context()` result. Invalidated
+		// on turn boundaries (markBusy/markIdle) so a fresh turn always re-reads,
+		// and TTL-bounded so the deferred pattern pass (after toolTextCheckDelayMs)
+		// does not reuse the structural pass's stale snapshot.
+		const CONTEXT_CACHE_TTL_MS = 1_000
+		const contextCache = new Map<string, { at: number; value: unknown[] }>()
+		function invalidateContextCache(sid: string): void { contextCache.delete(sid) }
+		async function cachedSessionContext(sid: string): Promise<unknown[]> {
+			const now = Date.now()
+			const c = contextCache.get(sid)
+			if (c && now - c.at < CONTEXT_CACHE_TTL_MS) return c.value
+			try {
+				const res = await ctx.session.context({ sessionID: sid })
+				const arr = Array.isArray(res) ? res : ((res as { messages?: unknown[] })?.messages ?? [])
+				contextCache.set(sid, { at: now, value: arr })
+				return arr
+			} catch (e) {
+				dbg(`${short(sid)} session.context() failed:`, e instanceof Error ? e.message : String(e))
+				return []
+			}
+		}
+
 		async function loadMessages(sid: string): Promise<unknown[]> {
 			try {
 				const res = await ctx.session.context({ sessionID: sid })
@@ -4157,6 +4261,9 @@ export default define({
 			// stall starts back at the base fuse.
 			w.episodeRefires = 0
 			w.episodeRecovers = 0
+			// A new instruction also clears the tail-chase run: the ladder budget
+			// is per genuine episode, like episodeRefires.
+			w.ladderRestarts = 0
 			// Lifetime cap is also per genuine user episode: new instructions
 			// mean a new task, so the total-fire count starts over here — and
 			// only here (plus genuine execution.started), never on model text.
@@ -4699,6 +4806,7 @@ export default define({
 							return
 						}
 						if (w.userCancelled) return
+						invalidateContextCache(sid)
 						void inspectOnIdle(sid, "pattern")
 					}, waitMs)
 				}
@@ -5677,7 +5785,7 @@ export default define({
 				if (!ref) {
 					// No step observed yet (plugin loaded mid-session): take the ref off
 					// the newest assistant message instead.
-					const msgs = await ctx.session.context({ sessionID: sid })
+					const msgs = await cachedSessionContext(sid)
 					if (Array.isArray(msgs)) {
 						for (let i = msgs.length - 1; i >= 0; i--) {
 							const m = msgs[i] as {
@@ -6117,6 +6225,16 @@ export default define({
 					const total = tokenTotalOf(ev.data?.tokens)
 					if (total <= 0) return
 					const w = ensureWatch(sid)
+					// Capture the model ref from the event when present, so the
+					// saturation path never needs a context() fetch to find it.
+					const m = ev.data?.model ?? ev.data?.info?.model
+					if (m && typeof m === "object") {
+						const providerID = (m as any).providerID ?? (m as any).provider
+						const modelID = (m as any).modelID ?? (m as any).id ?? (m as any).model
+						if (typeof providerID === "string" && typeof modelID === "string") {
+							w.modelRef = { providerID, modelID }
+						}
+					}
 					// Token flow is activity: a turn generating for minutes straight
 					// must not read as idle. Touch ONLY on growth — a flat total
 					// means nothing resumed, so the clock goes stale and the
@@ -6413,6 +6531,8 @@ export default define({
 					const sid = sidOf(ev)
 					if (!sid) return
 					const w = ensureWatch(sid)
+					const toolName = String(ev.data?.tool ?? ev.data?.name ?? "").toLowerCase()
+					if (toolName.includes("todo")) w.todosDirty = true
 					w.lastWasTaskTool = false
 					w.pendingTools = Math.max(0, w.pendingTools - 1)
 					{
