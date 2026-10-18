@@ -5258,12 +5258,19 @@ export default define({
 		 */
 		async function parentWaitingOnSubagents(sid: string, activeIDs: Set<string>): Promise<boolean> {
 			const verdict = await subagentVerdict(sid, activeIDs)
-			if (verdict.status === "busy" || verdict.status === "waiting") return true
-			if (verdict.status !== "idle") return false
+			if (verdict.status === "busy" || verdict.status === "waiting") return true   // live subagent confirmed via parentID — don't nudge
+			if (verdict.status === "crashed") return false                              // dead subagent — recover the parent
+			// verdict.status === "idle": no children discoverable via parentID.
 			const w = ensureWatch(sid)
-			if (w.pendingTools <= 0) return false
-			const children = await listSubagentIds(sid)
-			return children.length > 0
+			if (w.pendingTools <= 0) return false                                       // no outstanding work — not waiting on anything
+			// pendingTools > 0 but no live child discoverable (parentID not
+			// propagated or timing gap). Do NOT unconditionally skip: a dead tool
+			// (no success/failed event) keeps pendingTools > 0 forever and looks
+			// identical to a slow-but-live worker in every signal we have.
+			// Falling through lets stall detection recover it. The earlier
+			// inflightTools / hasYoungUnfinishedWork TTL guards already protect
+			// recently-dispatched tools; old outstanding tools are treated as stuck.
+			return false
 		}
 
 		/**
