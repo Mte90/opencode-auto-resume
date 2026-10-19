@@ -175,6 +175,10 @@ interface SessionWatch {
 	 * stretch 1/3 forever. Past the max the session stands down. */
 	lifetimeContinues: number
 	lastRetryAt: number
+	/** Newest `session.retry.scheduled` for this session: the provider is
+	 * retrying this turn itself, so a stall that follows within
+	 * PROVIDER_RETRY_GRACE_MS is a transport fault, not model unresponsiveness. */
+	providerRetryAt: number
 	/** Last wall-clock a user-visible quota notice was sent (first arm +
 	 * budget-exhausted). One notice per episode: the stand-down itself is
 	 * silent by design, but a session that looks dead for hours with no
@@ -632,6 +636,11 @@ const DEFAULT_MAX_RETRIES = 3
  * latch stands the session down. Counts recoveries with no model output
  * between them, not attempts: a dead backend fails every turn identically. */
 const FAILURE_LOOP_MAX = 3
+/** How long after a `session.retry.scheduled` a stall is still read as the
+ * provider's own retry rather than a fresh model stall. Wide enough to cover a
+ * backoff-plus-retry cycle: the prod still fires inside it, only the ladder
+ * escalation is held. */
+const PROVIDER_RETRY_GRACE_MS = 120_000
 const DEFAULT_BASE_BACKOFF_MS = 1_000
 const DEFAULT_MAX_BACKOFF_MS = 8_000
 const DEFAULT_LOOP_MAX_CONTINUES = 3
@@ -1544,6 +1553,14 @@ function isSilenceReason(reason: string): boolean {
 	return /^no activity for \d+s/i.test(reason)
 }
 
+/** True while the provider has told us it is retrying this session's turn (see
+ * the `session.retry.scheduled` handler). Inside that window a stall belongs to
+ * the transport, not the model: the ladder holds its rung and never gives up on
+ * it (ses_eae46bb9, 2026-10-19). */
+function isProviderRetryFresh(w: SessionWatch, now = Date.now()): boolean {
+	return w.providerRetryAt > 0 && now - w.providerRetryAt < PROVIDER_RETRY_GRACE_MS
+}
+
 function isStreamingFailure(message: string, patterns: string[] = STREAMING_FAILURE_MESSAGE_PATTERNS): boolean {
 	const lower = message.toLowerCase()
 	if (!lower) return false
@@ -2127,6 +2144,7 @@ export default define({
 					episodeRecovers: 0,
 					lifetimeContinues: 0,
 					lastRetryAt: 0,
+					providerRetryAt: 0,
 					quotaNoticedAt: 0,
 					gaveUp: false,
 					lastGenuineUserAt: 0,
@@ -3280,16 +3298,35 @@ export default define({
 				w.resumeAttempts = 0
 			}
 			if (lifetimeExhausted(sid, w)) return
-			recordContinue(sid)
-			if (w.resumeAttempts >= maxRetries) {
+			// A failure the provider is already retrying is not model
+			// unresponsiveness: hold the rung, and never give up on it. Otherwise a
+			// transport fault climbs the ladder into gaveUp, which is terminal
+			// silence (the sweep is gated on !gaveUp and only a genuine user
+			// message clears it). ses_eae46bb9, 2026-10-19: 3x ECONNRESET, each
+			// answered by opencode's own `provider retry #2`, drove 1/3 -> 2/3 ->
+			// restart -> 1/3 and was one fire from standing the session down. The
+			// prod below still fires: a dead stream needs waking even when the
+			// provider is coming back.
+			const providerFault =
+				isProviderRetryFresh(w) &&
+				(reason.startsWith("session.step.failed") || reason.startsWith("session.execution.failed"))
+			// The rung is committed only when the prompt below actually lands (see
+			// the inject timer), because counting at detection burned rungs on the
+			// injections the busy/live guard declined (ses_eae46bb9, 2026-10-19).
+			if (!providerFault && w.resumeAttempts >= maxRetries) {
 				log("warn", `${short(sid)} giving up after ${maxRetries} attempts (${reason}) mod=${MODULE_INSTANCE}`)
 				w.gaveUp = true
 				return
 			}
 			w.recovering = true
-			w.resumeAttempts++
-			const delay = backoffMs(w.resumeAttempts, baseBackoff, maxBackoff)
-			const attempt = w.resumeAttempts
+			const attempt = providerFault ? Math.max(1, w.resumeAttempts) : w.resumeAttempts + 1
+			const delay = backoffMs(attempt, baseBackoff, maxBackoff)
+			if (providerFault) {
+				log(
+					"info",
+					`${short(sid)} provider-fault stall (${reason}) — retry scheduled ${Math.round((Date.now() - w.providerRetryAt) / 1000)}s ago, holding the ladder at ${attempt}/${maxRetries}`,
+				)
+			}
 			log(
 				"info",
 				`${short(sid)} stall detected (${reason}) — resume attempt ${attempt}/${maxRetries} in ${delay}ms`,
@@ -3301,6 +3338,9 @@ export default define({
 			// freshness check below cannot see it — event-pump lag means their
 			// execution.started may not have been processed yet when we fire.
 			const armedAt = Date.now()
+			// Whether the prompt this timer sends actually lands. The ladder rung is
+			// committed only when it did — see the ok branch below.
+			let delivered = false
 			w.recoverTimer = setTimeout(async () => {
 				w.recoverTimer = null
 				// Disposed instances must stay silent: a superseded setup's
@@ -3361,6 +3401,17 @@ export default define({
 					const ok = await injectOnce(sid, stallText, "stalled — retrying", false, true)
 					w.pendingRecoveryArmed = false
 					if (ok) {
+						delivered = true
+						// Commit the rung only now that the prompt landed: the text
+						// above already carried `attempt`, and every decliner above
+						// returned before this point, so resumeAttempts counts
+						// delivered prods only (ses_eae46bb9, 2026-10-19: a declined
+						// inject burned rung 1, so the next fire read 2/3 with no
+						// 1/3 ever delivered). A provider-fault fire holds its rung
+						// instead: a transport fault is not the model failing to
+						// continue.
+						if (!providerFault && attempt > w.resumeAttempts) w.resumeAttempts = attempt
+						recordContinue(sid)
 						w.lastRetryAt = Date.now()
 						touch(sid)
 						markBusy(sid)
@@ -3369,6 +3420,9 @@ export default define({
 					}
 				} finally {
 					w.recovering = false
+					if (!delivered) {
+						dbg(`${short(sid)} attempt ${attempt}/${maxRetries} not delivered — rung not consumed (${reason})`)
+					}
 				}
 			}, delay)
 		}
@@ -4153,6 +4207,9 @@ export default define({
 				dbg(`${short(sid)} new user message — restarting the stall ladder`)
 			}
 			w.resumeAttempts = 0
+			// The user owns the turn now: a retry scheduled before their message
+			// no longer describes what a stall after it means.
+			w.providerRetryAt = 0
 			// A genuine user message also closes any refire episode: the next
 			// stall starts back at the base fuse.
 			w.episodeRefires = 0
@@ -6485,6 +6542,9 @@ export default define({
 					if (!sid) return
 					const w = ensureWatch(sid)
 					touch(sid) // provider-level retry is progress of its own kind
+					// ...and proof that this stall is the provider's to fix, not
+					// the model's: see isProviderRetryFresh / PROVIDER_RETRY_GRACE_MS.
+					w.providerRetryAt = Date.now()
 					const errType = String(ev.data?.error?.type ?? "")
 					const errMsg = String(ev.data?.error?.message ?? "")
 					maybeLockOoc(sid, errMsg, errType)
