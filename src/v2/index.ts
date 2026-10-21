@@ -5681,15 +5681,18 @@ export default define({
 					dbg(`${short(sid)} tool call still unfinished in history — working, not stalled`)
 					continue
 				}
-				// If another session is actively running and this one went silent
-				// right after dispatching a task tool, treat it as a parent wait.
-				if (w.lastWasTaskTool) {
-					const others = (await getActiveSessions()).filter((s) => s !== sid)
-					if (others.length > 0) {
-						dbg(`${short(sid)} silent after task tool with ${others.length} active child(ren) — waiting`)
-						continue
-					}
-				}
+				// A parent that dispatched a task tool and then went quiet is often
+				// waiting for a child. "Some other session is running" is NOT that
+				// evidence: on a busy box the reading silenced the stall detector for
+				// every session that ever dispatched a task tool, for as long as
+				// anything else was running (ses_ea173ea1effe7LdQB40HNuv2Jl, 2026-10-21:
+				// the 9am upstream-sync parent sat idle for 7 hours with its workers
+				// already cancelled). The parentID link below is the real evidence —
+				// it waits on a live child, waits on a quiet one inside the patience
+				// window, and RECOVERS a crashed one, which the coarse reading masked.
+				// When the link is undiscoverable the parent is recovered on purpose
+				// (cf1a395): an unfinished tool part in the parent's own history
+				// (checked above) still shows a live dispatch.
 				// A parent waiting on a live subagent is working, not stalled. The
 				// heuristic above misses native dispatches (no tool.called event)
 				// and active-set lag; the parentID link does not (see
