@@ -6,6 +6,7 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import type { SessionPromptResponses } from "@opencode-ai/sdk"
+import { setup as setupV2 } from "./v2"
 
 interface Todo {
     content: string
@@ -3125,4 +3126,11 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     }
 }
 
-export default AutoResumePlugin
+// Dual-shape plugin export: OpenCode 1 (>=1.3.4) calls `server`, OpenCode 2
+// calls `setup` (see src/v2.ts). The named `AutoResumePlugin` export above
+// stays unchanged for V1 hosts that import it directly.
+export default {
+    id: "opencode-auto-resume",
+    server: AutoResumePlugin,
+    setup: setupV2,
+}

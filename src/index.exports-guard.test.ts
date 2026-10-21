@@ -37,8 +37,12 @@ describe("REGRESSION: non-Plugin exports crash OpenCode host", () => {
         expect(SOURCE).toMatch(/^export\s+const\s+AutoResumePlugin/m)
     })
 
-    test("plugin source must have a default export", () => {
-        expect(SOURCE).toMatch(/^export\s+default\s+AutoResumePlugin/m)
+    test("plugin source must have a dual-shape default export (V1 server + V2 setup)", () => {
+        // OpenCode 1 (>=1.3.4) calls `default.server`; OpenCode 2 calls `default.setup`.
+        expect(SOURCE).toMatch(/export\s+default\s+\{/m)
+        expect(SOURCE).toMatch(/id:\s*"opencode-auto-resume"/m)
+        expect(SOURCE).toMatch(/server:\s*AutoResumePlugin/m)
+        expect(SOURCE).toMatch(/setup:\s*setupV2/m)
     })
 })
 
@@ -60,6 +64,30 @@ describe("REGRESSION: bundled dist must only export Plugin-shaped values (no nul
         }
 
         for (const [name, fn] of Object.entries(mod)) {
+            if (name === "default") {
+                // Dual-shape default export: { id, server (V1), setup (V2) }
+                const def = fn as unknown as Record<string, unknown>
+                if (typeof def !== "object" || def === null) {
+                    throw new Error(`Export "default" is not an object (got ${typeof def})`)
+                }
+                if (typeof def.id !== "string") {
+                    throw new Error(`Export "default".id must be a string`)
+                }
+                if (typeof def.server !== "function") {
+                    throw new Error(`Export "default".server must be a function (V1 Plugin)`)
+                }
+                if (typeof def.setup !== "function") {
+                    throw new Error(`Export "default".setup must be a function (V2 Plugin setup)`)
+                }
+                const result = await (def.server as Function)(fakeCtx, {})
+                if (result === null || typeof result !== "object") {
+                    throw new Error(
+                        `REGRESSION BROKEN: export "default".server returned ${result} when called as Plugin. ` +
+                        `OpenCode 1's loader expects the V1 plugin to return a Hooks object.`,
+                    )
+                }
+                continue
+            }
             if (typeof fn !== "function") {
                 throw new Error(`Export "${name}" is not a function (got ${typeof fn})`)
             }

@@ -376,6 +376,19 @@ With options:
 }
 ```
 
+### OpenCode 2
+
+Works on both OpenCode 1 and OpenCode 2 — no separate install needed. On OpenCode 2 the config key is `plugins`:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["opencode-auto-resume"]
+}
+```
+
+The package ships a dual-shape entrypoint: OpenCode 1 (>= 1.3.4) loads the classic V1 plugin via the `server` field, while OpenCode 2 calls the new `setup` entrypoint (see `src/v2.ts`), which bridges the same features onto the V2 APIs (tool hooks, event bus, `task_complete` tool registration).
+
 ## Configuration
 
 ```json
