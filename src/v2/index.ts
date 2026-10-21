@@ -1704,6 +1704,54 @@ function msgAt(m: unknown): number {
 	return typeof t === "number" ? t : 0
 }
 
+/**
+ * Readable body of a history record. The live projection is not uniform: some
+ * records carry a `content` array of parts, others a plain `text` string. The
+ * own-prompt check below needs the body in either shape - a miss here reads our
+ * own injection as a genuine user message.
+ */
+function messageTextOf(m: unknown): string | undefined {
+	const mm = m as
+		| { content?: Array<{ type?: string; text?: string }>; text?: unknown; info?: { content?: unknown } }
+		| null
+		| undefined
+	if (!mm || typeof mm !== "object") return undefined
+	if (Array.isArray(mm.content)) {
+		const parts = mm.content
+			.filter((p) => p?.type === "text" && typeof p.text === "string")
+			.map((p) => p.text as string)
+		if (parts.length > 0) return parts.join("\n")
+	}
+	if (typeof mm.text === "string" && mm.text.length > 0) return mm.text
+	if (typeof mm.info?.content === "string" && mm.info.content.length > 0) return mm.info.content
+	return undefined
+}
+
+/**
+ * Signatures of the prompts this plugin injects as visible user messages.
+ *
+ * Exact-text and recency matching are not enough on their own: the in-memory
+ * record of our own injections (ownPromptTexts / lastInjectAt) dies with the
+ * plugin instance, and a reload re-adopts a session whose newest user message
+ * is our OWN stall prompt. That prompt then reads as a genuine user message
+ * and resets the stall ladder AND the visible progress counter to 1/3 - the
+ * endless "attempt 1/3 (retry #1)" loop (ses_ea0141a1bffeX189yxDLHl1QDU,
+ * 2026-10-21: five consecutive stalls, every one of them "1/3 (retry #1)").
+ *
+ * The prompt body carries its own signature, so the message itself is the
+ * durable record of who wrote it.
+ */
+const OWN_PROMPT_SHAPES: RegExp[] = [
+	/^continue\s*\u2014\s*stalled\s*\(/,
+	/^continue\s*\nOnly continue work already in progress\./,
+	/^continue\s*\nIf work was already in progress,/,
+]
+
+function looksLikeOwnPrompt(text: string | undefined): boolean {
+	if (typeof text !== "string" || text.length === 0) return false
+	return OWN_PROMPT_SHAPES.some((re) => re.test(text))
+}
+
 function isTaskToolCall(ev: V2Event): boolean {
 	const tool = ev.data?.tool ?? ev.data?.toolName
 	if (typeof tool === "string") {
@@ -3227,7 +3275,7 @@ export default define({
 		 * Core recovery ladder for a stuck/failed session.
 		 * plain continue with backoff -> more attempts -> abort+resume escalation.
 		 */
-		async function recover(sid: string, reason: string) {
+		async function recover(sid: string, reason: string): Promise<void> {
 			const w = ensureWatch(sid)
 			if (w.recovering || w.aborting || w.gaveUp || w.userCancelled || w.permissionPending) return
 			if (w.failureLoopLatched) {
@@ -4092,7 +4140,34 @@ export default define({
 		 * that re-announces completion each turn would otherwise be handed a fresh
 		 * budget each time it announced, and the nudge would never stop.
 		 */
+		/**
+		 * Rebuild what we know about our OWN injections from the session log.
+		 *
+		 * ownPromptTexts and lastInjectAt live in the watch record, which a plugin
+		 * reload starts empty. Without this, the newest user message of a session
+		 * we ourselves nudged looks like a genuine user message on the next sweep:
+		 * the stall ladder restarts at 1/3 and the visible progress counter resets,
+		 * so a long stall cycle reads "attempt 1/3 (retry #1)" over and over. The
+		 * session log is the durable record - rebuild from it.
+		 */
+		function rememberOwnPrompts(w: SessionWatch, messages: unknown[]): void {
+			const start = Math.max(0, messages.length - 40)
+			for (let i = start; i < messages.length; i++) {
+				const m = messages[i]
+				if (msgRole(m) !== "user") continue
+				const text = messageTextOf(m)
+				if (!looksLikeOwnPrompt(text)) continue
+				if (!w.ownPromptTexts.includes(text as string)) {
+					w.ownPromptTexts.push(text as string)
+					if (w.ownPromptTexts.length > 10) w.ownPromptTexts.shift()
+				}
+				const at = msgAt(m)
+				if (at > 0 && at > w.lastInjectAt) w.lastInjectAt = at
+			}
+		}
+
 		function noteInboundUserMessage(sid: string, w: SessionWatch, messages: unknown[]): void {
+			rememberOwnPrompts(w, messages)
 			let latest: { id?: string; at?: number; text?: string } | null = null
 			for (let i = messages.length - 1; i >= 0; i--) {
 				const m = messages[i] as {
@@ -4102,12 +4177,11 @@ export default define({
 					time?: { created?: number }
 					info?: { time?: { created?: number }; role?: string }
 					content?: Array<{ type?: string; text?: string }>
+					text?: string
 				}
 				const isUser = msgRole(m) === "user"
 				if (!isUser) continue
-				const text = Array.isArray(m?.content)
-					? m.content.filter((p) => p?.type === "text" && typeof p.text === "string").map((p) => p.text as string).join("\n")
-					: undefined
+				const text = messageTextOf(m)
 				latest = { id: typeof m.id === "string" ? m.id : undefined, at: m.time?.created ?? m.info?.time?.created, text }
 				break
 			}
@@ -4129,12 +4203,15 @@ export default define({
 			// defeats text matching, but our prompt always lands within seconds
 			// of the inject on the same box clock.
 			const ownByText = typeof latest.text === "string" && latest.text.length > 0 && w.ownPromptTexts.includes(latest.text)
+			// The prompt body itself says who wrote it. This survives a plugin
+			// reload, where the in-memory own-prompt record starts empty.
+			const ownByShape = looksLikeOwnPrompt(latest.text)
 			const ownByTime =
 				typeof latest.at === "number" &&
 				w.lastInjectAt > 0 &&
 				latest.at >= w.lastInjectAt &&
 				latest.at - w.lastInjectAt < OWN_PROMPT_TIME_MS
-			if (ownByText || ownByTime) {
+			if (ownByText || ownByShape || ownByTime) {
 				dbg(`${short(sid)} newest user message is our own prompt — not re-arming budgets`)
 				return
 			}
@@ -6133,6 +6210,13 @@ export default define({
 					if (w.selfRecovery) {
 						w.selfRecovery = false
 					} else {
+						// A provider retry that opencode schedules itself starts a
+						// turn without the user asking. It is not a new episode: it
+						// must not wipe the visible progress counter, or the ladder
+						// reads 1/3 forever while the session is actually working
+						// (ses_ea0141a1bffeX189yxDLHl1QDU, 2026-10-21: five stalls
+						// in a row, every one of them "attempt 1/3 (retry #1)").
+						const providerRetryFresh = isProviderRetryFresh(w)
 						clearLocks(w, sid)
 						// A genuine turn is activity, and activity means quota is
 						// available again: the rate-limit ladder starts over. Our
@@ -6147,13 +6231,16 @@ export default define({
 						w.gaveUp = false
 						// Same for the empty-idle single-shot: a genuine turn is
 						// a new episode, so the instant nudge re-arms here.
-						// Same for the recovery count.
-						w.episodeRecovers = 0
-						// Lifetime cap is per genuine episode too: a real turn
-						// is new work, not our nudge looping. Own recovery
-						// turns skip this branch entirely, so they keep counting.
-						w.lifetimeContinues = 0
-						w.emptyIdleNudged = false
+						// Same for the recovery count — unless the turn is a
+						// provider retry, which is not a new episode.
+						if (!providerRetryFresh) {
+							w.episodeRecovers = 0
+							// Lifetime cap is per genuine episode too: a real turn
+							// is new work, not our nudge looping. Own recovery
+							// turns skip this branch entirely, so they keep counting.
+							w.lifetimeContinues = 0
+							w.emptyIdleNudged = false
+						}
 						// Drop the durable arm with the in-memory one. This delete is
 						// what lets restore skip the history read: no record means the
 						// user has spoken since the arm, so there is nothing to serve.
@@ -6163,8 +6250,8 @@ export default define({
 						// never on lifecycle transitions) — unless our inject is
 						// newer than any genuine user message, in which case the
 						// turn continues our episode (interleaving idle events do
-						// not end it).
-						if (!(w.lastInjectAt > 0 && w.lastInjectAt >= w.lastGenuineUserAt)) {
+						// not end it), or the turn is the provider's own retry.
+						if (!providerRetryFresh && !(w.lastInjectAt > 0 && w.lastInjectAt >= w.lastGenuineUserAt)) {
 							w.resumeAttempts = 0
 						}
 					}
