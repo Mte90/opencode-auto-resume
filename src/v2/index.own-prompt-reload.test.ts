@@ -161,6 +161,11 @@ async function waitFor(what: () => boolean, budgetMs = 4000): Promise<boolean> {
 	return what()
 }
 
+const attemptOf = (text: string | undefined): string | null => {
+	const m = /attempt (\d+)\/\d+/.exec(text ?? "")
+	return m ? m[1] : null
+}
+
 const retryOf = (text: string | undefined): string | null => {
 	const m = /retry #(\d+)/.exec(text ?? "")
 	return m ? m[1] : null
@@ -200,13 +205,20 @@ describe("v2: our own stall prompt is not a genuine user message", () => {
 		// starts it empty), and the body is in the plain-text shape.
 		messages.push(ownStallRecord(Date.now() - 600_000, "u_own_1"))
 		await waitFor(() => h.injected.length >= 2)
+		const attempts = h.injected.map((i: any) => attemptOf(i.text))
 		const retries = h.injected.map((i: any) => retryOf(i.text))
 		const logs = readLog(h)
 		await teardown(h)
-		expect(retries.length).toBeGreaterThanOrEqual(2)
-		// Pre-fix both reads were "1": the counter was reset by our own prompt.
+		expect(attempts.length).toBeGreaterThanOrEqual(2)
+		// The model produced nothing between the stalls, so the ATTEMPTS climb
+		// (they count unanswered nudges) ...
+		expect(attempts[0]).toBe("1")
+		expect(attempts[1]).toBe("2")
+		// ... and the retry count (work done) stays put. Pre-fix the second
+		// nudge read "attempt 1/3 (retry #1)" - the counter was reset by our
+		// own prompt being read as a genuine user message.
 		expect(retries[0]).toBe("1")
-		expect(retries[1]).toBe("2")
+		expect(retries[1]).toBe("1")
 		expect(logs).not.toContain("new user message — restarting the stall ladder")
 	})
 })

@@ -133,6 +133,11 @@ async function waitFor(what: () => boolean, budgetMs = 3000): Promise<boolean> {
 	return what()
 }
 
+const retryOf = (text: string | undefined): string | null => {
+	const m = /retry #(\d+)/.exec(text ?? "")
+	return m ? m[1] : null
+}
+
 /** The internal give-up ladder, read from the log line the plugin writes
  *  ("stall detected (...) - resume attempt N/3 in Xms (episode M)"). The
  *  VISIBLE attempt number in the injected text is the episode count now, so
@@ -171,13 +176,14 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		const logs = existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : ""
 		await teardown(h)
 		const attempts = h.injected.map((i: any) => attemptOf(i.text))
+		const retries = h.injected.map((i: any) => retryOf(i.text))
 		expect(attempts.length).toBeGreaterThanOrEqual(2)
-		// The LADDER restarts on model progress: the give-up budget starts
-		// over, so a session that keeps working is never stood down.
+		// Model text IS work: the attempts reset to 1/3 (the give-up budget
+		// starts over, so a session that keeps working is never stood down) ...
+		expect(attempts.slice(0, 2)).toEqual(["1", "1"])
 		expect(ladderOf(logs).slice(0, 2)).toEqual(["1", "1"])
-		// The VISIBLE number counts the episode instead, so the user can see
-		// the nudges piling up even while the ladder restarts underneath.
-		expect(attempts.slice(0, 2)).toEqual(["1", "2"])
+		// ... and the retry count moves instead. The two never climb together.
+		expect(retries.slice(0, 2)).toEqual(["1", "2"])
 	})
 
 	test("tool completions between failure-driven recovers do not restart the ladder", async () => {
@@ -217,11 +223,13 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		const attempts = h.injected.map((i: any) => attemptOf(i.text))
 		const logs = existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : ""
 		await teardown(h)
-		// Ladder restarts (the give-up budget starts over) ...
+		// A successful tool IS work: the attempts reset to 1/3 ...
+		expect(attempts.slice(0, 2)).toEqual(["1", "1"])
 		expect(ladderOf(logs).slice(0, 2)).toEqual(["1", "1"])
 		expect(logs).toContain("restarting the stall ladder")
-		// ... while the visible number counts the episode.
-		expect(attempts.slice(0, 2)).toEqual(["1", "2"])
+		// ... and the retry count moves instead.
+		const retries = h.injected.map((i: any) => retryOf(i.text))
+		expect(retries.slice(0, 2)).toEqual(["1", "2"])
 	})
 
 	test("a failed tool between silence stalls does not restart the ladder", async () => {
@@ -257,8 +265,10 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		const attempts = h.injected.map((i: any) => attemptOf(i.text))
 		const logs = existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : ""
 		await teardown(h)
+		expect(attempts.slice(0, 2)).toEqual(["1", "1"])
 		expect(ladderOf(logs).slice(0, 2)).toEqual(["1", "1"])
-		expect(attempts.slice(0, 2)).toEqual(["1", "2"])
+		const retries = h.injected.map((i: any) => retryOf(i.text))
+		expect(retries.slice(0, 2)).toEqual(["1", "2"])
 	})
 
 	test("a genuine turn restarts the retry count but not the ladder", async () => {
@@ -285,19 +295,10 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		const retries = h.injected.map((i: any) => retryOf(i.text))
 		const logs = existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : ""
 		await teardown(h)
-		// The give-up ladder keeps climbing through a genuine turn ...
+		// A genuine turn is NOT work: neither counter moves, and the give-up
+		// ladder keeps climbing through it.
 		expect(ladderOf(logs).slice(0, 2)).toEqual(["1", "2"])
-		// ... while the episode counter restarts: the log's episode annotation
-		// reads 1 again for the fire that follows the genuine turn (it would
-		// read 2 without the reset).
-		const episodes = episodeOf(logs)
-		expect(episodes.length).toBeGreaterThanOrEqual(3)
-		expect(episodes[1]).toBe("1")
-		// The visible numbers count the episode, so the pair reads #1 then #2:
-		// the new episode's first fire repeats the previous text and the
-		// duplicate suppression declines it (no model output since the last
-		// prod) - the delivered sequence stays consecutive.
-		expect(retries.slice(0, 2)).toEqual(["1", "2"])
+		expect(retries.slice(0, 2)).toEqual(["1", "1"])
 		expect(attempts.slice(0, 2)).toEqual(["1", "2"])
 	})
 	test("each fire carries its episode retry number", async () => {
@@ -378,7 +379,30 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		const attempts = h.injected.map((i: any) => attemptOf(i.text))
 		const retries = h.injected.map((i: any) => /retry #(\d+)/.exec(i.text ?? "")?.[1] ?? null)
 		await teardown(h)
+		// A silent stall: the attempts climb 1/3, 2/3, 3/3 ...
 		expect(attempts.slice(0, 3)).toEqual(["1", "2", "3"])
+		// ... while the retry count does NOT move (no work was done) - the two
+		// numbers never climb together.
+		expect(retries.slice(0, 3)).toEqual(["1", "1", "1"])
+	})
+
+	test("three answered stalls read 1/3, 1/3, 1/3 with retry #1, #2, #3", async () => {
+		// The user's spec: "a user seeing 3 stall messages that were all 1/3
+		// SHOULD see retry 1, 2 and 3 so he knows it's not a fucking loop."
+		// The model works between every nudge, so the attempts reset each time
+		// and the retry count is what moves.
+		const h = await setup()
+		push(h, "session.execution.started", SID)
+		await wait(10)
+		await waitFor(() => h.injected.length >= 1)
+		push(h, "session.text.delta", SID, { assistantMessageID: "m1", delta: "work happened" })
+		await waitFor(() => h.injected.length >= 2)
+		push(h, "session.text.delta", SID, { assistantMessageID: "m2", delta: "more work" })
+		await waitFor(() => h.injected.length >= 3)
+		const attempts = h.injected.map((i: any) => attemptOf(i.text))
+		const retries = h.injected.map((i: any) => retryOf(i.text))
+		await teardown(h)
+		expect(attempts.slice(0, 3)).toEqual(["1", "1", "1"])
 		expect(retries.slice(0, 3)).toEqual(["1", "2", "3"])
 	})
 

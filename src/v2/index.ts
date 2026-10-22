@@ -168,7 +168,9 @@ interface SessionWatch {
 	 * ladder rung (which progress restarts) and episodeRefires (which counts only
 	 * progress restarts), this counts every fire so the nudge text can say which
 	 * recovery of the episode it is. Reset at the same genuine-episode sites. */
-	episodeRecovers: number
+	/** How many times the model DID work after a nudge. The visible
+	 *  `retry #N`; it moves when the attempts reset, never with them. */
+	workRetries: number
 	/** Lifetime stall continues this genuine user episode. Unlike
 	 * `resumeAttempts` (restarted by model text) this only resets on a
 	 * genuine user message, so a model that keeps answering "done" cannot
@@ -2192,7 +2194,7 @@ export default define({
 			// sharing began needs a default here, not just in the constructor below.
 			if (w) {
 				w.emptyIdleNudged ??= false
-				w.episodeRecovers ??= 0
+				w.workRetries ??= 0
 				w.lifetimeContinues ??= 0
 				w.inflightTools ??= new Map()
 				w.lastStuckToolCheck ??= 0
@@ -2207,7 +2209,7 @@ export default define({
 					userCancelledAt: 0,
 					resumeAttempts: 0,
 					episodeRefires: 0,
-					episodeRecovers: 0,
+					workRetries: 0,
 					lifetimeContinues: 0,
 					lastRetryAt: 0,
 					providerRetryAt: 0,
@@ -3110,8 +3112,6 @@ export default define({
 			w.gaveUp = false
 			// Same observable-episode rule for the empty-idle single-shot.
 			w.emptyIdleNudged = false
-			// A genuine turn is also a new counting episode.
-			w.episodeRecovers = 0
 			// Deliberately does not recordContinue(): our own escalation must not feed
 			// the loop guard that triggered it, or the guard trips on its own output.
 			// Through the same choke point as every other path. The runtime
@@ -3277,23 +3277,25 @@ export default define({
 			// (Predicate hoisted to module scope: recover reuses it for the
 			// success-progress episode reset.)
 			const isSilence = isSilenceReason(reason)
-			// BOTH numbers the user reads must COUNT.
+			// TWO COUNTERS, TWO MEANINGS - they never move together.
 			//
-			// The attempt number used to be the give-up ladder (w.resumeAttempts),
-			// which resets on any assistant text growth - a model that streams
-			// reasoning kept it at 1/3 forever, so even a REAL stall never went
-			// 1/3 -> 2/3 -> 3/3 and the number carried no information. It now
-			// comes from the episode nudge count, the same counter the `retry #N`
-			// half already shows, so a stalled session reads 1/3, 2/3, 3/3 as the
-			// nudges pile up. The give-up ladder keeps its own semantics and
-			// still drives `gaveUp` - the terminal-silence protection is
-			// untouched.
+			// `attempt N/M` - consecutive nudges the model did NOT answer. It
+			// climbs 1/3, 2/3, 3/3 and a nudge the model answered resets it to
+			// 1. That is the give-up ladder (w.resumeAttempts), which already
+			// carried exactly this rule.
+			//
+			// `retry #K` - how many times the model DID work after a nudge. It
+			// moves when the attempts reset, so the two numbers never climb
+			// together: a stalled session reads 1/3, 2/3, 3/3 (retry #K
+			// unchanged), a session that keeps working reads 1/3 (retry #K
+			// climbing).
+			//
 			// A provider fault is opencode's own retry, not a model failure: the
 			// ladder holds there, so the visible number holds with it.
-			const episode = providerFault ? attempt : Math.max(1, w.episodeRecovers)
+			const shown = providerFault ? attempt : attempt
 			const head = [
 				isSilence ? null : reason,
-				`attempt ${Math.min(episode, maxRetries)}/${maxRetries} (retry #${w.episodeRecovers})`,
+				`attempt ${Math.min(shown, maxRetries)}/${maxRetries} (retry #${w.workRetries})`,
 				isSilence ? `idle ${hms(elapsed)}` : null,
 				now,
 			]
@@ -3364,6 +3366,9 @@ export default define({
 			// 1/3 forever). gaveUp itself is left alone: only a fresh turn
 			// (markBusy) clears that latch.
 			if (w.lastProdText !== "" && w.lastAssistantText !== w.prodAssistantSnapshot) {
+				// The model produced output since our last nudge: that is a WORK
+				// event, so the retry count moves and the attempts reset below.
+				w.workRetries++
 				// Every reset logs: silent restarts hid the endless-1/3 loop
 				// for weeks (ses_ef3a2ba2 — resets visible only once in six
 				// fires). Observability before economy here.
@@ -3373,6 +3378,8 @@ export default define({
 				if (w.resumeAttempts > 0) w.episodeRefires++
 				w.resumeAttempts = 0
 			} else if (isSilenceReason(reason) && w.succeededSinceProd > 0) {
+				// Work as well: a successful tool/shell since the last nudge.
+				w.workRetries++
 				log("info", `${short(sid)} progress since last prod — restarting the stall ladder`)
 				if (w.resumeAttempts > 0) w.episodeRefires++
 				w.resumeAttempts = 0
@@ -3410,7 +3417,7 @@ export default define({
 			log(
 				"info",
 				`${short(sid)} stall detected (${reason}) — resume attempt ${attempt}/${maxRetries} in ${delay}ms` +
-					` (episode ${w.episodeRecovers + 1})`,
+					` (work #${w.workRetries} this session)`,
 			)
 			if (w.recoverTimer) clearTimeout(w.recoverTimer)
 			// When this timer was armed: a genuine user message arriving after
@@ -3477,13 +3484,18 @@ export default define({
 					// Count this fire now: the text below reads the count, and every
 					// return past this point still decided to recover (declines all
 					// returned earlier), so the number matches injections decided.
-					// The episode count keeps advancing here: it is the retry number,
-					// and the ATTEMPT half is what holds during a provider fault (see
-					// buildStallContinueText). Holding the count instead would make
-					// two consecutive provider-fault nudges byte-identical, and the
-					// duplicate suppression would swallow the second one - silence
-					// instead of a held number.
-					w.episodeRecovers++
+					// The retry count counts WORK, and work is counted where the
+					// attempts reset (the model produced output since the last nudge)
+					// - so it does NOT move per nudge. Seed it at 1 so the first
+					// nudge of a session never reads "retry #0".
+					//
+					// A provider fault is the exception: it IS a retry of the same
+					// attempt (the attempts hold, the model never answered), and the
+					// nudge must reach the session every time - two byte-identical
+					// prompts would be swallowed by the duplicate suppression and the
+					// prodding would stop.
+					if (providerFault) w.workRetries++
+					else if (w.workRetries === 0) w.workRetries = 1
 					const stallText = await buildStallContinueText(sid, reason, attempt, providerFault)
 					const ok = await injectOnce(sid, stallText, "stalled — retrying", false, true)
 					w.pendingRecoveryArmed = false
@@ -4329,7 +4341,6 @@ export default define({
 			// A genuine user message also closes any refire episode: the next
 			// stall starts back at the base fuse.
 			w.episodeRefires = 0
-			w.episodeRecovers = 0
 			// Lifetime cap is also per genuine user episode: new instructions
 			// mean a new task, so the total-fire count starts over here — and
 			// only here (plus genuine execution.started), never on model text.
@@ -6273,10 +6284,11 @@ export default define({
 						w.gaveUp = false
 						// Same for the empty-idle single-shot: a genuine turn is
 						// a new episode, so the instant nudge re-arms here.
-						// Same for the recovery count — unless the turn is a
-						// provider retry, which is not a new episode.
+						// The work count is NOT reset here: it is the session's
+						// count of "the model did work after a nudge", and the user
+						// is in the session all day — resetting it on every human
+						// message made it read "retry #1" all day.
 						if (!providerRetryFresh) {
-							w.episodeRecovers = 0
 							// Lifetime cap is per genuine episode too: a real turn
 							// is new work, not our nudge looping. Own recovery
 							// turns skip this branch entirely, so they keep counting.
