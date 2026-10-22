@@ -96,6 +96,7 @@ type Registered = {
 	name: string
 	description: string
 	input: unknown
+	options?: { codemode?: boolean; namespace?: string; permission?: string }
 	execute: (input: any, context: { sessionID: string }) => Promise<{ content: string }>
 }
 
@@ -193,6 +194,15 @@ describe("v2: task_complete is offered to the model", () => {
 		expect(h.tool!.description).toContain("Signal that all work is complete")
 		// v1's `args: {}`: the signal is the call, not a payload.
 		expect(h.tool!.input).toMatchObject({ type: "object", properties: {} })
+		await teardown(h)
+	})
+
+	test("the tool is DIRECT - the model can call it, not only the Code Mode runtime", async () => {
+		// packages/core/src/tool.ts: `direct` = the tools with
+		// `options.codemode === false`; everything else goes into the Code Mode
+		// catalog and is reachable only through `execute`.
+		const h = await setup({})
+		expect(h.tool!.options?.codemode).toBe(false)
 		await teardown(h)
 	})
 

@@ -142,6 +142,14 @@ interface AutoResumeToolEditor {
 		name: string
 		description: string
 		input: Record<string, unknown>
+		/**
+		 * `codemode: false` puts the tool in the MODEL'S OWN tool list. Without
+		 * it a plugin tool lands in the Code Mode catalog and is only reachable
+		 * through the `execute` runtime (packages/core/src/tool.ts) - the model
+		 * can then never call it. `namespace` and `permission` mirror the core
+		 * tool options.
+		 */
+		options?: { codemode?: boolean; namespace?: string; permission?: string }
 		execute: (input: any, context: { sessionID: string }) => Promise<{ content: string }>
 	}): void
 }
@@ -4707,6 +4715,12 @@ export default define({
 					editor.add({
 						name: "task_complete",
 						description: TASK_COMPLETE_DESCRIPTION,
+						// DIRECT, not Code Mode: the model must be able to call this
+						// itself. A plugin tool without codemode:false is only
+						// reachable through the `execute` runtime, which is why the
+						// completion protocol had to fall back to "return the words
+						// TASK COMPLETE".
+						options: { codemode: false },
 						// No arguments. v1's `args: {}` is the same thing: the signal
 						// is the call, not a payload.
 						input: { type: "object", properties: {}, additionalProperties: false },
