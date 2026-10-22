@@ -365,6 +365,44 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		expect(attempts.some((a: string | null) => a === "2")).toBe(true)
 	})
 
+	test("the FIRST visible nudge reads retry #1, even when the model worked before it", async () => {
+		// ses_eaf2fe1f6ffemxjM5OL3kybdTx (2026-10-22): the first stall message
+		// of a session read "attempt 1/3 (retry #2)". The retry count is the WORK
+		// count, and it used to move at DETECTION - so work the model did before
+		// the first nudge (or a nudge that was never delivered) moved it, and the
+		// first message the user actually saw was one ahead.
+		const h = await setup()
+		push(h, "session.execution.started", SID)
+		await wait(20)
+		// The model did real work before the stall.
+		push(h, "session.tool.success", SID, { tool: "shell", id: "call_9" })
+		await wait(20)
+		await waitFor(() => h.injected.length >= 1)
+		const first = h.injected[0]?.text ?? ""
+		await teardown(h)
+		expect(first).toContain("retry #1")
+	})
+
+	test("a DECLINED nudge does not move the retry count", async () => {
+		// The ladder rung has been delivery-gated since 2026-10-19; the retry
+		// count now matches it. A nudge the busy/live guard declines must not
+		// show up in the next number.
+		const h = await setup()
+		push(h, "session.execution.started", SID)
+		await wait(20)
+		// A stall is detected, then the session goes live again before the
+		// delayed inject fires: the inject is declined ("still busy and live").
+		push(h, "session.tool.success", SID, { tool: "shell", id: "call_1" })
+		await wait(20)
+		push(h, "session.step.started", SID, { agent: "build" })
+		await wait(600)
+		const delivered = h.injected.map((i: any) => String(i.text ?? "").match(/retry #(\d+)/)?.[1] ?? null)
+		await teardown(h)
+		// Whatever was delivered, the FIRST delivered message must read #1.
+		const firstDelivered = delivered.find((n: string | null) => n !== null)
+		expect(firstDelivered).toBe("1")
+	})
+
 	test("a real stall counts up: attempt 1/3, 2/3, 3/3", async () => {
 		// The requirement, pinned: for a REAL stall - no model output, no user
 		// message, nothing but silence - consecutive nudges must read 1/3, 2/3,

@@ -182,6 +182,12 @@ interface SessionWatch {
 	 * ladder rung (which progress restarts) and episodeRefires (which counts only
 	 * progress restarts), this counts every fire so the nudge text can say which
 	 * recovery of the episode it is. Reset at the same genuine-episode sites. */
+	/**
+	 * The model produced output (text or a completed tool) since the last
+	 * nudge. Set at detection, consumed by a DELIVERED nudge: the retry count
+	 * must not move for a nudge the user never saw.
+	 */
+	workSinceNudge: boolean
 	/** How many times the model DID work after a nudge. The visible
 	 *  `retry #N`; it moves when the attempts reset, never with them. */
 	workRetries: number
@@ -2243,6 +2249,7 @@ export default define({
 					resumeAttempts: 0,
 					episodeRefires: 0,
 					workRetries: 0,
+				workSinceNudge: false,
 					lifetimeContinues: 0,
 					lastRetryAt: 0,
 					providerRetryAt: 0,
@@ -3268,6 +3275,7 @@ export default define({
 			reason: string,
 			attempt: number,
 			providerFault = false,
+			prospectiveRetries?: number,
 		): Promise<string> {
 			const w = ensureWatch(sid)
 			if (opts.continuePrompt !== undefined && opts.continuePrompt !== "") return opts.continuePrompt
@@ -3326,9 +3334,10 @@ export default define({
 			// A provider fault is opencode's own retry, not a model failure: the
 			// ladder holds there, so the visible number holds with it.
 			const shown = providerFault ? attempt : attempt
+			const retries = prospectiveRetries ?? w.workRetries
 			const head = [
 				isSilence ? null : reason,
-				`attempt ${Math.min(shown, maxRetries)}/${maxRetries} (retry #${w.workRetries})`,
+				`attempt ${Math.min(shown, maxRetries)}/${maxRetries} (retry #${retries})`,
 				isSilence ? `idle ${hms(elapsed)}` : null,
 				now,
 			]
@@ -3400,8 +3409,9 @@ export default define({
 			// (markBusy) clears that latch.
 			if (w.lastProdText !== "" && w.lastAssistantText !== w.prodAssistantSnapshot) {
 				// The model produced output since our last nudge: that is a WORK
-				// event, so the retry count moves and the attempts reset below.
-				w.workRetries++
+				// event, so the attempts reset below and the retry count moves -
+				// but only when a nudge actually lands (see the inject timer).
+				w.workSinceNudge = true
 				// Every reset logs: silent restarts hid the endless-1/3 loop
 				// for weeks (ses_ef3a2ba2 — resets visible only once in six
 				// fires). Observability before economy here.
@@ -3412,7 +3422,7 @@ export default define({
 				w.resumeAttempts = 0
 			} else if (isSilenceReason(reason) && w.succeededSinceProd > 0) {
 				// Work as well: a successful tool/shell since the last nudge.
-				w.workRetries++
+				w.workSinceNudge = true
 				log("info", `${short(sid)} progress since last prod — restarting the stall ladder`)
 				if (w.resumeAttempts > 0) w.episodeRefires++
 				w.resumeAttempts = 0
@@ -3527,13 +3537,23 @@ export default define({
 					// nudge must reach the session every time - two byte-identical
 					// prompts would be swallowed by the duplicate suppression and the
 					// prodding would stop.
-					if (providerFault) w.workRetries++
-					else if (w.workRetries === 0) w.workRetries = 1
-					const stallText = await buildStallContinueText(sid, reason, attempt, providerFault)
+					// The PROSPECTIVE retry count for the text below: the count moves by
+					// one for this nudge when the model produced output since the last
+					// one, and it is seeded at 1 so the first nudge of a session never
+					// reads "retry #0". The count is COMMITTED only if the nudge lands
+					// (below) - counting at detection advanced it for nudges the user
+					// never saw, so the first VISIBLE message could read "retry #2"
+					// (ses_eaf2fe1f6ffemxjM5OL3kybdTx, 2026-10-22).
+					const workMove = providerFault || w.workSinceNudge ? 1 : 0
+					const prospectiveRetries = Math.max(1, w.workRetries + workMove)
+					const stallText = await buildStallContinueText(sid, reason, attempt, providerFault, prospectiveRetries)
 					const ok = await injectOnce(sid, stallText, "stalled — retrying", false, true)
 					w.pendingRecoveryArmed = false
 					if (ok) {
 						delivered = true
+						// Commit the retry count now that the nudge landed.
+						w.workRetries = prospectiveRetries
+						w.workSinceNudge = false
 						// Commit the rung only now that the prompt landed: the text
 						// above already carried `attempt`, and every decliner above
 						// returned before this point, so resumeAttempts counts
