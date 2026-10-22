@@ -3500,6 +3500,16 @@ export default define({
 					// (a normal completion clears pendingRecoveryArmed) or the
 					// user took over.
 					if (w.userCancelled || w.gaveUp) return
+					// Refresh what we know about the user's messages from HISTORY
+					// before the park check below: w.lastGenuineUserAt only advances
+					// on the execution/step event handlers, so a genuine user message
+					// the watchdog has not noticed yet leaves it holding a pre-message
+					// value and the nudge fires into the user's live turn within the
+					// same minute (2026-10-21: comments at 10:55/10:57). The
+					// orphan-abort path already reads history for exactly this
+					// reason.
+					const history = await loadMessages(sid)
+					noteInboundUserMessage(sid, w, history)
 					// A genuine user message newer than the arm means the user took
 					// over during the backoff wait — park this recovery, do not fire
 					// into their turn. Own prompts never advance lastGenuineUserAt,
@@ -3536,8 +3546,9 @@ export default define({
 						return
 					}
 					// Same re-check for user input: a question asked between
-					// detection and this delayed inject parks the turn.
-					if (isWaitingOnUser(sid, w, await loadMessages(sid))) {
+					// detection and this delayed inject parks the turn. Reuse the
+					// history already loaded above.
+					if (isWaitingOnUser(sid, w, history)) {
 						dbg(`${short(sid)} waiting on user input at inject time — not interrupting`)
 						return
 					}
