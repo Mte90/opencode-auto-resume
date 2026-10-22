@@ -688,7 +688,7 @@ const DEFAULT_STUCK_TOOL_AGE_MS = 60_000
  * gate for every tool, so this changes WHEN a busy stall fires, never
  * whether an abandoned call gets nudged.
  */
-const LONG_RUNNING_TOOL_STALE_TTL_MS = 10 * 60_000
+const LONG_RUNNING_TOOL_STALE_TTL_MS = 30 * 60_000
 const LONG_RUNNING_TOOLS = ["shell"]
 const DEFAULT_MAX_RETRIES = 3
 /** Consecutive failure-driven recoveries tolerated before the failure-loop
@@ -3103,12 +3103,29 @@ export default define({
 			}
 		}
 
-		async function tryAbortAndResume(sid: string, w: SessionWatch): Promise<boolean> {
+		async function tryAbortAndResume(sid: string, w: SessionWatch, force = false): Promise<boolean> {
 			// Guarded separately because this path calls `interrupt()` *before*
 			// delegating to injectOnce — guarding only the injection would still
 			// let us interrupt a running child.
 			if (await isSubAgentSession(sid)) {
 				dbg(`${short(sid)} subagent session — abort+resume refused`)
+				return false
+			}
+			// A user-initiated interrupt is a takeover, not a hang: the plugin
+			// must not follow it with an automatic "continue" (or interrupt the
+			// session again). Only our own abort+resume escalation is allowed to
+			// escalate. (ses_e9c4d8de7ffe5DC0yedTw7Cvk7, 2026-10-22.)
+			if (w.userCancelled) {
+				dbg(`${short(sid)} user cancelled — refusing abort+resume escalation`)
+				return false
+			}
+			// Do not interrupt a session that is still working (busy) unless the
+			// caller is the orphan-abort path (force), which exists precisely to
+			// recover a parent whose subagent died. Other callers (the stall
+			// ladder, the loop guard) must not produce "Step interrupted".
+			// (ses_e9c4d8de7ffe5DC0yedTw7Cvk7, 2026-10-22.)
+			if (!force && w.status === "busy") {
+				dbg(`${short(sid)} busy — refusing abort+resume escalation`)
 				return false
 			}
 			if (w.aborting || selfAbortActive(w)) return false
@@ -5329,6 +5346,17 @@ export default define({
 					}
 					const msgTime = msgAt(last) || undefined
 					const silentFor = typeof msgTime === "number" ? now - msgTime : Infinity
+					// An active subagent (the server reports it running) is alive,
+					// regardless of how long it has been silent: silence alone cannot
+					// distinguish a slow subagent from a dead one, and treating a slow
+					// one as crashed nudged parents that were genuinely waiting
+					// (ses_e9c4d8de7ffe5DC0yedTw7Cvk7, 2026-10-22: W2 sat quiet for
+					// ~28 minutes and was judged "crashed", so the parent got nudged).
+					// The active set is authoritative for liveness.
+					if (activeIDs.has(child)) {
+						sawBusy = true
+						continue
+					}
 					// An unanswered tool part is the "still working, slowly" case.
 					const hasToolCall = (last?.content ?? []).some(
 						(p) => p?.type === "tool" && p.state?.status !== "completed" && p.state?.status !== "error",
@@ -5342,8 +5370,11 @@ export default define({
 					// crashed sibling is still surfaced.
 					const deadLimit = hasToolCall ? subagentDeadMs * 3 : subagentDeadMs
 					if (silentFor <= limit) {
-						// Recent enough to be believed, whatever the server thinks.
-						if (activeIDs.has(child)) sawBusy = true
+						// Recent: assume alive (don't nudge the parent) even if not
+						// in the active set — that set lags, and a mid-work
+						// subagent is indistinguishable from a just-finished one by
+						// silence alone. A truly finished subagent ages out.
+						if (sawWaiting === null) sawWaiting = child
 						continue
 					}
 					if (silentFor <= deadLimit) {
@@ -5565,7 +5596,7 @@ export default define({
 				// function's top): without this the watch cycles forever, because
 				// nothing else increments resumeAttempts on this path.
 				w.resumeAttempts++
-				tryAbortAndResume(sid, w)
+				tryAbortAndResume(sid, w, true)
 				return
 			}
 			if (verdict.status === "waiting") {
@@ -5928,7 +5959,9 @@ export default define({
 				// Mirrors the v1 branch at src/index.ts.
 				if (busyStallStrategy === "abort" && w.resumeAttempts < maxRetries) {
 					log("info", `${short(sid)} stall (busyStallStrategy=abort): aborting before continue`)
-					await tryAbortAndResume(sid, w)
+					// The operator opted into interrupting busy sessions; honour
+					// that even though the default policy refuses to.
+					await tryAbortAndResume(sid, w, true)
 				} else {
 					await recover(sid, `no activity for ${Math.ceil(silence / 1000)}s`)
 				}
@@ -6448,10 +6481,11 @@ export default define({
 						w.gaveUp = false
 						// Same for the empty-idle single-shot: a genuine turn is
 						// a new episode, so the instant nudge re-arms here.
-						// The work count is NOT reset here: it is the session's
-						// count of "the model did work after a nudge", and the user
-						// is in the session all day — resetting it on every human
-						// message made it read "retry #1" all day.
+						// The work count resets here on a genuine new turn (not a
+						// provider retry): a new episode means the work done after
+						// the last nudge starts over, bounded by
+						// lifetimeMaxContinues (9). Own recovery turns skip this
+						// branch, so they keep counting.
 						if (!providerRetryFresh) {
 							// Lifetime cap is per genuine episode too: a real turn
 							// is new work, not our nudge looping. Own recovery
