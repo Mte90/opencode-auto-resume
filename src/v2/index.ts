@@ -3437,6 +3437,13 @@ export default define({
 				// work (attempts still 0) is a fresh episode, not a refire.
 				if (w.resumeAttempts > 0) w.episodeRefires++
 				w.resumeAttempts = 0
+				// New model output after TASK COMPLETE means there's more work:
+				// unlatch the completion so stall detection resumes.
+				if (w.completionSignaled) {
+					w.completionSignaled = false
+					w.completionSignaledAt = 0
+					dbg(`${short(sid)} model output after TASK COMPLETE — re-opening latched completion`)
+				}
 			} else if (isSilenceReason(reason) && w.succeededSinceProd > 0) {
 				// Work as well: a successful tool/shell since the last nudge.
 				w.workSinceNudge = true
@@ -3574,8 +3581,14 @@ export default define({
 					// (ses_eaf2fe1f6ffemxjM5OL3kybdTx, 2026-10-22).
 					const workMove = providerFault || w.workSinceNudge ? 1 : 0
 					const prospectiveRetries = Math.max(1, w.workRetries + workMove)
-					const stallText = await buildStallContinueText(sid, reason, attempt, providerFault, prospectiveRetries)
-					const ok = await injectOnce(sid, stallText, "stalled — retrying", false, true)
+					// At retry #7 (of 9 max), ask for a progress report so the model
+					// has a chance to report status before the hard limit stands it down.
+					// The prompt is a visible continue with explicit instructions.
+					const isProgressReport = prospectiveRetries >= 7
+					const stallText = isProgressReport
+						? `PROGRESS REPORT REQUIRED (attempt ${Math.min(attempt, maxRetries)}/${maxRetries}, retry #${prospectiveRetries}/${lifetimeMaxContinues}): this session has been nudged multiple times. Please report exactly what you have completed and what remains. If work is done, call task_complete. If blocked, say what you need. If still working, say what step you are on. Do not start new work — only continue the current task.`
+						: await buildStallContinueText(sid, reason, attempt, providerFault, prospectiveRetries)
+					const ok = await injectOnce(sid, stallText, isProgressReport ? "stalled — progress report" : "stalled — retrying", false, true)
 					w.pendingRecoveryArmed = false
 					if (ok) {
 						delivered = true
