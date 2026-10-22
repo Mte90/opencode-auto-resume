@@ -688,7 +688,7 @@ const DEFAULT_STUCK_TOOL_AGE_MS = 60_000
  * gate for every tool, so this changes WHEN a busy stall fires, never
  * whether an abandoned call gets nudged.
  */
-const LONG_RUNNING_TOOL_STALE_TTL_MS = 30 * 60_000
+const LONG_RUNNING_TOOL_STALE_TTL_MS = 60 * 60_000
 const LONG_RUNNING_TOOLS = ["shell"]
 const DEFAULT_MAX_RETRIES = 3
 /** Consecutive failure-driven recoveries tolerated before the failure-loop
