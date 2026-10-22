@@ -56,7 +56,7 @@ const define = <T>(plugin: T): T => plugin
 
 import { appendFileSync, readFileSync, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
-import { dirname, join } from "node:path"
+import { dirname, isAbsolute, join } from "node:path"
 
 /**
  * The subset of the v2 plugin input this plugin actually consumes. Typed
@@ -518,8 +518,9 @@ export interface AutoResumeOptions {
 	/** Prompt sent when a tool call was emitted inside reasoning. */
 	thinkingToolRecoveryPrompt?: string
 	/**
-	 * Append this build's log here instead of the default path
-	 * (`~/.local/state/opencode-v2/auto-resume.log`).
+	 * Append this build's log here instead of the default path (opencode's
+	 * state root: `XDG_STATE_HOME`/opencode/auto-resume.log, else
+	 * `~/.local/state/opencode/auto-resume.log`).
 	 *
 	 * v2 removed v1's `app.log` endpoint, so this is the only retrievable
 	 * record of what the plugin did. The `AUTO_RESUME_LOG_FILE` environment
@@ -562,7 +563,24 @@ export interface AutoResumeOptions {
  * Override with AUTO_RESUME_LOG_FILE. Size-capped so an unattended run cannot
  * fill the disk.
  */
-const DEFAULT_LOG_FILE = join(homedir(), ".local", "state", "opencode-v2", "auto-resume.log")
+/**
+ * Where this plugin logs by default: under opencode's OWN state root.
+ *
+ * Mirrors the opencode core's resolution of its state files
+ * (`packages/client/src/effect/service.ts`): `XDG_STATE_HOME` when it is set
+ * to an absolute path, else `~/.local/state`, then `opencode/<file>`. The
+ * plugin follows the platform convention instead of hardcoding a path for one
+ * machine — it ships upstream (PR #37), and the previous default
+ * (`~/.local/state/opencode-v2/auto-resume.log`) pointed at a tree name
+ * specific to this box, so every other user got a log file in a directory
+ * unrelated to their opencode install.
+ */
+export function defaultLogFile(): string {
+	const raw = process.env["XDG_STATE_HOME"]
+	const trimmed = typeof raw === "string" ? raw.trim() : ""
+	const stateHome = trimmed.length > 0 && isAbsolute(trimmed) ? trimmed : join(homedir(), ".local", "state")
+	return join(stateHome, "opencode", "auto-resume.log")
+}
 const LOG_FILE_MAX_BYTES = 2 * 1024 * 1024
 
 /**
@@ -1932,7 +1950,7 @@ export default define({
 				: /^(1|true|yes)$/i.test(envVisible))
 		const quietCorrections = opts.quietCorrections ?? true
 		const richContinuePrompt = opts.richContinuePrompt ?? true
-		const logFile = opts.logFile ?? process.env.AUTO_RESUME_LOG_FILE ?? DEFAULT_LOG_FILE
+		const logFile = opts.logFile ?? process.env.AUTO_RESUME_LOG_FILE ?? defaultLogFile()
 		const rateLimitCooldownsMs =
 			Array.isArray(opts.rateLimitCooldownsMs) && opts.rateLimitCooldownsMs.length > 0 &&
 			opts.rateLimitCooldownsMs.every((n) => typeof n === "number" && n > 0)
