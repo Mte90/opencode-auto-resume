@@ -15,10 +15,13 @@ const SID = "ses_task_complete"
 /**
  * `task_complete`: the model's explicit "I am finished".
  *
- * v2 ships no built-in equivalent — nothing in the v2 source mentions the name —
- * so the plugin registering it is the only way it exists. That makes this a
- * feature rather than a shim: the model gets a completion signal stronger than a
- * trailing 🎉, because it chose to call this.
+ * The tool's home is the task-complete plugin (config/plugins/task-complete) -
+ * it is a general capability, and the tool registry is one global map per
+ * server, so every plugin can list it, extend it and observe its calls.
+ *
+ * auto-resume keeps a FALLBACK copy so it still works as-is when that plugin is
+ * not installed, and it registers that copy ONLY when nothing else already
+ * provides the tool. These tests cover the fallback.
  *
  * The escalation is the part worth testing. The ack is fed straight back into the
  * turn, and a stuck model answers it by calling the tool again rather than ending
@@ -113,6 +116,8 @@ async function setup(
 		extraMessages?: unknown[]
 		parentID?: string
 		maxRetriesOverride?: number
+		/** Another plugin already registers the tool. */
+		existingTool?: boolean
 	},
 ): Promise<Harness> {
 	const injected: Harness["injected"] = []
@@ -162,7 +167,7 @@ async function setup(
 				})
 				return { dispose() {} }
 			},
-			list: async () => (registered ? [registered] : []),
+			list: async () => (opts.existingTool ? [{ id: "task_complete", name: "task_complete" }] : registered ? [registered] : []),
 		}
 	}
 
@@ -194,6 +199,14 @@ describe("v2: task_complete is offered to the model", () => {
 		expect(h.tool!.description).toContain("Signal that all work is complete")
 		// v1's `args: {}`: the signal is the call, not a payload.
 		expect(h.tool!.input).toMatchObject({ type: "object", properties: {} })
+		await teardown(h)
+	})
+
+	test("CONTROL: no fallback when another plugin already provides the tool", async () => {
+		// The registry is authoritative: the task-complete plugin is the tool's
+		// home, and auto-resume must not shadow it with its own copy.
+		const h = await setup({ existingTool: true })
+		expect(h.tool).toBeNull()
 		await teardown(h)
 	})
 

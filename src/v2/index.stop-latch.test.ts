@@ -88,6 +88,7 @@ async function setup(opts: {
 	todos?: Array<{ content: string; status: string }>
 	toolIds?: string[]
 	onAdd?: (def: any) => void
+	onHook?: (name: string, cb: (event: any) => unknown) => void
 }): Promise<any> {
 	const injected: Array<{ sid?: string; text?: string }> = []
 	const stream = makeEventStream()
@@ -124,6 +125,12 @@ async function setup(opts: {
 		tool: {
 			transform: async (cb: any) => (cb({ add: (def: any) => opts.onAdd?.(def) }), { dispose() {} }),
 			list: async () => (opts.toolIds ?? []).map((id) => ({ id })),
+			// The task_complete tool now lives in its own plugin, so auto-resume
+			// only SEES its calls - through this hook.
+			hook: (name: string, cb: (event: any) => unknown) => {
+				opts.onHook?.(name, cb)
+				return { dispose() {} }
+			},
 		},
 	}
 
@@ -189,15 +196,22 @@ describe("v2: explicit stop statements latch completion", () => {
 	})
 
 	test("busy-stall respects a latched completion", async () => {
-		const defs: any[] = []
-		const h = await setup({ onAdd: (d: any) => defs.push(d) })
-		const complete = defs.find((d: any) => d.name === "task_complete")
-		expect(complete).toBeDefined()
+		// The completion signal arrives as a task_complete CALL, which auto-resume
+		// observes through the tool registry's execute.after hook (the tool itself
+		// lives in its own plugin now).
+		let onAfter: ((event: any) => unknown) | undefined
+		const h = await setup({ onHook: (name: string, cb: any) => { if (name === "execute.after") onAfter = cb } })
+		expect(onAfter).toBeDefined()
 		push(h, "session.execution.started", SID)
 		await wait(10)
 		push(h, "session.step.started", SID)
 		await wait(10)
-		await complete.execute({}, { sessionID: SID })
+		await onAfter?.({
+			tool: "task_complete",
+			sessionID: SID,
+			status: "completed",
+			result: { content: "Task completion acknowledged.", metadata: { completed: true } },
+		})
 		await wait(900)
 		expect(h.injected.filter((i: any) => i.sid === SID)).toHaveLength(0)
 		await teardown(h)

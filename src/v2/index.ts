@@ -57,6 +57,8 @@ const define = <T>(plugin: T): T => plugin
 import { appendFileSync, readFileSync, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, isAbsolute, join } from "node:path"
+import { fileURLToPath } from "node:url"
+import { readFile } from "node:fs/promises"
 
 /**
  * The subset of the v2 plugin input this plugin actually consumes. Typed
@@ -115,6 +117,10 @@ interface AutoResumePluginInput {
 	tool?: {
 		transform: (cb: (editor: AutoResumeToolEditor) => void) => Promise<unknown>
 		list: () => Promise<readonly unknown[]>
+		/** Observe every tool call: `execute.after` carries the tool name, the
+		 *  session and the result. This is how auto-resume watches the
+		 *  task_complete tool it does not own. */
+		hook?: (name: string, callback: (event: any) => unknown) => unknown
 	}
 	/** Application logger, when the host provides one. */
 	app?: { log?: (level: string, message: string) => unknown }
@@ -585,6 +591,25 @@ export interface AutoResumeOptions {
  * specific to this box, so every other user got a log file in a directory
  * unrelated to their opencode install.
  */
+/**
+ * Does the opencode config list a task-complete plugin?
+ *
+ * The config is the decisive signal when the other plugin has not loaded yet:
+ * the load order IS the config order, so auto-resume can set up first and the
+ * live tool list cannot see the plugin that comes later. A missing or
+ * unreadable config answers false - the caller then PROVIDES the fallback,
+ * which is the safe direction (a duplicate tool is confusion, a missing one is
+ * a missing feature).
+ */
+export async function configMentionsTaskComplete(cfgPath: string): Promise<boolean> {
+	try {
+		const raw = await readFile(cfgPath, "utf8")
+		return /"[^"]*task-complete[^"]*"/i.test(raw)
+	} catch {
+		return false
+	}
+}
+
 export function defaultLogFile(): string {
 	const raw = process.env["XDG_STATE_HOME"]
 	const trimmed = typeof raw === "string" ? raw.trim() : ""
@@ -4705,11 +4730,59 @@ export default define({
 		 * call, so the escalation only ever measures a genuinely stuck loop rather
 		 * than several legitimate rounds of work.
 		 */
-		async function registerTaskCompleteTool(): Promise<void> {
+
+		/**
+		 * Register a FALLBACK copy of the `task_complete` tool.
+		 *
+		 * The tool's home is the task-complete plugin: it is a general capability,
+		 * and the tool registry is one global map per opencode server, so every
+		 * plugin can list it, extend it and observe its calls. This copy exists
+		 * only so auto-resume keeps working AS IS when that plugin is not
+		 * installed - which is why it registers ONLY when nothing else already
+		 * provides the tool.
+		 *
+		 * The check is the registry itself (`ctx.tool.list()`), so it is
+		 * order-independent: if the other plugin set up first, the tool is
+		 * already there and no fallback is registered; if auto-resume set up
+		 * first, the other plugin's registration overwrites this one (the
+		 * registry keys by name, last write wins).
+		 *
+		 * v1 semantics, kept: the todo gate, and the ack self-loop guard (first
+		 * call acks, second warns, third throws) so a stuck model cannot loop on
+		 * the ack.
+		 */
+		async function registerTaskCompleteFallback(): Promise<void> {
 			if (!ctx.tool?.transform) {
 				dbg("tool registry unavailable — task_complete not offered")
 				return
 			}
+			// Two signals, in the order infra-memory uses for its todo fallback.
+			//
+			// 1. The LIVE tool list: decisive when the other plugin set up
+			//    first. It cannot see a plugin that loads later.
+			let provided = false
+			try {
+				const listed = (await ctx.tool.list?.()) ?? []
+				const arr = Array.isArray(listed) ? listed : []
+				provided = arr.some((t: any) => {
+					const n = String(t?.id ?? t?.name ?? t ?? "").toLowerCase()
+					return n === "task_complete" || n.endsWith("/task_complete")
+				})
+			} catch (e) {
+				dbg("tool list failed — checking the config instead:", e instanceof Error ? e.message : String(e))
+			}
+			// 2. The CONFIG FILE: decisive when it did not, because the load
+			//    order is the CONFIG order and auto-resume may set up before the
+			//    other plugin. A configured plugin is the signal; live tools still
+			//    cover a plugin that is loaded without appearing in this config.
+			if (!provided) {
+				// <config>/opencode/plugins/auto-resume/index.js
+				// -> config root is <config>/opencode/opencode.jsonc.
+				const cfgPath = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "opencode.jsonc")
+				provided = await configMentionsTaskComplete(cfgPath)
+				if (provided) log("info", "task-complete plugin configured in opencode.jsonc — fallback stays out")
+			}
+			if (provided) return
 			try {
 				await ctx.tool.transform((editor) => {
 					editor.add({
@@ -4717,9 +4790,7 @@ export default define({
 						description: TASK_COMPLETE_DESCRIPTION,
 						// DIRECT, not Code Mode: the model must be able to call this
 						// itself. A plugin tool without codemode:false is only
-						// reachable through the `execute` runtime, which is why the
-						// completion protocol had to fall back to "return the words
-						// TASK COMPLETE".
+						// reachable through the `execute` runtime.
 						options: { codemode: false },
 						// No arguments. v1's `args: {}` is the same thing: the signal
 						// is the call, not a payload.
@@ -4737,9 +4808,9 @@ export default define({
 								const open = getOpenTodos(await readTodos(sid))
 								if (open.length > 0 && w.taskCompleteOverrides < maxRetries) {
 									w.taskCompleteOverrides++
-									// Work remains, so a later completion is legitimate: reset the
-									// repeat-signal counter rather than letting this override feed
-									// the escalation.
+									// Work remains, so a later completion is legitimate: reset
+									// the repeat-signal counter rather than letting this
+									// override feed the escalation.
 									w.taskCompleteSignals = 0
 									const reminder = buildOpenTodosReminder(open)
 									const blockMsg = `Mark any finished todos complete and do not redo completed work.\n${reminder}`
@@ -4747,11 +4818,10 @@ export default define({
 										"info",
 										`${short(sid)} task_complete blocked: ${open.length} open todos remain (override ${w.taskCompleteOverrides}/${maxRetries})`,
 									)
-									// Also fire a visible nudge naming the blocking todos, in case
-									// the tool result collapses to an invisible one-liner. Skipped
-									// when the user holds the ball — injecting then would start a
-									// step their real reply interrupts. The tool result already
-									// carries the todo names either way.
+									// Also fire a visible nudge naming the blocking todos, in
+									// case the tool result collapses to an invisible one-liner.
+									// Skipped when the user holds the ball - injecting then
+									// would start a step their real reply interrupts.
 									let awaitingInput = false
 									try {
 										awaitingInput = hasPendingUserInput(await loadMessages(sid))
@@ -4777,11 +4847,66 @@ export default define({
 						},
 					})
 				})
-				log("info", "registered the task_complete tool")
+				log("info", "registered the task_complete tool (fallback — the task-complete plugin is not installed)")
 			} catch (e) {
 				// A failed registration must not take the watchdog down with it.
 				const msg = e instanceof Error ? e.message : String(e)
 				log("warn", `task_complete registration failed (${msg}) — continuing without it`)
+			}
+		}
+		/**
+		 * Watch the `task_complete` tool and stand the session down.
+		 *
+		 * The tool itself lives in its own plugin (config/plugins/task-complete):
+		 * it is a general capability, and the tool registry is one global map per
+		 * server, so every plugin can see and observe it. What is auto-resume's
+		 * business is the STAND-DOWN - the latch that stops the nudges once the
+		 * model says the work is done.
+		 *
+		 * The tool reports `metadata.completed`: true when the completion was
+		 * accepted, false when its todo gate refused it. On a refusal auto-resume
+		 * fires the visible nudge naming the work that is left, because a
+		 * collapsed tool result would hide it.
+		 */
+		async function observeTaskCompleteTool(): Promise<void> {
+			if (!ctx.tool?.hook) {
+				dbg("tool hook unavailable — task_complete stand-down not observed")
+				return
+			}
+			try {
+				ctx.tool.hook("execute.after", async (event: any) => {
+					if (event?.tool !== "task_complete") return
+					if (event?.status !== "completed") return
+					const sid = event?.sessionID
+					if (!sid) return
+					const w = ensureWatch(sid)
+					const result = event?.result
+					if (result?.metadata?.completed === false) {
+						// The todo gate refused it: name the work that is left.
+						const content = typeof result?.content === "string" ? result.content : ""
+						if (!content) return
+						let awaitingInput = false
+						try {
+							awaitingInput = hasPendingUserInput(await loadMessages(sid))
+						} catch (e) {
+							dbg(`${short(sid)} task_complete block: awaiting-input check failed:`, e instanceof Error ? e.message : String(e))
+						}
+						if (awaitingInput) {
+							log("info", `${short(sid)} task_complete blocked but user input pending — skipping visible nudge`)
+							return
+						}
+						await injectOnce(sid, content, "task-complete-blocked")
+						return
+					}
+					w.completionSignaled = true
+					w.completionSignaledAt = Date.now()
+					w.taskCompleteSignals = 0
+					w.taskCompleteOverrides = 0
+					log("info", `${short(sid)} task_complete called, ${(await isSubAgentSession(sid)) ? "subagent" : "agent"} done`)
+				})
+			} catch (e) {
+				const msg = e instanceof Error ? e.message : String(e)
+				log("warn", `task_complete observer failed (${msg}) — continuing without the stand-down`)
 			}
 		}
 
@@ -5845,7 +5970,8 @@ export default define({
 		// Offered to the model before the first turn, so it can actually be called.
 		// Awaited, but guarded: a registry that refuses the registration must not
 		// stop the watchdog from starting.
-		await registerTaskCompleteTool()
+		await registerTaskCompleteFallback()
+		await observeTaskCompleteTool()
 
 		// ---------------------------------------------------------------------
 		// Context saturation
