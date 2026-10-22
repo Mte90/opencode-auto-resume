@@ -733,7 +733,7 @@ const SUBAGENT_STUCK_MS = 60_000
  * waited on — a hung model must not sit forever, but a long-thinking one
  * (coder blocks run many minutes on one shared GPU) must not read as
  * crashed at 60s either. ses_ef1c822c 2026-10-06. */
-const DEFAULT_SUBAGENT_DEAD_MS = 30 * 60_000
+const DEFAULT_SUBAGENT_DEAD_MS = 60 * 60_000
 const SUBAGENT_RECOVERY_PROMPT =
 	"It looks like you may have stalled or timed out. Please retry the last operation or continue with the task."
 const DEFAULT_SILENT_DEAD_STREAM_MIN_TOKENS = 200
