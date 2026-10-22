@@ -133,6 +133,24 @@ async function waitFor(what: () => boolean, budgetMs = 3000): Promise<boolean> {
 	return what()
 }
 
+/** The internal give-up ladder, read from the log line the plugin writes
+ *  ("stall detected (...) - resume attempt N/3 in Xms (episode M)"). The
+ *  VISIBLE attempt number in the injected text is the episode count now, so
+ *  the ladder is only observable here. */
+const ladderOf = (log: string): string[] => {
+	const out: string[] = []
+	for (const m of log.matchAll(/resume attempt (\d)\/3/g)) out.push(m[1])
+	return out
+}
+
+/** The episode counter the log prints alongside the ladder
+ *  ("... resume attempt N/3 in Xms (episode M)"). */
+const episodeOf = (log: string): string[] => {
+	const out: string[] = []
+	for (const m of log.matchAll(/\(episode (\d+)\)/g)) out.push(m[1])
+	return out
+}
+
 const attemptOf = (text: string | undefined): string | null => {
 	const m = /attempt (\d)\/3/.exec(text ?? "")
 	return m ? m[1] : null
@@ -150,11 +168,16 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		// Model produces text (progress, no completion), then goes quiet.
 		push(h, "session.text.delta", SID, { assistantMessageID: "m1", delta: "new findings from the probe" })
 		await waitFor(() => h.injected.length >= 2)
+		const logs = existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : ""
 		await teardown(h)
 		const attempts = h.injected.map((i: any) => attemptOf(i.text))
 		expect(attempts.length).toBeGreaterThanOrEqual(2)
-		// A second "1/3" means a new episode started after model progress.
-		expect(attempts.filter((a: string | null) => a === "1").length).toBeGreaterThanOrEqual(2)
+		// The LADDER restarts on model progress: the give-up budget starts
+		// over, so a session that keeps working is never stood down.
+		expect(ladderOf(logs).slice(0, 2)).toEqual(["1", "1"])
+		// The VISIBLE number counts the episode instead, so the user can see
+		// the nudges piling up even while the ladder restarts underneath.
+		expect(attempts.slice(0, 2)).toEqual(["1", "2"])
 	})
 
 	test("tool completions between failure-driven recovers do not restart the ladder", async () => {
@@ -194,8 +217,11 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		const attempts = h.injected.map((i: any) => attemptOf(i.text))
 		const logs = existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : ""
 		await teardown(h)
-		expect(attempts.slice(0, 2)).toEqual(["1", "1"])
+		// Ladder restarts (the give-up budget starts over) ...
+		expect(ladderOf(logs).slice(0, 2)).toEqual(["1", "1"])
 		expect(logs).toContain("restarting the stall ladder")
+		// ... while the visible number counts the episode.
+		expect(attempts.slice(0, 2)).toEqual(["1", "2"])
 	})
 
 	test("a failed tool between silence stalls does not restart the ladder", async () => {
@@ -229,8 +255,10 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		h.streamRef.push({ type: "shell.exited", data: { id: "sh_1", status: "exited", exit: 0 } })
 		await waitFor(() => h.injected.length >= 2)
 		const attempts = h.injected.map((i: any) => attemptOf(i.text))
+		const logs = existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : ""
 		await teardown(h)
-		expect(attempts.slice(0, 2)).toEqual(["1", "1"])
+		expect(ladderOf(logs).slice(0, 2)).toEqual(["1", "1"])
+		expect(attempts.slice(0, 2)).toEqual(["1", "2"])
 	})
 
 	test("a genuine turn restarts the retry count but not the ladder", async () => {
@@ -255,9 +283,22 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		await waitFor(() => h.injected.length >= 2)
 		const attempts = h.injected.map((i: any) => attemptOf(i.text))
 		const retries = h.injected.map((i: any) => retryOf(i.text))
+		const logs = existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : ""
 		await teardown(h)
+		// The give-up ladder keeps climbing through a genuine turn ...
+		expect(ladderOf(logs).slice(0, 2)).toEqual(["1", "2"])
+		// ... while the episode counter restarts: the log's episode annotation
+		// reads 1 again for the fire that follows the genuine turn (it would
+		// read 2 without the reset).
+		const episodes = episodeOf(logs)
+		expect(episodes.length).toBeGreaterThanOrEqual(3)
+		expect(episodes[1]).toBe("1")
+		// The visible numbers count the episode, so the pair reads #1 then #2:
+		// the new episode's first fire repeats the previous text and the
+		// duplicate suppression declines it (no model output since the last
+		// prod) - the delivered sequence stays consecutive.
+		expect(retries.slice(0, 2)).toEqual(["1", "2"])
 		expect(attempts.slice(0, 2)).toEqual(["1", "2"])
-		expect(retries.slice(0, 2)).toEqual(["1", "1"])
 	})
 	test("each fire carries its episode retry number", async () => {
 		// The ladder rung restarts on progress, so consecutive fires can all
@@ -321,6 +362,24 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		expect(attempts[attempts.length - 1]).not.toBe("1")
 		// And it must have grown, not repeated: 1/3 then 2/3 (or deeper).
 		expect(attempts.some((a: string | null) => a === "2")).toBe(true)
+	})
+
+	test("a real stall counts up: attempt 1/3, 2/3, 3/3", async () => {
+		// The requirement, pinned: for a REAL stall - no model output, no user
+		// message, nothing but silence - consecutive nudges must read 1/3, 2/3,
+		// 3/3. The visible attempt number used to be the give-up ladder, which
+		// resets on any assistant text growth, so a model that streamed
+		// reasoning kept it at 1/3 forever and the number never went up
+		// (2026-10-21: "usually attempt 1/3 ... learn to count").
+		const h = await setup()
+		push(h, "session.execution.started", SID)
+		await wait(10)
+		await waitFor(() => h.injected.length >= 3, 6000)
+		const attempts = h.injected.map((i: any) => attemptOf(i.text))
+		const retries = h.injected.map((i: any) => /retry #(\d+)/.exec(i.text ?? "")?.[1] ?? null)
+		await teardown(h)
+		expect(attempts.slice(0, 3)).toEqual(["1", "2", "3"])
+		expect(retries.slice(0, 3)).toEqual(["1", "2", "3"])
 	})
 
 	test("the stall message carries a timestamp and idle duration", async () => {

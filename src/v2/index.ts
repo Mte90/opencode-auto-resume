@@ -3230,7 +3230,12 @@ export default define({
 		 * (cattleprod-style) instead of bare "continue". Same channel and
 		 * guards either way — only the content changes.
 		 */
-		async function buildStallContinueText(sid: string, reason: string, attempt: number): Promise<string> {
+		async function buildStallContinueText(
+			sid: string,
+			reason: string,
+			attempt: number,
+			providerFault = false,
+		): Promise<string> {
 			const w = ensureWatch(sid)
 			if (opts.continuePrompt !== undefined && opts.continuePrompt !== "") return opts.continuePrompt
 			if (!richContinuePrompt) return CONTINUE_PROMPT
@@ -3272,14 +3277,23 @@ export default define({
 			// (Predicate hoisted to module scope: recover reuses it for the
 			// success-progress episode reset.)
 			const isSilence = isSilenceReason(reason)
-			// The retry count is the episode's recovery number, not the ladder
-			// rung: after N recoveries the next fire reads "attempt 1/3" just
-			// the same when progress restarted the rung. Without it every fire
-			// in a filler loop reads identically and the numbers cannot be
-			// reconciled from the transcript.
+			// BOTH numbers the user reads must COUNT.
+			//
+			// The attempt number used to be the give-up ladder (w.resumeAttempts),
+			// which resets on any assistant text growth - a model that streams
+			// reasoning kept it at 1/3 forever, so even a REAL stall never went
+			// 1/3 -> 2/3 -> 3/3 and the number carried no information. It now
+			// comes from the episode nudge count, the same counter the `retry #N`
+			// half already shows, so a stalled session reads 1/3, 2/3, 3/3 as the
+			// nudges pile up. The give-up ladder keeps its own semantics and
+			// still drives `gaveUp` - the terminal-silence protection is
+			// untouched.
+			// A provider fault is opencode's own retry, not a model failure: the
+			// ladder holds there, so the visible number holds with it.
+			const episode = providerFault ? attempt : Math.max(1, w.episodeRecovers)
 			const head = [
 				isSilence ? null : reason,
-				`attempt ${attempt}/${maxRetries} (retry #${w.episodeRecovers})`,
+				`attempt ${Math.min(episode, maxRetries)}/${maxRetries} (retry #${w.episodeRecovers})`,
 				isSilence ? `idle ${hms(elapsed)}` : null,
 				now,
 			]
@@ -3395,7 +3409,8 @@ export default define({
 			}
 			log(
 				"info",
-				`${short(sid)} stall detected (${reason}) — resume attempt ${attempt}/${maxRetries} in ${delay}ms`,
+				`${short(sid)} stall detected (${reason}) — resume attempt ${attempt}/${maxRetries} in ${delay}ms` +
+					` (episode ${w.episodeRecovers + 1})`,
 			)
 			if (w.recoverTimer) clearTimeout(w.recoverTimer)
 			// When this timer was armed: a genuine user message arriving after
@@ -3462,8 +3477,14 @@ export default define({
 					// Count this fire now: the text below reads the count, and every
 					// return past this point still decided to recover (declines all
 					// returned earlier), so the number matches injections decided.
+					// The episode count keeps advancing here: it is the retry number,
+					// and the ATTEMPT half is what holds during a provider fault (see
+					// buildStallContinueText). Holding the count instead would make
+					// two consecutive provider-fault nudges byte-identical, and the
+					// duplicate suppression would swallow the second one - silence
+					// instead of a held number.
 					w.episodeRecovers++
-					const stallText = await buildStallContinueText(sid, reason, attempt)
+					const stallText = await buildStallContinueText(sid, reason, attempt, providerFault)
 					const ok = await injectOnce(sid, stallText, "stalled — retrying", false, true)
 					w.pendingRecoveryArmed = false
 					if (ok) {
