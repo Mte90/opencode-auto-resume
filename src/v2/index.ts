@@ -897,7 +897,7 @@ const PERMANENT_HISTORY_RE =
  * exactly why these stay message-keyed. */
 /** The model itself is gone: permanent whatever the status, including 404. */
 const PERMANENT_GONE_RE =
-	/model\b[^.]{0,80}\b(deprecat\w*|discontinued|retired|removed|no longer (available|supported|offered))\b|\bno llm route for\b/i
+	/model\b.{0,80}\b(deprecat\w*|discontinued|retired|removed|no longer (available|supported|offered))\b|\bno llm route for\b/i
 /** "This model is not in the catalog" — permanent per source, EXCEPT behind a
  * 404: provider/error.ts:26 says "openai sometimes returns 404 for models that
  * are actually available" and opencode treats an openai 404 as retryable, so a

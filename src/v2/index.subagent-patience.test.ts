@@ -189,14 +189,14 @@ describe("v2: quiet subagents wait inside a patience window", () => {
 	})
 
 	test("CONTROL: quiet past the dead window still aborts", async () => {
-		// 40 minutes of quiet with no error: a hung model must not sit
-		// forever. Crashed handling is preserved.
+		// 70 minutes of quiet with no error: past the 60m dead window,
+		// a hung model must not sit forever. Crashed handling is preserved.
 		const now = Date.now()
 		const h = await setup({
 			active: [SID],
 			history: {
 				[SID]: [userMessage("go", now - 60_000)],
-				[CHILD]: [assistantAt(now - 40 * 60_000)],
+				[CHILD]: [assistantAt(now - 70 * 60_000)],
 			},
 		})
 		await armWatch(h)
@@ -214,7 +214,7 @@ describe("v2: quiet subagents wait inside a patience window", () => {
 			maxRetries: 1,
 			history: {
 				[SID]: [userMessage("go", now - 60_000)],
-				[CHILD]: [assistantAt(now - 40 * 60_000)],
+				[CHILD]: [assistantAt(now - 70 * 60_000)],
 			},
 		})
 		await armWatch(h)

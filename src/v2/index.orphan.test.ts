@@ -175,9 +175,9 @@ async function childGoesBusyThenIdle(h: any) {
 }
 
 const A_LONG_WAY_AGO = Date.now() - 10 * 60_000
-// Past the 30m dead window: quiet this long with no error reads as crashed,
+// Past the 60m dead window: quiet this long with no error reads as crashed,
 // while A_LONG_WAY_AGO (10m) now reads as waiting. Crashed-path tests use this.
-const PAST_DEAD = Date.now() - 40 * 60_000
+const PAST_DEAD = Date.now() - 70 * 60_000
 
 describe("v2: the orphan watch arms when a parent's subagents fall quiet", () => {
 	test("CONTROL: nothing is armed while only the parent is busy", async () => {
