@@ -5773,6 +5773,38 @@ export default define({
 							w.lastStuckToolCheck = now
 							await checkForStuckToolCalls(sid, w)
 						}
+						// STALL DETECTION FOR IDLE SESSIONS: a session that went
+						// idle mid-work (not waiting on user, not completed) must
+						// still be nudged. The same guards as the busy path apply.
+						// (ses_e9c4d8de7ffe5DC0yedTw7Cvk7, 2026-10-22: idle 13 min
+						// with no nudge because idle path skipped stall detection.)
+						{
+							const history = await loadMessages(sid)
+							noteInboundUserMessage(sid, w, history)
+							if (w.completionSignaled) {
+								if (w.lastGenuineUserAt > w.completionSignaledAt) {
+									w.completionSignaled = false
+									w.completionSignaledAt = 0
+									dbg(`${short(sid)} genuine new user message after latched completion — re-opening stall detection`)
+								} else {
+									dbg(`${short(sid)} completion latched — skipping stall detection`)
+								}
+							} else if (!isWaitingOnUser(sid, w, history)) {
+								if (w.compacting) {
+									dbg(`${short(sid)} mid-compaction — skipping stall detection`)
+								} else if (await hasYoungUnfinishedWork(sid, now)) {
+									dbg(`${short(sid)} tool call still unfinished in history — working, not stalled`)
+								} else if (await parentWaitingOnSubagents(sid, activeSet)) {
+									dbg(`${short(sid)} waiting on subagents — skipping stall detection`)
+								} else {
+									const silence = now - w.lastActivityAt
+									const fuseMult = Math.min(8, 2 ** Math.max(0, w.episodeRefires))
+									if (silence >= (chunkTimeoutMs + gracePeriodMs) * fuseMult) {
+										await recover(sid, `no activity for ${Math.ceil(silence / 1000)}s`)
+									}
+								}
+							}
+						}
 						continue
 					} else {
 						continue
