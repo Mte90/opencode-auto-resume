@@ -4345,6 +4345,10 @@ export default define({
 			// mean a new task, so the total-fire count starts over here — and
 			// only here (plus genuine execution.started), never on model text.
 			w.lifetimeContinues = 0
+			// The retry count rides that budget: it counts the work done after a
+			// nudge, which can never outrun the continues of the episode, so the
+			// existing `lifetimeMaxContinues` setting (9) bounds it too.
+			w.workRetries = 0
 			// And it re-opens a stood-down session: the stall gaveUp latch
 			// clears on genuine user takeovers, never on transitions.
 			w.gaveUp = false
@@ -6293,6 +6297,9 @@ export default define({
 							// is new work, not our nudge looping. Own recovery
 							// turns skip this branch entirely, so they keep counting.
 							w.lifetimeContinues = 0
+							// The retry count rides that budget (see the user-message
+							// site): it is bounded by lifetimeMaxContinues.
+							w.workRetries = 0
 							w.emptyIdleNudged = false
 						}
 						// Drop the durable arm with the in-memory one. This delete is
