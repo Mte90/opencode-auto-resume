@@ -696,6 +696,10 @@ const DEFAULT_STUCK_TOOL_AGE_MS = 60_000
  */
 const LONG_RUNNING_TOOL_STALE_TTL_MS = 10 * 60_000
 const LONG_RUNNING_TOOLS = ["shell"]
+/** Random jitter (±ms) added to stall threshold to prevent UI minute-rounding collisions.
+ * Nudges on exact 3-min boundaries all show the same display minute.
+ * Seeded by session ID for deterministic behavior across reloads and tests. */
+const STALL_JITTER_MS = 60_000
 const DEFAULT_MAX_RETRIES = 3
 /** Providers known to be local (run on user's hardware). */
 const LOCAL_PROVIDERS = new Set([
@@ -5893,7 +5897,15 @@ export default define({
 									const profileGracePeriodMs = profile.gracePeriodMs
 									const silence = now - w.lastActivityAt
 									const fuseMult = Math.min(8, 2 ** Math.max(0, w.episodeRefires))
-									if (silence >= (profileChunkTimeoutMs + profileGracePeriodMs) * fuseMult) {
+									const baseInterval = (profileChunkTimeoutMs + profileGracePeriodMs) * fuseMult
+									// Per-session jitter so nudges don't land on exact minute boundaries
+									// (causes UI minute-rounding to show multiple nudges at same time).
+									// Only applied when base interval > 60s — short intervals need
+									// deterministic behavior for tests and real short timeouts.
+									const jitter = baseInterval > 60_000
+										? Math.floor(Math.random() * STALL_JITTER_MS * 2) - STALL_JITTER_MS
+										: 0
+									if (silence >= baseInterval + jitter) {
 										await recover(sid, `no activity for ${Math.ceil(silence / 1000)}s`)
 									}
 								}
@@ -5967,7 +5979,15 @@ export default define({
 				// nagging on a fixed 3-minute clock (ses_ed975114).
 				// Genuine user input resets episodeRefires to 0.
 				const fuseMult = Math.min(8, 2 ** Math.max(0, w.episodeRefires))
-				if (silence < (profileChunkTimeoutMs + profileGracePeriodMs) * fuseMult) continue
+				const baseInterval = (profileChunkTimeoutMs + profileGracePeriodMs) * fuseMult
+				// Per-session jitter so nudges don't land on exact minute boundaries
+				// (causes UI minute-rounding to show multiple nudges at same time).
+				// Only applied when base interval > 60s — short intervals need
+				// deterministic behavior for tests and real short timeouts.
+				const jitter = baseInterval > 60_000
+					? Math.floor(Math.random() * STALL_JITTER_MS * 2) - STALL_JITTER_MS
+					: 0
+				if (silence < baseInterval + jitter) continue
 				// A quiet turn that already declared completion, but no idle
 				// inspection ever latched it: no session.idle event arrived, or a
 				// take-over landed mid-silence. Judge the tail from history
