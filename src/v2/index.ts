@@ -509,6 +509,12 @@ export interface AutoResumeOptions {
 	 * Off by default (test files share one process); prod opts in so
 	 * session attach/restore stops restoring amnesia. */
 	shareWatchState?: boolean
+	/** Model profiles: operator can override per-provider or set defaults. */
+	modelProfiles?: Record<string, Partial<StallProfile>>
+	/** Default profile for fast (online) models. */
+	defaultFast?: Partial<StallProfile>
+	/** Default profile for slow (local) models. */
+	defaultSlow?: Partial<StallProfile>
 
 	/**
 	 * Which process-wide registry slot this instance owns.
@@ -691,6 +697,41 @@ const DEFAULT_STUCK_TOOL_AGE_MS = 60_000
 const LONG_RUNNING_TOOL_STALE_TTL_MS = 10 * 60_000
 const LONG_RUNNING_TOOLS = ["shell"]
 const DEFAULT_MAX_RETRIES = 3
+/** Providers known to be local (run on user's hardware). */
+const LOCAL_PROVIDERS = new Set([
+	"llama-server",
+	"ollama",
+	"llama.cpp",
+	"llama-cpp",
+	"vllm",
+	"text-generation-inference",
+	"tgi",
+	"lmstudio",
+	"koboldcpp",
+	"exllama",
+	"mlc-llm",
+	"ggml",
+	"llamacpp",
+])
+/** Session-specific stall profile based on model provider. */
+type StallProfile = {
+	chunkTimeoutMs: number
+	gracePeriodMs: number
+	maxRetries: number
+	lifetimeMaxContinues: number
+}
+const FAST_PROFILE: StallProfile = {
+	chunkTimeoutMs: 180_000,
+	gracePeriodMs: 3_000,
+	maxRetries: 3,
+	lifetimeMaxContinues: 9,
+}
+const SLOW_PROFILE: StallProfile = {
+	chunkTimeoutMs: 600_000,
+	gracePeriodMs: 60_000,
+	maxRetries: 5,
+	lifetimeMaxContinues: 12,
+}
 /** Consecutive failure-driven recoveries tolerated before the failure-loop
  * latch stands the session down. Counts recoveries with no model output
  * between them, not attempts: a dead backend fails every turn identically. */
@@ -1978,6 +2019,7 @@ export default define({
 		const baseBackoff = opts.baseBackoffMs ?? DEFAULT_BASE_BACKOFF_MS
 		const maxBackoff = opts.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS
 		const loopMaxContinues = opts.loopMaxContinues ?? DEFAULT_LOOP_MAX_CONTINUES
+		const baseLoopMaxContinues = loopMaxContinues
 		const loopWindowMs = opts.loopWindowMs ?? DEFAULT_LOOP_WINDOW_MS
 		const lifetimeMaxContinues = opts.lifetimeMaxContinues ?? DEFAULT_LIFETIME_MAX_CONTINUES
 		const debug = opts.debug ?? DEFAULT_DEBUG
@@ -2131,6 +2173,9 @@ export default define({
 			"sendTimeoutMs",
 			"stuckToolAgeMs",
 			"configProbe",
+			"modelProfiles",
+			"defaultFast",
+			"defaultSlow",
 		])
 		const unknownOptions = Object.keys(opts).filter((key) => !RECOGNISED_OPTIONS.has(key))
 		if (unknownOptions.length > 0) {
@@ -2326,6 +2371,28 @@ export default define({
 			return w
 		}
 
+		/** Resolve the stall profile for a session based on its model provider.
+		 * Reads w.model at call time to handle mid-session model switches.
+		 * Applies opts.modelProfiles (per-provider) and opts.defaultFast/defaultSlow. */
+		function resolveProfile(sid: string): StallProfile {
+			const w = sessions.get(sid)
+			const model = w?.model ?? ""
+			const provider = model.split("/")[0]?.trim().toLowerCase() ?? ""
+			const isLocal = LOCAL_PROVIDERS.has(provider)
+			let base: StallProfile = isLocal ? { ...SLOW_PROFILE } : { ...FAST_PROFILE }
+			const defaultOverride = isLocal ? opts.defaultSlow : opts.defaultFast
+			if (defaultOverride) base = { ...base, ...defaultOverride }
+			const providerOverride = opts.modelProfiles?.[provider] ?? opts.modelProfiles?.[model.split("/")[0]?.trim() ?? ""]
+			if (providerOverride) base = { ...base, ...providerOverride }
+			// opts values (when explicitly provided) override the profile defaults,
+			// so tests/configs that set chunkTimeoutMs etc. keep working.
+			const chunkTimeoutMs = opts.chunkTimeoutMs ?? base.chunkTimeoutMs
+			const gracePeriodMs = opts.gracePeriodMs ?? base.gracePeriodMs
+			const maxRetries = opts.maxRetries ?? opts.maxRecoveryRetries ?? base.maxRetries
+			const lifetimeMaxContinues = opts.lifetimeMaxContinues ?? base.lifetimeMaxContinues
+			return { ...base, chunkTimeoutMs, gracePeriodMs, maxRetries, lifetimeMaxContinues }
+		}
+
 		function touch(sid: string) {
 			const w = ensureWatch(sid)
 			// `minActivityGapMs` debounces activity: without it, a burst of events
@@ -2485,9 +2552,11 @@ export default define({
 		 * model that keeps replying "done" reads 1/3 forever. Only a
 		 * genuine user message clears it — never model output. */
 		function lifetimeExhausted(sid: string, w: SessionWatch): boolean {
-			if ((w.lifetimeContinues ?? 0) >= lifetimeMaxContinues) {
+			const profile = resolveProfile(sid)
+			const profileLifetimeMaxContinues = profile.lifetimeMaxContinues
+			if ((w.lifetimeContinues ?? 0) >= profileLifetimeMaxContinues) {
 				if (!w.gaveUp) {
-					log("warn", `${short(sid)} lifetime cap (${lifetimeMaxContinues} continues, no genuine user message) — standing down`)
+					log("warn", `${short(sid)} lifetime cap (${profileLifetimeMaxContinues} continues, no genuine user message) — standing down`)
 					w.gaveUp = true
 				}
 				return true
@@ -3407,8 +3476,8 @@ export default define({
 			}
 			// Evaluate the loop guard BEFORE recording this continue, so the plugin
 			// never escalates on continues it injected itself.
-			if (continuesInWindow(w) >= loopMaxContinues) {
-				log("warn", `${short(sid)} hallucination loop (${loopMaxContinues} continues/${loopWindowMs / 1000}s) — abort+resume`)
+			if (continuesInWindow(w) >= baseLoopMaxContinues) {
+				log("warn", `${short(sid)} hallucination loop (${baseLoopMaxContinues} continues/${loopWindowMs / 1000}s) — abort+resume`)
 				await tryAbortAndResume(sid, w)
 				w.continueTimestamps = []
 				return
@@ -3452,6 +3521,10 @@ export default define({
 				w.resumeAttempts = 0
 			}
 			if (lifetimeExhausted(sid, w)) return
+			// Per-session profile for maxRetries and lifetimeMaxContinues
+			const profile = resolveProfile(sid)
+			const profileMaxRetries = profile.maxRetries
+			const profileLifetimeMaxContinues = profile.lifetimeMaxContinues
 			// A failure the provider is already retrying is not model
 			// unresponsiveness: hold the rung, and never give up on it. Otherwise a
 			// transport fault climbs the ladder into gaveUp, which is terminal
@@ -3467,8 +3540,8 @@ export default define({
 			// The rung is committed only when the prompt below actually lands (see
 			// the inject timer), because counting at detection burned rungs on the
 			// injections the busy/live guard declined (ses_eae46bb9, 2026-10-19).
-			if (!providerFault && w.resumeAttempts >= maxRetries) {
-				log("warn", `${short(sid)} giving up after ${maxRetries} attempts (${reason}) mod=${MODULE_INSTANCE}`)
+			if (!providerFault && w.resumeAttempts >= profileMaxRetries) {
+				log("warn", `${short(sid)} giving up after ${profileMaxRetries} attempts (${reason}) mod=${MODULE_INSTANCE}`)
 				w.gaveUp = true
 				return
 			}
@@ -3478,12 +3551,12 @@ export default define({
 			if (providerFault) {
 				log(
 					"info",
-					`${short(sid)} provider-fault stall (${reason}) — retry scheduled ${Math.round((Date.now() - w.providerRetryAt) / 1000)}s ago, holding the ladder at ${attempt}/${maxRetries}`,
+					`${short(sid)} provider-fault stall (${reason}) — retry scheduled ${Math.round((Date.now() - w.providerRetryAt) / 1000)}s ago, holding the ladder at ${attempt}/${profileMaxRetries}`,
 				)
 			}
 			log(
 				"info",
-				`${short(sid)} stall detected (${reason}) — resume attempt ${attempt}/${maxRetries} in ${delay}ms` +
+				`${short(sid)} stall detected (${reason}) — resume attempt ${attempt}/${profileMaxRetries} in ${delay}ms` +
 					` (work #${w.workRetries} this session)`,
 			)
 			if (w.recoverTimer) clearTimeout(w.recoverTimer)
@@ -3581,12 +3654,13 @@ export default define({
 					// (ses_eaf2fe1f6ffemxjM5OL3kybdTx, 2026-10-22).
 					const workMove = providerFault || w.workSinceNudge ? 1 : 0
 					const prospectiveRetries = Math.max(1, w.workRetries + workMove)
-					// At retry #7 (of 9 max), ask for a progress report so the model
-					// has a chance to report status before the hard limit stands it down.
-					// The prompt is a visible continue with explicit instructions.
-					const isProgressReport = prospectiveRetries >= 7
+					// At retry #7 (of 9 max for fast, 12 for slow), ask for a progress report
+					// so the model has a chance to report status before the hard limit
+					// stands it down. The prompt is a visible continue with explicit instructions.
+					const progressReportThreshold = Math.max(7, Math.floor(profileLifetimeMaxContinues * 0.7))
+					const isProgressReport = prospectiveRetries >= progressReportThreshold
 					const stallText = isProgressReport
-						? `PROGRESS REPORT REQUIRED (attempt ${Math.min(attempt, maxRetries)}/${maxRetries}, retry #${prospectiveRetries}/${lifetimeMaxContinues}): this session has been nudged multiple times. Please report exactly what you have completed and what remains. If work is done, call task_complete. If blocked, say what you need. If still working, say what step you are on. Do not start new work — only continue the current task.`
+						? `PROGRESS REPORT REQUIRED (attempt ${Math.min(attempt, profileMaxRetries)}/${profileMaxRetries}, retry #${prospectiveRetries}/${profileLifetimeMaxContinues}): this session has been nudged multiple times. Please report exactly what you have completed and what remains. If work is done, call task_complete. If blocked, say what you need. If still working, say what step you are on. Do not start new work — only continue the current task.`
 						: await buildStallContinueText(sid, reason, attempt, providerFault, prospectiveRetries)
 					const ok = await injectOnce(sid, stallText, isProgressReport ? "stalled — progress report" : "stalled — retrying", false, true)
 					w.pendingRecoveryArmed = false
@@ -3797,7 +3871,7 @@ export default define({
 				dbg(`${short(sid)} self-abort in flight — skipping ${kind} nudge`)
 				return
 			}
-			if (continuesInWindow(w) >= loopMaxContinues) {
+			if (continuesInWindow(w) >= baseLoopMaxContinues) {
 				log("warn", `${short(sid)} loop guard before ${kind} nudge — abort+resume`)
 				await tryAbortAndResume(sid, w)
 				w.continueTimestamps = []
@@ -4112,8 +4186,8 @@ export default define({
 			// Same loop guard as recover(): our continue counts toward the
 			// shared window, and past the max the answer is escalation, not
 			// another prompt.
-			if (continuesInWindow(w) >= loopMaxContinues) {
-				log("warn", `${short(sid)} hallucination loop (${loopMaxContinues} continues/${loopWindowMs / 1000}s) — abort+resume`)
+			if (continuesInWindow(w) >= baseLoopMaxContinues) {
+				log("warn", `${short(sid)} hallucination loop (${baseLoopMaxContinues} continues/${loopWindowMs / 1000}s) — abort+resume`)
 				await tryAbortAndResume(sid, w)
 				w.continueTimestamps = []
 				return true
@@ -5512,7 +5586,9 @@ export default define({
 
 		async function runOrphanWatch(sid: string, w: SessionWatch, now: number, activeIDs: Set<string>): Promise<void> {
 			if (now - w.orphanWatchStartAt! < subagentWaitMs + gracePeriodMs) return
-			if (w.resumeAttempts >= maxRetries) {
+			const profile = resolveProfile(sid)
+			const profileMaxRetries = profile.maxRetries
+			if (w.resumeAttempts >= profileMaxRetries) {
 				if (!w.gaveUp) {
 					w.gaveUp = true
 					w.orphanWatchStartAt = null
@@ -5520,7 +5596,7 @@ export default define({
 					// gaveUp is a legitimate reset: the watch stood down for good, so a
 					// future episode (even with the same dead child) starts clean.
 					w.orphanEscalatedChildSid = undefined
-					log("warn", `${short(sid)} orphan watch gave up after ${w.resumeAttempts} attempts`)
+					log("warn", `${short(sid)} orphan watch gave up after ${profileMaxRetries} attempts`)
 				}
 				return
 			}
@@ -5591,10 +5667,12 @@ export default define({
 					// subagent-patience suite pins) is preserved; only the abort is
 					// skipped.
 					w.resumeAttempts++
-					if (w.resumeAttempts >= maxRetries) {
+					const profile = resolveProfile(sid)
+					const profileMaxRetries = profile.maxRetries
+					if (w.resumeAttempts >= profileMaxRetries) {
 						if (!w.gaveUp) {
 							w.gaveUp = true
-							log("warn", `${short(sid)} orphan watch gave up after ${w.resumeAttempts} attempts`)
+							log("warn", `${short(sid)} orphan watch gave up after ${profileMaxRetries} attempts`)
 						}
 					} else {
 						w.orphanWatchStartAt = now
@@ -5810,9 +5888,12 @@ export default define({
 								} else if (await parentWaitingOnSubagents(sid, activeSet)) {
 									dbg(`${short(sid)} waiting on subagents — skipping stall detection`)
 								} else {
+									const profile = resolveProfile(sid)
+									const profileChunkTimeoutMs = profile.chunkTimeoutMs
+									const profileGracePeriodMs = profile.gracePeriodMs
 									const silence = now - w.lastActivityAt
 									const fuseMult = Math.min(8, 2 ** Math.max(0, w.episodeRefires))
-									if (silence >= (chunkTimeoutMs + gracePeriodMs) * fuseMult) {
+									if (silence >= (profileChunkTimeoutMs + profileGracePeriodMs) * fuseMult) {
 										await recover(sid, `no activity for ${Math.ceil(silence / 1000)}s`)
 									}
 								}
@@ -5875,6 +5956,10 @@ export default define({
 					dbg(`${short(sid)} mid-compaction — skipping stall detection`)
 					continue
 				}
+			// Per-session profile based on model provider (local vs online)
+				const profile = resolveProfile(sid)
+				const profileChunkTimeoutMs = profile.chunkTimeoutMs
+				const profileGracePeriodMs = profile.gracePeriodMs
 				const silence = now - w.lastActivityAt
 				// Episode backoff: each progress-restarted refire without
 				// genuine user input doubles the fuse (cap x8), so a
@@ -5882,7 +5967,7 @@ export default define({
 				// nagging on a fixed 3-minute clock (ses_ed975114).
 				// Genuine user input resets episodeRefires to 0.
 				const fuseMult = Math.min(8, 2 ** Math.max(0, w.episodeRefires))
-				if (silence < (chunkTimeoutMs + gracePeriodMs) * fuseMult) continue
+				if (silence < (profileChunkTimeoutMs + profileGracePeriodMs) * fuseMult) continue
 				// A quiet turn that already declared completion, but no idle
 				// inspection ever latched it: no session.idle event arrived, or a
 				// take-over landed mid-silence. Judge the tail from history
