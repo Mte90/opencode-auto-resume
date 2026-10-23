@@ -2654,6 +2654,11 @@ export default define({
 				serveQuotaRung(sid, w, n, ladder)
 				return
 			}
+			// Already armed and cooldown not elapsed — skip re-arming to prevent
+			// duplicate quota-armed log entries and duplicate syncQuotaState calls.
+			if (w.rateLimitedAt > 0 && now - w.rateLimitedAt < ladder[n]) {
+				return
+			}
 			if (w.rateLimitedAt === 0) w.rateLimitedAt = now
 			w.awaitingQuotaRetry = true
 			const waitMs = Math.max(0, ladder[n] - (now - w.rateLimitedAt))
