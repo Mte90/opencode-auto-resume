@@ -734,7 +734,7 @@ const SLOW_PROFILE: StallProfile = {
 	chunkTimeoutMs: 600_000,
 	gracePeriodMs: 60_000,
 	maxRetries: 5,
-	lifetimeMaxContinues: 12,
+	lifetimeMaxContinues: 20,
 }
 /** Consecutive failure-driven recoveries tolerated before the failure-loop
  * latch stands the session down. Counts recoveries with no model output

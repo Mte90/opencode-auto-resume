@@ -91,7 +91,7 @@ Stall thresholds and retry budgets are selected per-session based on the model p
 | `chunkTimeoutMs` | 180s | 600s |
 | `gracePeriodMs` | 3s | 60s |
 | `maxRetries` | 3 | 5 |
-| `lifetimeMaxContinues` | 9 | 12 |
+| `lifetimeMaxContinues` | 9 | 20 |
 
 Override per-profile via `defaultFast` / `defaultSlow`, or per-provider via `modelProfiles`:
 
@@ -680,7 +680,7 @@ Defaults are the same on v1 and v2 unless a row says otherwise.
 | `subagentDeadMs` | `1800000` | Outer bound: quiet past this with no error evidence reads as dead (v2 only). Inside it, a quiet child is waited on, not aborted — 30 min default for long-thinking models |
 | `loopMaxContinues` | `3` | Continues in window before triggering abort |
 | `loopWindowMs` | `600000` | Hallucination loop detection window (10 min) |
-| `lifetimeMaxContinues` | `9` (fast) / `12` (slow) | Lifetime stall continues per genuine user episode before standing down; resets only on a genuine user message/turn, never on model text — stops the "keeps saying done" loop that restarts the `maxRetries` ladder at 1/3 forever. Per-profile defaults: fast (online) models get 9, slow (local) models get 12. Override both via `lifetimeMaxContinues`, or set `defaultFast.lifetimeMaxContinues` / `defaultSlow.lifetimeMaxContinues` for per-profile control |
+| `lifetimeMaxContinues` | `9` (fast) / `20` (slow) | Lifetime stall continues per genuine user episode before standing down; resets only on a genuine user message/turn, never on model text — stops the "keeps saying done" loop that restarts the `maxRetries` ladder at 1/3 forever. Per-profile defaults: fast (online) models get 9, slow (local) models get 20. Override both via `lifetimeMaxContinues`, or set `defaultFast.lifetimeMaxContinues` / `defaultSlow.lifetimeMaxContinues` for per-profile control |
 | `streamingFailureErrorNames` | `["ProviderError","APIError","StreamError","ConnectionError","TimeoutError"]` | Error names that classify as streaming failures (exact match) |
 | `streamingFailureMessagePatterns` | `["streaming response failed","stream.*fail","connection.*reset","connection.*closed"]` | Regex patterns (case-insensitive) in error messages indicating streaming failure |
 | `maxRecoveryRetries` | `2` | v1 name for the streaming-failure retry budget; v2 canonical is `maxRetries` (alias still accepted) |
