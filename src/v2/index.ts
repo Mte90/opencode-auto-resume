@@ -346,6 +346,10 @@ interface SessionWatch {
 	 * backoff timer after disposal and injects from a dead sessions map
 	 * (observed 2026-10-06: twin identical prods 5ms apart). */
 	recoverTimer: ReturnType<typeof setTimeout> | null
+	/** Generation counter for the recover timer. Incremented each time recover()
+	 * arms a new timer. Stale timer callbacks check this before injecting to
+	 * prevent duplicate nudges (observed 2026-10-23: twin identical prods). */
+	recoverGeneration: number
 	/** Tool calls started but not finished, tracked from the tool lifecycle events.
 	 * The orphan watch must never abort a session that is legitimately working. */
 	pendingTools: number
@@ -2283,6 +2287,7 @@ export default define({
 			if (w) {
 				w.emptyIdleNudged ??= false
 				w.workRetries ??= 0
+				w.recoverGeneration ??= 0
 				w.lifetimeContinues ??= 0
 				w.inflightTools ??= new Map()
 				w.lastStuckToolCheck ??= 0
@@ -2346,6 +2351,7 @@ export default define({
 					orphanRecoveryTried: false,
 					toolTextTimer: null,
 					recoverTimer: null,
+					recoverGeneration: 0,
 					lastSubagentCheckAt: 0,
 					pendingTools: 0,
 					toolsInFlightAtIdle: 0,
@@ -3569,6 +3575,9 @@ export default define({
 					` (work #${w.workRetries} this session)`,
 			)
 			if (w.recoverTimer) clearTimeout(w.recoverTimer)
+			// Increment generation so stale timer callbacks from a previous
+			// recover() call don't fire (prevents duplicate nudges).
+			const gen = ++w.recoverGeneration
 			// When this timer was armed: a genuine user message arriving after
 			// this point means the user took over mid-backoff, and firing into
 			// their live turn would interrupt it ("Step interrupted"). The
@@ -3580,6 +3589,10 @@ export default define({
 			let delivered = false
 			w.recoverTimer = setTimeout(async () => {
 				w.recoverTimer = null
+				// Stale timer guard: if a newer recover() call armed a different
+				// timer, this callback is stale and must not inject (prevents
+				// duplicate nudges from queued callbacks).
+				if (gen !== w.recoverGeneration) return
 				// Disposed instances must stay silent: a superseded setup's
 				// backoff outlives its own dispose (which is exactly how twin
 				// identical prods landed milliseconds apart).
