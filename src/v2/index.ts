@@ -4439,7 +4439,14 @@ export default define({
 				w.lastInjectAt > 0 &&
 				latest.at >= w.lastInjectAt &&
 				latest.at - w.lastInjectAt < OWN_PROMPT_TIME_MS
-			if (ownByText || ownByShape || ownByTime) {
+			// ownByTime alone is too permissive: a genuine user message arriving
+			// within OWN_PROMPT_TIME_MS of our injection would be misidentified as
+			// our own prompt, skipping the workRetries reset and breaking the
+			// retry counter (I1 audit, 2026-10-23). Only trust ownByTime when
+			// there is no readable body (content null projection) AND the message
+			// arrived on our inject clock.
+			const ownByTimeOnly = ownByTime && !(typeof latest.text === "string" && latest.text.length > 0)
+			if (ownByText || ownByShape || ownByTimeOnly) {
 				dbg(`${short(sid)} newest user message is our own prompt — not re-arming budgets`)
 				return
 			}
