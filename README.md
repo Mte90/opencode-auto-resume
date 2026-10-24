@@ -78,6 +78,34 @@ The plugin extracts the **agent, model, and provider** from the last session mes
 
 Token flow counts as activity. The watchdog measures silence from events, but a turn generating tokens for minutes emits no other events — so every `session.usage.updated` event whose token total grew resets the silence clock. A flat total (nothing resumed) does not reset it, so a genuinely wedged session still trips the watchdog on schedule.
 
+### Per-session model profiles
+
+Stall thresholds and retry budgets are selected per-session based on the model provider. Local models (running on your hardware) get more patience; online models (cloud APIs) get tighter timeouts.
+
+**Local providers** (slow profile): `llama-server`, `ollama`, `vllm`, `lmstudio`, `koboldcpp`, `exllama`, `text-generation-inference`, `llamacpp`, and aliases.
+
+**Online providers** (fast profile): everything else, including `opencode/*`.
+
+| | Fast (online) | Slow (local) |
+|---|---|---|
+| `chunkTimeoutMs` | 180s | 600s |
+| `gracePeriodMs` | 3s | 60s |
+| `maxRetries` | 3 | 5 |
+| `lifetimeMaxContinues` | 9 | 12 |
+
+Override per-profile via `defaultFast` / `defaultSlow`, or per-provider via `modelProfiles`:
+
+```json
+{
+  "modelProfiles": {
+    "llama-server": { "lifetimeMaxContinues": 20 }
+  },
+  "defaultSlow": { "chunkTimeoutMs": 900000 }
+}
+```
+
+The profile is resolved at stall-detection time (not session start), so mid-session model switches are handled automatically.
+
 _Motivated by:_
 - [#34214](https://github.com/anomalyco/opencode/issues/34214) — Opencode freezes / becomes unresponsive mid-session
 - [#35207](https://github.com/anomalyco/opencode/issues/35207) — Session hangs indefinitely after MCP tool-call — no timeout recovery (deadlock)
@@ -652,7 +680,7 @@ Defaults are the same on v1 and v2 unless a row says otherwise.
 | `subagentDeadMs` | `1800000` | Outer bound: quiet past this with no error evidence reads as dead (v2 only). Inside it, a quiet child is waited on, not aborted — 30 min default for long-thinking models |
 | `loopMaxContinues` | `3` | Continues in window before triggering abort |
 | `loopWindowMs` | `600000` | Hallucination loop detection window (10 min) |
-| `lifetimeMaxContinues` | `9` | Lifetime stall continues per genuine user episode before standing down; resets only on a genuine user message/turn, never on model text — stops the "keeps saying done" loop that restarts the `maxRetries` ladder at 1/3 forever |
+| `lifetimeMaxContinues` | `9` (fast) / `12` (slow) | Lifetime stall continues per genuine user episode before standing down; resets only on a genuine user message/turn, never on model text — stops the "keeps saying done" loop that restarts the `maxRetries` ladder at 1/3 forever. Per-profile defaults: fast (online) models get 9, slow (local) models get 12. Override both via `lifetimeMaxContinues`, or set `defaultFast.lifetimeMaxContinues` / `defaultSlow.lifetimeMaxContinues` for per-profile control |
 | `streamingFailureErrorNames` | `["ProviderError","APIError","StreamError","ConnectionError","TimeoutError"]` | Error names that classify as streaming failures (exact match) |
 | `streamingFailureMessagePatterns` | `["streaming response failed","stream.*fail","connection.*reset","connection.*closed"]` | Regex patterns (case-insensitive) in error messages indicating streaming failure |
 | `maxRecoveryRetries` | `2` | v1 name for the streaming-failure retry budget; v2 canonical is `maxRetries` (alias still accepted) |
