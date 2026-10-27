@@ -525,6 +525,43 @@ Aborts the active run, then continues. The only family that can unblock a live r
 
 Paths: orphan parent, subagent stuck (parent side), hallucination loop, streaming-failure escalation. All aborts pass the active-tool guards first, and plugin-initiated aborts are marked so they are not mistaken for user ESC (`session.error` → `MessageAbortedError` race).
 
+## Complementary plugins
+
+Auto-resume works on its own, but two companion plugins make it sharper. Both are
+optional — auto-resume detects their presence and degrades gracefully when they
+are absent.
+
+### Todo list plugin (optional)
+
+- **Plugin:** [opencode-todolist](https://github.com/aiev/opencode-todolist) (v0.6.0+)
+- **What it does:** restores `todowrite` / `todoread` in opencode v2.
+- **How auto-resume uses it:** reads the session's todo list to nudge when
+  unfinished tasks remain (the "open todos" nudges). With no todo plugin, those
+  nudges never fire; every other recovery path runs unchanged and auto-resume
+  falls back to the older behaviour (latch on the 🎉 emoji, demand a report on
+  a bare done-claim).
+- **Without it:** auto-resume functions fully — just without task-aware nudges.
+
+### Task-complete plugin (optional)
+
+- **Plugin:** [opencode-task-complete](https://github.com/famewolf/opencode-task-complete)
+- **What it does:** provides the `task_complete` tool, the model's explicit
+  "I am finished" signal (stronger than a trailing 🎉).
+- **How auto-resume uses it:** treats a `task_complete` call as the strongest
+  completion signal available. If the plugin is not installed, auto-resume
+  registers a built-in fallback copy of the tool so completion signalling still
+  works; when the plugin is present its registration takes precedence
+  (registry keys by name, last write wins).
+- **Without it:** auto-resume functions fully — completion is inferred from
+  text and emoji instead.
+
+### Summary
+
+| Plugin | Required? | If absent |
+|---|---|---|
+| opencode-todolist | No | No task-aware nudges; other paths unaffected |
+| opencode-task-complete | No | Built-in fallback `task_complete` tool; text/emoji completion |
+
 ## Architecture
 
 v1 consumed the SSE event stream (`session.status`, `session.created`,
