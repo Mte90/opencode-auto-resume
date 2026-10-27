@@ -3300,6 +3300,7 @@ export default define({
 			if (!running) return false
 			w.aborting = false
 			w.resumeAttempts = 0
+			void syncCounters(sid, w)
 			// The escalation is an observable new episode, so it also re-opens
 			// a stood-down session. Unreachable with gaveUp set today (every
 			// caller is gaveUp-guarded), but the rule belongs here so a future
@@ -3594,6 +3595,7 @@ export default define({
 				if (w.resumeAttempts > 0) w.episodeRefires++
 				w.resumeAttempts = 0
 			}
+			void syncCounters(sid, w)
 			if (lifetimeExhausted(sid, w)) return
 			// Per-session profile for maxRetries and lifetimeMaxContinues
 			const profile = resolveProfile(sid)
