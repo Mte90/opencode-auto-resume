@@ -299,14 +299,15 @@ describe("v2: the todo list, read from the tool that owns it", () => {
 		expect(storageWrites.filter((k) => k.startsWith("todos/"))).toEqual([])
 	})
 
-	test("storage writes are confined to the plugin's own quota domain", async () => {
+	test("storage writes are confined to the plugin's own quota + counter domains", async () => {
 		// The counterpart to the assertion above: writing is allowed, writing
 		// anywhere else is not. A future feature reaching for someone else's
 		// storage namespace fails here rather than silently mutating state it
-		// does not own.
+		// does not own. (2026-10-26: resume-counters/ is the plugin's second
+		// owned namespace — the persistent recovery counters.)
 		const { storageWrites } = await replay([{ text: CELEBRATED }], OPEN)
 		for (const key of storageWrites) {
-			expect(key.startsWith("resume-quota/")).toBe(true)
+			expect(key.startsWith("resume-quota/") || key.startsWith("resume-counters/")).toBe(true)
 		}
 	})
 

@@ -796,6 +796,7 @@ const CHECKED_TOOL_PART_IDS_MAX = 500
  * (R1). A log file was the previous channel and is a bad one: a 2MB rotation
  * cap plus a fixed 3000-line tail can drop a live arm. */
 const QUOTA_STATE_PREFIX = "resume-quota/"
+const COUNTER_STATE_PREFIX = "resume-counters/"
 /** Generous ceiling on a stored arm. The ladder horizon is minutes; this only
  * exists so an abandoned record cannot haunt a session days later. */
 const QUOTA_STATE_MAX_AGE_MS = 48 * 3600_000
@@ -961,7 +962,7 @@ const PERMANENT_UNKNOWN_MODEL_RE =
  * Throttle phrasing also matches (issue #46: "sent too many tokens ... in a
  * short period, please wait before retrying") so it never reaches the OOC
  * latch — maybeLockOoc defers to isRateLimitError first. */
-const RATE_LIMIT_RE = /rate limit exceeded|too many requests|\b429\b|quota exceeded|provider\.quota|throttl|slow down|please wait|try again later|too many tokens.{0,120}(short period|wait|retr|throttl|slow|per (second|minute|hour|day)|rate|limit|quota)/i
+const RATE_LIMIT_RE = /rate limit exceeded|too many requests|\b429\b|quota exceeded|provider\.quota|throttl|slow down|please wait|try again later|too many tokens.{0,120}(short period|wait|retr|throttl|slow|per (second|minute|hour|day)|rate|limit|quota)|free usage limit reached|usage limit reached|connect a provider or subscribe/i
 /** Per-attempt cooldowns before a rate-limited session may be retried: 15m,
  * 30m, 1h, then 2h out to ~12h of unattended coverage. Past the ladder the
  * session stays silent until a genuine user turn. */
@@ -2638,7 +2639,8 @@ export default define({
 			w.quotaNoticedAt = 0
 			log("info", `${short(sid)} rate-limit cooldown served — retrying (attempt ${rung + 1}/${ladder.length}) mod=${MODULE_INSTANCE}`)
 			void syncQuotaState(sid, w)
-			void recover(sid, "rate-limit cooldown served")
+			const cooldownMin = Math.max(1, Math.round(ladder[rung] / 60000))
+			void recover(sid, `rate-limit cooldown served (rung ${rung + 1}/${ladder.length}, ${cooldownMin}m)`)
 		}
 
 		function handleRateLimitFailure(sid: string, w: SessionWatch, errType: string, errMsg: string): void {
@@ -3411,6 +3413,7 @@ export default define({
 			const elapsed = w.lastActivityAt ? Math.round((Date.now() - w.lastActivityAt) / 1000) : 0
 			const hms = (n: number) =>
 				n < 60 ? `${n}s` : n < 3600 ? `${Math.floor(n / 60)}m ${n % 60}s` : `${Math.floor(n / 3600)}h ${Math.floor((n % 3600) / 60)}m`
+			const isRateLimitReason = /rate-limit/i.test(reason)
 			// Each fact exactly once: a "no activity for Ns" reason already states
 			// the silence, so adding "idle M:SS" repeats it (188s vs 3m 9s). And
 			// idle is only news for silence stalls: a dead stream is seconds old
@@ -3438,7 +3441,7 @@ export default define({
 			const retries = prospectiveRetries ?? w.workRetries
 			const head = [
 				isSilence ? null : reason,
-				`attempt ${Math.min(shown, maxRetries)}/${maxRetries} (retry #${retries})`,
+				isRateLimitReason ? null : `attempt ${Math.min(shown, maxRetries)}/${maxRetries} (retry #${retries})`,
 				isSilence ? `idle ${hms(elapsed)}` : null,
 				now,
 			]
@@ -3593,6 +3596,10 @@ export default define({
 				// timer, this callback is stale and must not inject (prevents
 				// duplicate nudges from queued callbacks).
 				if (gen !== w.recoverGeneration) return
+				// F2 (2026-10-26): the w.workRetries value before this rung's claim - the
+				// release target if the rung is not consumed (declared here so the finally
+				// block below can see it).
+				let rungFloor = -1
 				// Disposed instances must stay silent: a superseded setup's
 				// backoff outlives its own dispose (which is exactly how twin
 				// identical prods landed milliseconds apart).
@@ -3674,8 +3681,13 @@ export default define({
 					// (below) - counting at detection advanced it for nudges the user
 					// never saw, so the first VISIBLE message could read "retry #2"
 					// (ses_eaf2fe1f6ffemxjM5OL3kybdTx, 2026-10-22).
-					const workMove = providerFault || w.workSinceNudge ? 1 : 0
-					const prospectiveRetries = Math.max(1, w.workRetries + workMove)
+					// F2 (2026-10-26): claim the rung count at rung START, before any
+					// await, so two rungs scheduled in the same pass carry distinct
+					// prospective counts (+1 each) instead of both reading the same
+					// stale w.workRetries; the commit below only ever moves forward.
+					rungFloor = w.workRetries
+					const prospectiveRetries = w.workRetries + 1
+					w.workRetries = prospectiveRetries
 					// At retry #7 (of 9 max for fast, 12 for slow), ask for a progress report
 					// so the model has a chance to report status before the hard limit
 					// stands it down. The prompt is a visible continue with explicit instructions.
@@ -3688,8 +3700,10 @@ export default define({
 					w.pendingRecoveryArmed = false
 					if (ok) {
 						delivered = true
-						// Commit the retry count now that the nudge landed.
-						w.workRetries = prospectiveRetries
+						// Commit the retry count now that the nudge landed (F2: forward-only —
+						// the rung was already claimed at rung start; a reordered landing must
+						// never clobber a newer rung's higher claim). (Claim already
+						// made at rung start; this line was a no-op and is removed.)
 						w.workSinceNudge = false
 						// Commit the rung only now that the prompt landed: the text
 						// above already carried `attempt`, and every decliner above
@@ -3701,6 +3715,7 @@ export default define({
 						// continue.
 						if (!providerFault && attempt > w.resumeAttempts) w.resumeAttempts = attempt
 						recordContinue(sid)
+						syncCounters(sid, w)
 						w.lastRetryAt = Date.now()
 						touch(sid)
 						markBusy(sid)
@@ -3708,6 +3723,13 @@ export default define({
 						await tryAbortAndResume(sid, w)
 					}
 				} finally {
+					// F2 release (2026-10-26): the rung above claimed one count, but the
+					// nudge was never consumed (dedup-suppressed, busy, declined, failed) -
+					// release the claim so an unconsumed rung cannot advance the ordinal or
+					// reach the progress-report threshold. Strict equality: a concurrent rung
+					// that claimed AFTER us keeps its higher count untouched.
+					if (!delivered && rungFloor >= 0 && w.workRetries === rungFloor + 1)
+						w.workRetries = rungFloor
 					w.recovering = false
 					if (!delivered) {
 						dbg(`${short(sid)} attempt ${attempt}/${maxRetries} not delivered — rung not consumed (${reason})`)
@@ -3901,6 +3923,7 @@ export default define({
 			}
 			if (lifetimeExhausted(sid, w)) return
 			recordContinue(sid)
+			syncCounters(sid, w)
 			if (w[budgetKey] >= maxRetries) {
 				dbg(`${short(sid)} ${kind} budget exhausted`)
 				return
@@ -4217,6 +4240,7 @@ export default define({
 			w.emptyIdleNudged = true
 			if (lifetimeExhausted(sid, w)) return true
 			recordContinue(sid)
+			syncCounters(sid, w)
 			// Send DIRECTLY, not through recover(): recover() schedules on a
 			// backoff timer (the opposite of instant) and arms selfRecovery
 			// for a turn that may never start — a stale claim that would
@@ -5931,6 +5955,29 @@ export default define({
 										? Math.floor(Math.random() * STALL_JITTER_MS * 2) - STALL_JITTER_MS
 										: 0
 									if (silence >= baseInterval + jitter) {
+										// Quota guard for idle sessions: don't inject a stall nudge
+										// when the last assistant message carries a quota/usage error.
+										try {
+											const _qlast2 = history.length ? history[history.length - 1] : null
+											let _qtype2 = ""
+											let _qmsg2 = ""
+											if (_qlast2 && msgRole(_qlast2) === "assistant") {
+												const _qe2 = (_qlast2 as { error?: unknown; info?: { error?: unknown } }).error ?? (_qlast2 as { info?: { error?: unknown } }).info?.error
+												if (typeof _qe2 === "string") _qmsg2 = _qe2
+												else if (_qe2 && typeof _qe2 === "object") {
+													_qtype2 = String((_qe2 as { name?: unknown; type?: unknown }).name ?? (_qe2 as { type?: unknown }).type ?? "")
+													_qmsg2 = String((_qe2 as { message?: unknown }).message ?? "")
+												}
+												const _qtxt2 = lastAssistantTextFrom(history)
+												if (_qtxt2) _qmsg2 = _qmsg2 ? `${_qmsg2} ${_qtxt2}` : _qtxt2
+											}
+											if (isRateLimitError(_qtype2, _qmsg2)) {
+												handleRateLimitFailure(sid, w, _qtype2, _qmsg2)
+												continue
+											}
+										} catch (e) {
+											dbg(`${short(sid)} quota guard (idle) failed: ${e instanceof Error ? e.message : String(e)}`)
+										}
 										await recover(sid, `no activity for ${Math.ceil(silence / 1000)}s`)
 									}
 								}
@@ -6149,6 +6196,31 @@ export default define({
 					// that even though the default policy refuses to.
 					await tryAbortAndResume(sid, w, true)
 				} else {
+					// Quota guard: if the last assistant message carries a quota/usage-limit
+					// error, treat it as a rate-limit failure (stand down + quota ladder)
+					// instead of injecting a stall-recovery prompt that will also fail.
+					try {
+						const _qm = await loadMessages(sid)
+						const _qlast = _qm.length ? _qm[_qm.length - 1] : null
+						let _qtype = ""
+						let _qmsg = ""
+						if (_qlast && msgRole(_qlast) === "assistant") {
+							const _qe = (_qlast as { error?: unknown; info?: { error?: unknown } }).error ?? (_qlast as { info?: { error?: unknown } }).info?.error
+							if (typeof _qe === "string") _qmsg = _qe
+							else if (_qe && typeof _qe === "object") {
+								_qtype = String((_qe as { name?: unknown; type?: unknown }).name ?? (_qe as { type?: unknown }).type ?? "")
+								_qmsg = String((_qe as { message?: unknown }).message ?? "")
+							}
+							const _qtxt = lastAssistantTextFrom(_qm)
+							if (_qtxt) _qmsg = _qmsg ? `${_qmsg} ${_qtxt}` : _qtxt
+						}
+						if (isRateLimitError(_qtype, _qmsg)) {
+							handleRateLimitFailure(sid, w, _qtype, _qmsg)
+							continue
+						}
+					} catch (e) {
+						dbg(`${short(sid)} quota guard failed: ${e instanceof Error ? e.message : String(e)}`)
+					}
 					await recover(sid, `no activity for ${Math.ceil(silence / 1000)}s`)
 				}
 			}
@@ -6632,6 +6704,24 @@ export default define({
 			}
 		}
 
+		async function syncCounters(sid: string, w: SessionWatch) {
+			try {
+				const st = ctx.storage
+				if (!st?.set) return
+				const key = `${COUNTER_STATE_PREFIX}${sid}`
+				await st.set(key, {
+					v: 1,
+					workRetries: w.workRetries ?? 0,
+					resumeAttempts: w.resumeAttempts ?? 0,
+					lifetimeContinues: w.lifetimeContinues ?? 0,
+					episodeRefires: w.episodeRefires ?? 0,
+					at: Date.now()
+				})
+			} catch (e) {
+				dbg(`${short(sid)} counter sync failed:`, e instanceof Error ? e.message : String(e))
+			}
+		}
+
 		// ---------------------------------------------------------------------
 		// Event stream
 		// ---------------------------------------------------------------------
@@ -6672,29 +6762,67 @@ export default define({
 						// the last nudge starts over, bounded by
 						// lifetimeMaxContinues (9). Own recovery turns skip this
 						// branch, so they keep counting.
-						if (!providerRetryFresh) {
-							// Lifetime cap is per genuine episode too: a real turn
-							// is new work, not our nudge looping. Own recovery
-							// turns skip this branch entirely, so they keep counting.
-							w.lifetimeContinues = 0
-							// The retry count rides that budget (see the user-message
-							// site): it is bounded by lifetimeMaxContinues.
-							w.workRetries = 0
-							w.emptyIdleNudged = false
-						}
-						// Drop the durable arm with the in-memory one. This delete is
-						// what lets restore skip the history read: no record means the
-						// user has spoken since the arm, so there is nothing to serve.
-						void syncQuotaState(sid, w)
-						// A genuine turn is also a new episode for the stall
-						// ladder (the reset lives here and in the progress check,
-						// never on lifecycle transitions) — unless our inject is
-						// newer than any genuine user message, in which case the
-						// turn continues our episode (interleaving idle events do
-						// not end it), or the turn is the provider's own retry.
-						if (!providerRetryFresh && !(w.lastInjectAt > 0 && w.lastInjectAt >= w.lastGenuineUserAt)) {
-							w.resumeAttempts = 0
-						}
+						// F1 (2026-10-26, live-vs-production audit m00412): our own
+						// stall-continue injects fire session.execution.started, so a
+						// fresh self-inject is the only time this branch runs on OUR
+						// turn. Wiping counters there made the visible retry# repeat
+						// #1 across rungs (auditor I2: 3 invariant breaks in 19
+						// nudges). Gate the whole reset on 'not a fresh self-inject'.
+						// F1 recency (2026-10-26, audit m00412): the proxy below
+						// (lastInjectAt >= lastGenuineUserAt) cannot see a user
+						// message that is ALREADY in the history but not yet
+						// learned — boot seeds are learned by the sweep, which runs
+						// later. A user message newer than our last inject means a new
+						// episode, not our rung; skipping the wipe there lets one
+						// episode's counters leak into the next (watch state is
+						// module-persistent). Our own nudge reads ≈ lastInjectAt, so
+						// it never trips this.
+						void (async () => {
+							const selfInjectFresh =
+								w.lastInjectAt > 0 && w.lastInjectAt >= w.lastGenuineUserAt
+							let ownRung = !providerRetryFresh && selfInjectFresh
+							if (ownRung) {
+								try {
+									for (const m of await loadMessages(sid)) {
+										if (
+											msgRole(m) === "user" &&
+											msgAt(m) > w.lastInjectAt
+										) {
+											ownRung = false
+											break
+										}
+									}
+								} catch {
+									// Fail closed: if the history cannot be read
+									// (no session.context in the environment), we
+									// cannot confirm this is our rung — fall back
+									// to the pre-fix reset behaviour (wipe).
+									ownRung = false
+								}
+							}
+							if (!ownRung) {
+								// Lifetime cap is per genuine episode too: a real turn
+								// is new work, not our nudge looping. Own recovery
+								// rungs skip the wipe entirely, so they keep counting.
+								w.lifetimeContinues = 0
+								// The retry count rides that budget (see the user-message
+								// site): it is bounded by lifetimeMaxContinues.
+								w.workRetries = 0
+								w.emptyIdleNudged = false
+								if (ctx.storage?.remove) {
+									ctx.storage.remove(`${COUNTER_STATE_PREFIX}${sid}`).catch(() => {})
+								}
+							}
+							// Drop the durable arm with the in-memory one. This delete is
+							// what lets restore skip the history read: no record means the
+							// user has spoken since the arm, so there is nothing to serve.
+							void syncQuotaState(sid, w)
+							// The stall ladder resets per episode (see the progress
+							// check) — never on own rungs, which continue the episode.
+							if (!ownRung) {
+								w.resumeAttempts = 0
+							}
+						})()
 					}
 					markBusy(sid)
 					return
@@ -7165,6 +7293,37 @@ export default define({
 		}
 		void pump()
 		void restoreQuotaLadders()
+		// Restore counters (workRetries, resumeAttempts, etc.) from persisted
+		// state so an armed session keeps its budget across a plugin reload /
+		// process restart. Stale records (>24h) and sessions with a live watch
+		// (workRetries > 0) are skipped. See syncCounters (write side).
+		void (async () => {
+			try {
+				const listed = new Set(unwrapList(await callSessionApi("list")).map((r) => r.id).filter((id) => typeof id === "string"))
+				for (const sid of listed) {
+					let rec: unknown
+					try {
+						rec = await ctx.storage.get(`${COUNTER_STATE_PREFIX}${sid}`)
+					} catch {
+						continue
+					}
+					if (!rec || typeof rec !== "object") continue
+					const recObj = rec as { v?: unknown; at?: unknown; workRetries?: unknown; resumeAttempts?: unknown; lifetimeContinues?: unknown; episodeRefires?: unknown }
+					if (typeof recObj.v !== "number") continue
+					// Only restore if recent (within 24h)
+					if (typeof recObj.at !== "number" || Date.now() - recObj.at > 24 * 3600000) continue
+					const w = ensureWatch(sid)
+					if (w.workRetries > 0) continue // already has state (e.g., not a restart)
+					w.workRetries = typeof recObj.workRetries === "number" ? recObj.workRetries : 0
+					w.resumeAttempts = typeof recObj.resumeAttempts === "number" ? recObj.resumeAttempts : 0
+					w.lifetimeContinues = typeof recObj.lifetimeContinues === "number" ? recObj.lifetimeContinues : 0
+					w.episodeRefires = typeof recObj.episodeRefires === "number" ? recObj.episodeRefires : 0
+					dbg(`${short(sid)} counters restored: workRetries=${w.workRetries} resumeAttempts=${w.resumeAttempts} lifetimeContinues=${w.lifetimeContinues}`)
+				}
+			} catch (e) {
+				dbg("counter restore failed:", e instanceof Error ? e.message : String(e))
+			}
+		})()
 
 		if (superseded) {
 			// Two mod ids under ONE boot is the evidence that separates a plugin

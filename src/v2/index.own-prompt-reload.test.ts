@@ -214,11 +214,12 @@ describe("v2: our own stall prompt is not a genuine user message", () => {
 		// (they count unanswered nudges) ...
 		expect(attempts[0]).toBe("1")
 		expect(attempts[1]).toBe("2")
-		// ... and the retry count (work done) stays put. Pre-fix the second
-		// nudge read "attempt 1/3 (retry #1)" - the counter was reset by our
-		// own prompt being read as a genuine user message.
+		// ... and the retry ordinal continues (2026-10-26 F2: rung-claim).
+		// Pre-fix the second nudge read "attempt 1/3 (retry #1)" - the counter
+		// was reset by our own prompt being read as a genuine user message;
+		// that misreading still cannot happen (asserted below).
 		expect(retries[0]).toBe("1")
-		expect(retries[1]).toBe("1")
+		expect(retries[1]).toBe("2")
 		expect(logs).not.toContain("new user message — restarting the stall ladder")
 	})
 })

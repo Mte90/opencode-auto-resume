@@ -271,12 +271,13 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		expect(retries.slice(0, 2)).toEqual(["1", "2"])
 	})
 
-	test("a genuine turn restarts the retry count but not the ladder", async () => {
-		// The count answers "which recovery of the episode", and a model turn
-		// not caused by us is a new episode — even when the stall ladder
-		// correctly keeps climbing through it (own inject newer than any
-		// genuine user message, so no ladder reset). Fires read attempt 1/3
-		// then 2/3, but retry #1 both times.
+	test("a model turn of its own keeps the ladder and the retry ordinal climbing", async () => {
+		// The ordinal answers "which recovery of the episode" and resets ONLY
+		// on a genuine user message (2026-10-26 F1/F2). A model turn we did
+		// not cause is NOT a new episode — the ladder climbs and the ordinal
+		// continues. Fires read attempt 1/3 then 2/3 with retry #1 then #2
+		// (pre-fix the exec-start wipe here restarted the count to #1 — the
+		// exact repeat the audit flagged).
 		const retryOf = (text: string | undefined): string | null => {
 			const m = /retry #(\d+)/.exec(text ?? "")
 			return m ? m[1] : null
@@ -287,18 +288,19 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		await waitFor(() => h.injected.length >= 1)
 		push(h, "session.idle", SID)
 		await wait(10)
-		// No new user message: the next start is the model acting on its own
-		// (selfRecovery was cleared as stale by the idle above), so genuine.
+		// No user message since our nudge: the next start takes the genuine
+		// path (selfRecovery was cleared as stale by the idle above) — and it
+		// continues the episode, not resets it.
 		push(h, "session.execution.started", SID)
 		await waitFor(() => h.injected.length >= 2)
 		const attempts = h.injected.map((i: any) => attemptOf(i.text))
 		const retries = h.injected.map((i: any) => retryOf(i.text))
 		const logs = existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : ""
 		await teardown(h)
-		// A genuine turn is NOT work: neither counter moves, and the give-up
-		// ladder keeps climbing through it.
+		// The ladder keeps climbing, and the ordinal continues through the
+		// model's own turn (no genuine user message in between).
 		expect(ladderOf(logs).slice(0, 2)).toEqual(["1", "2"])
-		expect(retries.slice(0, 2)).toEqual(["1", "1"])
+		expect(retries.slice(0, 2)).toEqual(["1", "2"])
 		expect(attempts.slice(0, 2)).toEqual(["1", "2"])
 	})
 	test("each fire carries its episode retry number", async () => {
@@ -419,9 +421,10 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		await teardown(h)
 		// A silent stall: the attempts climb 1/3, 2/3, 3/3 ...
 		expect(attempts.slice(0, 3)).toEqual(["1", "2", "3"])
-		// ... while the retry count does NOT move (no work was done) - the two
-		// numbers never climb together.
-		expect(retries.slice(0, 3)).toEqual(["1", "1", "1"])
+		// ... and the retry ordinal climbs with them — the recovery-rung
+		// number, claimed at rung-start (2026-10-26 F2; pre-fix it held at #1
+		// for pure silence — the repeat the audit flagged).
+		expect(retries.slice(0, 3)).toEqual(["1", "2", "3"])
 	})
 
 	test("three answered stalls read 1/3, 1/3, 1/3 with retry #1, #2, #3", async () => {
