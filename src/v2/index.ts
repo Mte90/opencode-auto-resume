@@ -207,6 +207,9 @@ interface SessionWatch {
 	 * explanation reads as broken (ses_edd3d940, 2026-10-10). */
 	quotaNoticedAt: number
 	gaveUp: boolean
+	/** User-paused: auto-resume will not inject or arm quota for this session
+	 * until explicitly resumed. Persisted via the marker file + storage. */
+	paused: boolean
 	/** Newest genuine (non-own-prompt) user message observed, by timestamp. Our
 	 * own injections travel as user messages but carry no new instructions, so
 	 * they must not read as the user taking over (see noteInboundUserMessage).
@@ -797,6 +800,7 @@ const CHECKED_TOOL_PART_IDS_MAX = 500
  * cap plus a fixed 3000-line tail can drop a live arm. */
 const QUOTA_STATE_PREFIX = "resume-quota/"
 const COUNTER_STATE_PREFIX = "resume-counters/"
+const PAUSED_MARKER_FILE = `${process.env.HOME ?? ""}/.config/opencode/auto-resume.paused`
 /** Generous ceiling on a stored arm. The ladder horizon is minutes; this only
  * exists so an abandoned record cannot haunt a session days later. */
 const QUOTA_STATE_MAX_AGE_MS = 48 * 3600_000
@@ -2310,6 +2314,7 @@ export default define({
 					providerRetryAt: 0,
 					quotaNoticedAt: 0,
 					gaveUp: false,
+					paused: false,
 					lastGenuineUserAt: 0,
 					consecFailureRecovers: 0,
 					failureLoopLatched: false,
@@ -2402,6 +2407,49 @@ export default define({
 			const maxRetries = opts.maxRetries ?? opts.maxRecoveryRetries ?? base.maxRetries
 			const lifetimeMaxContinues = opts.lifetimeMaxContinues ?? base.lifetimeMaxContinues
 			return { ...base, chunkTimeoutMs, gracePeriodMs, maxRetries, lifetimeMaxContinues }
+		}
+
+		// ---- Pause / resume (user-controlled) ---------------------------------
+		// Source of truth: a marker file listing paused session ids (one per line)
+		// or "*" for all. Written by the CLI helper and the /auto-resume command.
+		let pausedCacheMtime = 0
+		let pausedCacheSet: Set<string> = new Set()
+		function readPausedSet(): Set<string> {
+			try {
+				const st = statSync(PAUSED_MARKER_FILE)
+				if (st.mtimeMs === pausedCacheMtime) return pausedCacheSet
+				pausedCacheMtime = st.mtimeMs
+				const raw = readFileSync(PAUSED_MARKER_FILE, "utf8")
+				const s = new Set<string>()
+				for (const line of raw.split(/\r?\n/)) {
+					const t = line.trim()
+					if (t) s.add(t)
+				}
+				pausedCacheSet = s
+				return s
+			} catch {
+				pausedCacheMtime = 0
+				pausedCacheSet = new Set()
+				return pausedCacheSet
+			}
+		}
+		function isPaused(sid: string): boolean {
+			const s = readPausedSet()
+			return s.has("*") || s.has(sid)
+		}
+		function setPaused(sid: string, on: boolean): void {
+			const s = readPausedSet()
+			if (on) s.add(sid)
+			else s.delete(sid)
+			try {
+				mkdirSync(dirname(PAUSED_MARKER_FILE), { recursive: true })
+			} catch {}
+			try {
+				writeFileSync(PAUSED_MARKER_FILE, [...s].join("\n") + (s.size ? "\n" : ""), "utf8")
+				pausedCacheMtime = 0
+			} catch (e) {
+				dbg(`${short(sid)} pause write failed: ${e instanceof Error ? e.message : String(e)}`)
+			}
 		}
 
 		function touch(sid: string) {
@@ -2644,6 +2692,10 @@ export default define({
 		}
 
 		function handleRateLimitFailure(sid: string, w: SessionWatch, errType: string, errMsg: string): void {
+			if (isPaused(sid)) {
+				dbg(`${short(sid)} paused — not arming quota ladder`)
+				return
+			}
 			const ladder = rateLimitCooldownsMs
 			const tag = "rate-limit"
 			const n = w.rateLimitAttempts
@@ -3457,6 +3509,10 @@ export default define({
 		 */
 		async function recover(sid: string, reason: string): Promise<void> {
 			const w = ensureWatch(sid)
+			if (isPaused(sid)) {
+				dbg(`${short(sid)} paused — skipping recover (${reason})`)
+				return
+			}
 			if (w.recovering || w.aborting || w.gaveUp || w.userCancelled || w.permissionPending) return
 			if (w.failureLoopLatched) {
 				dbg(`${short(sid)} failure loop latched — standing down until a genuine turn or fresh model output`)
@@ -5887,6 +5943,7 @@ export default define({
 			const activeSet = new Set(activeIDs)
 
 			for (const [sid, w] of sessions) {
+				if (isPaused(sid)) continue
 				if (w.status !== "busy" || w.userCancelled) {
 					// A stood-down session still gets its inbound mail read: a
 					// genuine new user message re-arms (clears userCancelled
@@ -7340,6 +7397,39 @@ export default define({
 		}
 		if (adoptedSessions > 0) {
 			log("info", `adopted ${adoptedSessions} watched session(s) from previous instance (stall memory retained) mod=${MODULE_INSTANCE}`)
+		}
+
+		// Register /auto-resume slash command (pause/resume this session).
+		if (ctx.command && typeof ctx.command.transform === "function") {
+			try {
+				await ctx.command.transform((cmd) => {
+					cmd.add({
+						name: "auto-resume",
+						description: "Pause or resume auto-resume for this session: /auto-resume off|on|status",
+						execute: async (input: any) => {
+							const sessionID = String(input?.sessionID ?? "")
+							const rawArg = input?.args ?? input?.prompt?.args ?? input?.prompt?.text ?? input?.text ?? ""
+							const verb = String(rawArg).trim().toLowerCase().split(/\s+/)[0] || "status"
+							const w = ensureWatch(sessionID)
+							const msg = (text: string) => ctx.session.prompt({ sessionID, text } as any)
+							if (verb === "off" || verb === "pause") {
+								setPaused(sessionID, true)
+								w.paused = true
+								await msg("auto-resume paused for this session. Run /auto-resume on to resume.")
+							} else if (verb === "on" || verb === "resume") {
+								setPaused(sessionID, false)
+								w.paused = false
+								await msg("auto-resume resumed for this session.")
+							} else {
+								const state = isPaused(sessionID) ? "paused" : "active"
+								await msg(`auto-resume is ${state} for this session.`)
+							}
+						},
+					})
+				})
+			} catch (e) {
+				log("warn", `auto-resume command registration failed: ${e instanceof Error ? e.message : String(e)}`)
+			}
 		}
 
 		log(

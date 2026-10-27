@@ -311,6 +311,14 @@ _Motivated by:_
 
 ---
 
+### Pausing auto-resume
+
+Long-running quota blocks (or any delicate work) can be paused without deleting the session:
+
+- Slash command: `/auto-resume off` pauses the current session, `/auto-resume on` resumes, `/auto-resume` (or `/auto-resume status`) reports state. While paused, auto-resume will not inject a continue nudge and will not arm the quota ladder.
+- CLI helper (works without opening the chat): `auto-resume-toggle <sessionID> off|on|status`, plus `auto-resume-toggle --all off|on` to pause/resume every session.
+- Pause is sticky: it stays off until an explicit `on`, so a forgotten pause won't silently re-arm. (The marker file is `~/.config/opencode/auto-resume.paused`.)
+
 ### Explicit completion via `task_complete`
 
 The agent can call the `task_complete` tool to signal that all work is done. When invoked, the plugin stops sending any further `"continue"` prompts, clears all pending timers, and marks the session as complete. This replaces fragile text-based heuristics (emoji patterns, language detection) with a deterministic signal.
