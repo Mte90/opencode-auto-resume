@@ -966,7 +966,7 @@ const PERMANENT_UNKNOWN_MODEL_RE =
  * Throttle phrasing also matches (issue #46: "sent too many tokens ... in a
  * short period, please wait before retrying") so it never reaches the OOC
  * latch — maybeLockOoc defers to isRateLimitError first. */
-const RATE_LIMIT_RE = /rate limit exceeded|too many requests|\b429\b|quota exceeded|provider\.quota|throttl|slow down|please wait|try again later|too many tokens.{0,120}(short period|wait|retr|throttl|slow|per (second|minute|hour|day)|rate|limit|quota)|free usage limit reached|usage limit reached|connect a provider or subscribe/i
+const RATE_LIMIT_RE = /rate limit exceeded|too many requests|\b429\b|quota exceeded|provider\.quota|provider\.free|throttl|slow down|please wait|try again later|too many tokens.{0,120}(short period|wait|retr|throttl|slow|per (second|minute|hour|day)|rate|limit|quota)|free[ -]?limit|free usage limit reached|usage limit reached|connect a provider or subscribe/i
 /** Per-attempt cooldowns before a rate-limited session may be retried: 15m,
  * 30m, 1h, then 2h out to ~12h of unattended coverage. Past the ladder the
  * session stays silent until a genuine user turn. */
@@ -6041,6 +6041,10 @@ export default define({
 										} catch (e) {
 											dbg(`${short(sid)} quota guard (idle) failed: ${e instanceof Error ? e.message : String(e)}`)
 										}
+										if (w.awaitingQuotaRetry || w.rateLimitedAt > 0) {
+											dbg(`${short(sid)} quota-armed — skipping stall recover`)
+											continue
+										}
 										await recover(sid, `no activity for ${Math.ceil(silence / 1000)}s`)
 									}
 								}
@@ -6283,6 +6287,10 @@ export default define({
 						}
 					} catch (e) {
 						dbg(`${short(sid)} quota guard failed: ${e instanceof Error ? e.message : String(e)}`)
+					}
+					if (w.awaitingQuotaRetry || w.rateLimitedAt > 0) {
+						dbg(`${short(sid)} quota-armed — skipping stall recover`)
+						continue
 					}
 					await recover(sid, `no activity for ${Math.ceil(silence / 1000)}s`)
 				}
