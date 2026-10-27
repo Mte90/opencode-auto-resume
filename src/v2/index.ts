@@ -3730,6 +3730,7 @@ export default define({
 					// that claimed AFTER us keeps its higher count untouched.
 					if (!delivered && rungFloor >= 0 && w.workRetries === rungFloor + 1)
 						w.workRetries = rungFloor
+					void syncCounters(sid, w)
 					w.recovering = false
 					if (!delivered) {
 						dbg(`${short(sid)} attempt ${attempt}/${maxRetries} not delivered — rung not consumed (${reason})`)
@@ -4570,6 +4571,9 @@ export default define({
 			// nudge, which can never outrun the continues of the episode, so the
 			// existing `lifetimeMaxContinues` setting (9) bounds it too.
 			w.workRetries = 0
+			if (ctx.storage?.remove) {
+				ctx.storage.remove(`${COUNTER_STATE_PREFIX}${sid}`).catch(() => {})
+			}
 			// And it re-opens a stood-down session: the stall gaveUp latch
 			// clears on genuine user takeovers, never on transitions.
 			w.gaveUp = false
