@@ -207,6 +207,9 @@ interface SessionWatch {
 	 * explanation reads as broken (ses_edd3d940, 2026-10-10). */
 	quotaNoticedAt: number
 	gaveUp: boolean
+	/** Timestamp of the last quota notice sent (dedupes back-to-back duplicates
+	 * from concurrent event paths; 100ms window). */
+	lastQuotaNoticeAt: number
 	/** User-paused: auto-resume will not inject or arm quota for this session
 	 * until explicitly resumed. Persisted via the marker file + storage. */
 	paused: boolean
@@ -966,7 +969,7 @@ const PERMANENT_UNKNOWN_MODEL_RE =
  * Throttle phrasing also matches (issue #46: "sent too many tokens ... in a
  * short period, please wait before retrying") so it never reaches the OOC
  * latch — maybeLockOoc defers to isRateLimitError first. */
-const RATE_LIMIT_RE = /rate limit exceeded|too many requests|\b429\b|quota exceeded|provider\.quota|provider\.free|throttl|slow down|please wait|try again later|too many tokens.{0,120}(short period|wait|retr|throttl|slow|per (second|minute|hour|day)|rate|limit|quota)|free[ -]?limit|free usage limit reached|usage limit reached|connect a provider or subscribe/i
+const RATE_LIMIT_RE = /rate.?limit|too many requests|\b429\b|quota exceeded|provider\.quota|provider\.free|insufficient.?quota|resource.?exhausted|overloaded|throttl|slow down|please wait|try again later|too many tokens.{0,120}(short period|wait|retr|throttl|slow|per (second|minute|hour|day)|rate|limit|quota)|free[ -]?limit|free usage limit reached|usage limit reached|connect a provider or subscribe/i
 /** Per-attempt cooldowns before a rate-limited session may be retried: 15m,
  * 30m, 1h, then 2h out to ~12h of unattended coverage. Past the ladder the
  * session stays silent until a genuine user turn. */
@@ -2314,6 +2317,7 @@ export default define({
 					providerRetryAt: 0,
 					quotaNoticedAt: 0,
 					gaveUp: false,
+					lastQuotaNoticeAt: 0,
 					paused: false,
 					lastGenuineUserAt: 0,
 					consecFailureRecovers: 0,
@@ -2703,8 +2707,9 @@ export default define({
 			if (n >= ladder.length) {
 				w.awaitingQuotaRetry = false
 				log("warn", `${short(sid)} ${tag} budget exhausted (${ladder.length} attempts) — standing down until user turn`)
-				if (!w.quotaNoticedAt) {
+				if (!w.quotaNoticedAt && Date.now() - w.lastQuotaNoticeAt > 100) {
 					w.quotaNoticedAt = Date.now()
+					w.lastQuotaNoticeAt = Date.now()
 					void sendQuotaNotice(sid, `Rate limited — standing down until you return (budget exhausted after ${ladder.length} attempts).`)
 				}
 				return
@@ -2726,8 +2731,9 @@ export default define({
 			// User-visible twin of the stand-down: silence reads as dead
 			// (ses_edd3d940). One notice per episode (first arm only);
 			// resume:false so it never kicks a turn or re-arms budgets.
-			if (!w.quotaNoticedAt) {
+			if (!w.quotaNoticedAt && Date.now() - w.lastQuotaNoticeAt > 100) {
 				w.quotaNoticedAt = Date.now()
+				w.lastQuotaNoticeAt = Date.now()
 				const mins = Math.max(1, Math.round(waitMs / 60000))
 				const when = mins >= 60 ? `~${Math.floor(mins / 60)}h ${mins % 60}m` : `~${mins}m`
 				void sendQuotaNotice(sid, `Rate limited, retrying in ${when} (attempt ${n + 1}/${ladder.length}).`)
