@@ -7432,6 +7432,10 @@ export default define({
 			}
 		}
 
+		// Pause is process-lifetime only: a restart re-arms auto-resume so a
+		// forgotten pause cannot silently disable it forever.
+		try { writeFileSync(PAUSED_MARKER_FILE, "", "utf8") } catch {}
+
 		log(
 			"info",
 			`ready (opencode v2). timeout=${chunkTimeoutMs}ms interval=${checkIntervalMs}ms retries=${maxRetries} loop=${loopMaxContinues}/${loopWindowMs / 1000}s warmup=${warmupMs}ms stall=${busyStallStrategy} visibleContinue=${visibleContinue} probe=${configProbe ?? "-"} mod=${MODULE_INSTANCE} up=${HOST_UPTIME_S}s boot=${HOST_BOOT}` +
