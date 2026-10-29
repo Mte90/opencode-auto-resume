@@ -42,15 +42,26 @@ describe("REGRESSION: non-Plugin exports crash OpenCode host", () => {
     })
 })
 
-describe("REGRESSION: bundled dist must only export Plugin-shaped values (no null/string/number returns)", () => {
-    test("every export from the built dist returns an object (Hooks) when called, never null/string/number", async () => {
-        const mod = await import("./index")
-        const fakeCtx: any = {
+describe("REGRESSION: bundled dist must export dual-shape dispatcher (id, server, setup)", () => {
+    test("built dist default export has id, callable server, and callable setup; server returns hooks with callable event", async () => {
+        // Import the BUILT dist/index.js (same as the main entry point)
+        const mod = await import("../dist/index.js")
+        
+        // Assert default export is an object with the required shape
+        expect(typeof mod.default).toBe("object")
+        expect(typeof mod.default.id).toBe("string")
+        expect(mod.default.id).toBe("auto-resume.v2")
+        expect(typeof mod.default.server).toBe("function")
+        expect(typeof mod.default.setup).toBe("function")
+
+        // Assert .server returns hooks with callable event
+        const minimalCtx: any = {
             client: {
                 app: { log: async () => {} },
                 session: {
                     list: async () => ({ data: [] }),
                     status: async () => ({ data: {} }),
+                    todo: async () => ({ data: [] }),
                     messages: async () => [],
                     prompt: async () => ({}),
                     abort: async () => ({}),
@@ -59,24 +70,20 @@ describe("REGRESSION: bundled dist must only export Plugin-shaped values (no nul
             ui: { toast: async () => {} },
         }
 
-        for (const [name, fn] of Object.entries(mod)) {
-            if (typeof fn !== "function") {
-                throw new Error(`Export "${name}" is not a function (got ${typeof fn})`)
-            }
-            const result = await (fn as Function)(fakeCtx, {})
-            if (result === null) {
-                throw new Error(
-                    `REGRESSION BROKEN: export "${name}" returned null when called as Plugin. ` +
-                    `OpenCode's loader would push this null into the plugin array, then crash at null.config?.(U) ` +
-                    `with "null is not an object (evaluating 'N.config')".`,
-                )
-            }
-            if (typeof result !== "object") {
-                throw new Error(
-                    `Export "${name}" returned ${typeof result} (not an object). ` +
-                    `OpenCode's loader expects every export to be a Plugin returning a Hooks object.`,
-                )
-            }
+        const options = {
+            enabled: true,
+            baseBackoffMs: 1,
+            checkIntervalMs: 10_000_000,
+            maxRetries: 3,
+            loopMaxContinues: 10,
+            minActivityGapMs: 0,
+            toolTextCheckDelayMs: 10,
+            warmupMs: 0,
+            activeUserWindowMs: 0
         }
+
+        const hooks = await (mod.default.server as Function)(minimalCtx, options)
+        expect(hooks).toBeDefined()
+        expect(typeof hooks.event).toBe("function")
     })
 })

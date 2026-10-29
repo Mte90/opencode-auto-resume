@@ -123,7 +123,7 @@ interface AutoResumePluginInput {
 		hook?: (name: string, callback: (event: any) => unknown) => unknown
 	}
 	/** Application logger, when the host provides one. */
-	app?: { log?: (level: string, message: string) => unknown }
+	app?: { name?: string; version?: string; channel?: string }
 }
 
 // ---------------------------------------------------------------------------
@@ -1308,7 +1308,7 @@ const STOP_STATEMENT_PATTERNS: RegExp[] = [
 	//
 	// Case discipline (2026-10-15): every completion pattern in this file is
 	// case-insensitive EXCEPT the system's own literal — bare "TASK COMPLETE"
-	// must read byte-exact, per the operator contract in docs/AGENTS-snippet.md
+	// must read byte-exact, per the operator contract
 	// ("The line must read exactly `TASK COMPLETE`"). A lowercase "task
 	// complete" is model prose, not the signal, and does not latch. The past
 	// tense ("task completed", any case) stays insensitive — it was never
@@ -2200,6 +2200,12 @@ export default define({
 				`ignoring unrecognised option(s): ${unknownOptions.join(", ")} — ` +
 					`this v2 build does not read them. See docs/known-issues-v2.md.`,
 			)
+		}
+		// Build/server version guard: this bundle only works on opencode v2, where the
+		// plugin input exposes `app.version`. A v1 server omits `ctx.app` entirely;
+		// without this check setup crashes later with an opaque API error.
+		if (typeof (ctx as any).app?.version !== "string") {
+			log("warn", "this looks like the opencode v1 build running on the wrong server: ctx.app.version is missing. The v2 bundle requires opencode v2 — check docs/migration.md and load dist/index.js (v1) or dist/v2/index.js (v2) to match your server.")
 		}
 		// Feature-gated options are valid but inert on v2. Reported in the startup
 		// line rather than as a warning — the user cannot act on it, so a per-start

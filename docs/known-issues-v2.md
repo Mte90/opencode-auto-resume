@@ -104,6 +104,11 @@ effective timings, so a build that loaded at all is provable from the file:
 2026-10-01T18:02:28.412Z INFO  [auto-resume] ready (opencode v2). timeout=180000ms interval=5000ms ...
 ```
 
+If the server is not v2 — `ctx.app.version` absent, as on opencode v1 — the
+build logs a mismatch warning to `logFile` at startup instead of crashing later
+with an opaque API error. The mirror guard exists in the v1 build (warns on the
+server console when `ctx.serverUrl` is absent).
+
 ## Session discovery
 
 v1 swept `session.list()` on an interval and trusted a `status` field per row.

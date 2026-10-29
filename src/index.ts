@@ -504,6 +504,14 @@ function buildOpenTodosReminder(todos: Todo[]): string {
 }
 
 export const AutoResumePlugin: Plugin = async (ctx, options) => {
+    // Build/server version guard: this bundle only works on opencode v1, whose
+    // plugin input exposes `serverUrl`. A v2 server omits it, and the v1 log
+    // sink (ctx.client.app.log) is gone in v2 — without this check setup
+    // surfaces only an opaque API error, so the warning goes straight to the
+    // console and cannot depend on log().
+    if (!(ctx as any).serverUrl) {
+        console.warn("[auto-resume] this looks like the opencode v1 build running on the wrong server: ctx.serverUrl is missing. The v1 bundle requires opencode v1 — check docs/migration.md and load dist/index.js (v1) or dist/v2/index.js (v2) to match your server.")
+    }
     const chunkTimeoutMs: number =
     (options?.chunkTimeoutMs as number) ?? DEFAULT_CHUNK_TIMEOUT_MS
     const checkIntervalMs: number =

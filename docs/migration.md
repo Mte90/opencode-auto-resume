@@ -19,6 +19,12 @@ covered by 233 tests across 20 files driven through the real event stream — on
 file per feature area (figures rechecked 2026-10-05 after the todo-branch fix
 ports; repo-wide total in the suite footer below counts v1+v2).
 
+The shipped `dist/index.js` is a dual-shape universal entry: its
+default export carries both `server` (v1 loader) and `setup` (v2 loader), so
+one install path loads on either server generation. Each branch still guards
+against a wrong-host load (`ctx.serverUrl is missing` on v1,
+`ctx.app.version is missing` on v2) instead of failing with an opaque error.
+
 ## 1. Config key renamed: `plugin` → `plugins`
 
 ```jsonc
@@ -188,7 +194,7 @@ respected.
 
 The port reads **all 31 of v1's options** and applies **all 31**. Names and
 defaults are unchanged, and the full table is in the
-[README](../../README.md#configurable-options). Two defaults moved after both
+[README](../README.md#configurable-options). Two defaults moved after both
 builds picked them up from upstream: `chunkTimeoutMs` to 180000 (`49957b2`) and
 `activeUserWindowMs` to 300000 (`e1b8374`).
 

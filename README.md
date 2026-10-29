@@ -2,25 +2,36 @@
 
 **Plugin for [OpenCode](https://github.com/anomalyco/opencode) that automatically detects and recovers from LLM session failures — stalls, broken tool calls, hallucination loops, stuck subagent parents, and more. Fully silent, zero UI pollution.**
 
-> **Which instructions?** This README covers both builds: unmarked sections
-> describe behavior shared by v1 and v2, and build-specific notes say so
-> inline ("On v2…", "Both builds…"). On **v2**, install first via
-> [docs/v2/installing.md](docs/v2/installing.md), then read here — the
-> [Architecture](#architecture) section is v2's flow with the v1 shape kept
-> as a three-line historical note.
+Supports **both OpenCode v1 and v2**. The npm package ships a universal
+build and a v2-only build:
 
-> **OpenCode v2 is here (stable).** This repo ships both the v1 plugin
-> (`src/index.ts`) and a complete v2 port (`src/v2/index.ts`) targeting the
-> stable `@opencode/plugin` 2.0.5+ API (verified live against 2.0.27; the
-> 2.0.5→2.0.27 surface diff is additive-only — new experimental WS hooks,
-> `remove`/`compact` on the session domain, tool `list()` — nothing the
-> plugin uses was removed or reshaped). Install it with the
-> [v2 install guide](docs/v2/installing.md); see
-> [docs/v2/migration.md](docs/v2/migration.md) for the full migration notes.
+- `dist/index.js` — **universal**: works on both v1 and v2 servers. The
+  module exposes one entry whose `server`/`setup` branches are picked by
+  the loader of whichever server loads it, so the same install path works
+  everywhere. If a server loads the wrong branch anyway, the build warns
+  (`ctx.serverUrl is missing` / `ctx.app.version is missing`) instead of
+  failing with an opaque API error.
+- `dist/v2/index.js` — v2-only, for installs that point at the v2 file
+  explicitly.
+
+- **v1** — add the plugin to `opencode.jsonc` (config below) and you are
+  done.
+- **v2** — follow the [v2 install guide](docs/installing.md); the v2
+  build targets the stable `@opencode/plugin` 2.0.5+ API (verified live
+  against 2.0.27–2.0.29). The startup banner reads
+  `ready (opencode v2)` so you can confirm the right build loaded, and
+  any option key the v2 build does not recognise produces a single `warn`
+  line at startup — so a typo or a dropped v1→v2 port is never silent.
+  For the full v1 → v2 notes see [docs/migration.md](docs/migration.md).
+
+Unmarked README sections describe behavior shared by both builds;
+build-specific notes say so inline ("On v2…", "Both builds…"). The
+[Architecture](#architecture) section is v2's flow with the v1 shape kept
+as a three-line historical note.
 
 ## Installation
 
-### Opencode
+### v1 (opencode 1.x)
 
 Add to your `opencode.jsonc`:
 
@@ -45,10 +56,12 @@ With options:
 }
 ```
 
-Requires opencode v2.0+ (any 2.0.x server; verified live 2.0.27–2.0.29).
-Uses core session/model APIs only — no experimental hooks. No release
-bundle is published yet, so install is manual (clone, build, copy `dist`;
-see the v2 install guide above) — there is currently no one-line install.
+### v2 (opencode 2.0+)
+
+See the [v2 install guide](docs/installing.md). Requires opencode 2.0.5+.
+No release bundle is published yet, so install is manual (clone, build,
+copy `dist/v2` or the universal `dist/index.js`; see the guide) — there is
+currently no one-line install.
 
 ## Updating
 
@@ -357,10 +370,9 @@ Every capability above is conditional on existing — the text fallback is
 the only step with zero dependencies, so a bare setup degrades to "end
 with TASK COMPLETE" rather than misfiring. Nothing else is guaranteed to
 exist, so these two locations cover it: the global file catches every
-session, the job prompt catches the runs that cost real time. A copy-paste
-version of the A wording plus the two structural companions (todos,
-questions) ships with the plugin at [docs/AGENTS-snippet.md](docs/AGENTS-snippet.md)
-for operators who have no AGENTS.md at all.
+session, the job prompt catches the runs that cost real time. Operators
+with no AGENTS.md at all should write the A wording into a new
+`~/.config/opencode/AGENTS.md` themselves.
 
 ---
 
@@ -422,9 +434,8 @@ intent, not completion, and matches nothing — documented here so a future
 widening doesn't swallow it.
 
 Case discipline: the system's own literal is the one case-sensitive pattern
-in the build — bare `TASK COMPLETE` must read byte-exact, per
-[docs/AGENTS-snippet.md](docs/AGENTS-snippet.md). Every other completion
-pattern is case-insensitive. A lowercase `task complete` is model prose and
+in the build — bare `TASK COMPLETE` must read byte-exact. Every
+other completion pattern is case-insensitive. A lowercase `task complete` is model prose and
 latches nothing; past-tense `task completed` (any case) still latches — it
 was never the literal.
 
@@ -680,8 +691,8 @@ Or place `src/v2/index.ts` directly in `~/.config/opencode/plugins/` for auto-di
 
 Disable via `"-auto-resume.v2"` in `plugins`.
 
-- **Step-by-step install guide:** [docs/v2/installing.md](docs/v2/installing.md)
-- **Migration notes (v1 → v2, stable validation):** [docs/v2/migration.md](docs/v2/migration.md)
+- **Step-by-step install guide:** [docs/installing.md](docs/installing.md)
+- **Migration notes (v1 → v2, stable validation):** [docs/migration.md](docs/migration.md)
 - **What the v2 port does and does not yet do:** [docs/known-issues-v2.md](docs/known-issues-v2.md)
 
 ### How a finished turn is judged

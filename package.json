@@ -23,9 +23,9 @@
   "main": "dist/index.js",
 "scripts": {
     "build": "bun run build:v1 && bun run build:v2",
-    "build:v1": "bun build src/index.ts --outdir dist --target bun",
+    "build:v1": "bun build src/dispatch.ts --outfile dist/index.js --target bun",
     "build:v2": "bun build src/v2/index.ts --outfile dist/v2/index.js --target bun",
-    "dev": "bun build src/index.ts --outdir dist --target bun --watch",
+    "dev": "bun build src/dispatch.ts --outfile dist/index.js --target bun --watch",
     "test": "bun test",
     "prepublishOnly": "bun run build"
 },  "files": [

@@ -3,7 +3,8 @@
 This guide installs the **v2 port** of the plugin. It targets the stable v2
 plugin API (`@opencode/plugin` 2.0.5+, shipped with `opencode` v2.0.5; live-verified on 2.0.27 — the 2.0.5→2.0.27 surface diff is additive-only).
 
-> Coming from OpenCode v1? Read [`migration.md`](./migration.md) first — the v1
+> Coming from OpenCode v1? Read [`migration.md`](./migration.md) first. Note:
+> the universal `dist/index.js` entry works on both servers, but the bare v1
 > plugin file does **not** run on v2 and must be replaced by the v2 port.
 
 ## Requirements
@@ -22,8 +23,9 @@ plugin API (`@opencode/plugin` 2.0.5+, shipped with `opencode` v2.0.5; live-veri
   `OPENCODE_PORT` / `PORT`. If `OPENCODE_SERVER_PASSWORD` (or `OPENCODE_PASSWORD`)
   is set, it is sent as HTTP Basic on that request. All of it is best-effort: a
   host that refuses any of it degrades to "cannot read todos", never a crash.
-- The plugin source: [`src/v2/index.ts`](../../src/v2/index.ts) from this repo, or
-  the built `dist/v2/index.js`.
+- The plugin source: [`src/v2/index.ts`](../src/v2/index.ts) from this repo, or
+  the built `dist/v2/index.js`. The universal `dist/index.js` also works — it
+  exposes the same v2 `setup` branch under a shape both server generations load.
 
 ## Install
 
@@ -86,7 +88,7 @@ symptom to check for.
 Every option is optional and is read from `ctx.options` in `setup`. The port
 reads **all** of v1's options, and applies all of them — there are none left in an
 "accepted but not applied" state. The full table with every default is in the
-[README](../../README.md#configurable-options); the ones worth knowing about on
+[README](../README.md#configurable-options); the ones worth knowing about on
 v2 specifically:
 
 | Option | Default | Description |
@@ -137,6 +139,7 @@ has a plugin sink to write to, which is why `logFile` exists.
 | Symptom | Check |
 |---|---|
 | No `[auto-resume] ready …` banner | File is in a `plugins/` dir opencode scans, or listed in `plugins`; restart opencode. |
+| Log says `ctx.app.version is missing` | This v2 bundle was loaded on an opencode v1 server. Load the v1 build (`dist/index.js`) instead, or upgrade the server — see [migration](migration.md). |
 | Logs say `failed to load plugin` with no reason | The file is not a valid ES module, or a syntax error. Run `bunx tsc --noEmit` on it (see [Development](#development)). |
 | Nothing happens on a stall | Increase verbosity with `"debug": true`; confirm `chunkTimeoutMs` isn't larger than your real stall. |
 | Recovers but you don't see a notice | Your model/provider may reject `session.synthetic()`; the plugin falls back to `session.prompt()` (no TUI banner). |
