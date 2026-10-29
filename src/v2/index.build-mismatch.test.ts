@@ -1,8 +1,6 @@
 import { describe, test, expect } from "bun:test"
-import { existsSync, readFileSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
@@ -12,8 +10,7 @@ const LOG_SALT = "BuildMismatchTest"
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_bmm"
 
-/** Scratch log path per replay, so parallel cases cannot read each other's writes. */
-let counter = 0
+
 
 const textPart = (t: string) => ({ type: "text", text: t })
 
@@ -53,19 +50,18 @@ function makeEventStream() {
 
 type Harness = {
 	cleanup: (() => void) | undefined
-	logFile: string
+	capture: ReturnType<typeof capturePluginLogs>
 	logs: string[]
 }
 
 /** Set up a test context and run setup(). */
 async function setupTest(app?: { name?: string; version?: string; channel?: string }): Promise<Harness> {
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-test-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const stream = makeEventStream()
 	const ctx: any = {
 		event: stream,
-		options: { toolTextCheckDelayMs: 0, logFile, registryScope: LOG_SALT },
+		options: { toolTextCheckDelayMs: 0, registryScope: LOG_SALT },
 		session: {
 			context: async () => [
 				{
@@ -94,13 +90,13 @@ async function setupTest(app?: { name?: string; version?: string; channel?: stri
 	const cleanup = await (plugin as any).setup(ctx)
 	await wait(100) // Allow setup to complete
 
-	const logs = existsSync(logFile) ? readFileSync(logFile, "utf8").split("\n") : []
-	return { cleanup, logFile, logs }
+	const logs = capture.lines
+	return { cleanup, capture, logs }
 }
 
 describe("build/server mismatch guard", () => {
 	test("a ctx without app.version warns about the build/server mismatch", async () => {
-		const { cleanup, logFile, logs } = await setupTest(undefined)
+		const { cleanup, capture, logs } = await setupTest(undefined)
 		try {
 			// setup should NOT throw
 			expect(logs).toBeDefined()
@@ -113,13 +109,13 @@ describe("build/server mismatch guard", () => {
 			expect(warnLines[0]).toContain("ctx.app.version is missing")
 			expect(warnLines[0]).toContain("The v2 bundle requires opencode v2")
 		} finally {
+			capture.stop()
 			cleanup?.()
-			rmSync(logFile, { force: true })
 		}
 	})
 
 	test("a proper v2 app context does not warn", async () => {
-		const { cleanup, logFile, logs } = await setupTest({
+		const { cleanup, capture, logs } = await setupTest({
 			name: "opencode",
 			version: "2.0.27",
 			channel: "stable",
@@ -134,8 +130,8 @@ describe("build/server mismatch guard", () => {
 			)
 			expect(warnLines.length).toBe(0)
 		} finally {
+			capture.stop()
 			cleanup?.()
-			rmSync(logFile, { force: true })
 		}
 	})
 })

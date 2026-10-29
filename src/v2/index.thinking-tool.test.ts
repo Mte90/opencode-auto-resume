@@ -1,8 +1,6 @@
 import { describe, test, expect } from "bun:test"
-import { existsSync, readFileSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
@@ -29,7 +27,7 @@ const SID = "ses_thinking_tool"
  * Every group carries a control.
  */
 
-let counter = 0
+
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -126,12 +124,11 @@ async function replay(
 ): Promise<{ injected: Array<{ text?: string }>; logs: string[] }> {
 	const injected: Array<{ text?: string }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-thinktool-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile, ...opts, registryScope: LOG_SALT },
+		options: { ...OPTIONS, ...opts, registryScope: LOG_SALT },
 		session: {
 			context: async () => [userTurn(), assistantTurn(parts)],
 			active: async () => ({}),
@@ -155,9 +152,8 @@ async function replay(
 	await wait(700)
 	;(cleanup as (() => void) | undefined)?.()
 
-	const logs = existsSync(logFile) ? readFileSync(logFile, "utf8").split("\n") : []
-	rmSync(logFile, { force: true })
-	return { injected, logs }
+	capture.stop()
+	return { injected, logs: capture.lines }
 }
 
 describe("v2: a tool call written into the reasoning block", () => {

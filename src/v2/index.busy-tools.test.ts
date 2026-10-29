@@ -1,8 +1,7 @@
 import { describe, test, expect, setDefaultTimeout } from "bun:test"
 import { rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
@@ -37,7 +36,6 @@ const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 setDefaultTimeout(30_000)
 
 const SID = "ses_busytools"
-let counter = 61000
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -93,11 +91,10 @@ const BASE_OPTS = {
 async function setup(extraOpts: Record<string, unknown> = {}) {
 	const injected: Array<{ text?: string }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-busytools-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 	const ctx: any = {
 		event: stream,
-		options: { ...BASE_OPTS, logFile, registryScope: LOG_SALT, ...extraOpts },
+		options: { ...BASE_OPTS, registryScope: LOG_SALT, ...extraOpts },
 		session: {
 			context: async () => [],
 			active: async () => ({}),
@@ -116,9 +113,10 @@ async function setup(extraOpts: Record<string, unknown> = {}) {
 			stream.push(ev(type, data))
 			await wait(10)
 		},
+		capture,
 		teardown: () => {
 			;(cleanup as (() => void) | undefined)?.()
-			rmSync(logFile, { force: true })
+			capture.stop()
 		},
 	}
 }

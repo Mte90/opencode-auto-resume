@@ -1,8 +1,8 @@
 import { describe, test, expect } from "bun:test"
 import { readFileSync, rmSync } from "node:fs"
 import { join } from "node:path"
-import { tmpdir } from "node:os"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
@@ -14,16 +14,7 @@ const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_registry"
 let counter = 0
 
-/**
- * A private log file. Without `logFile` the plugin writes to its DEFAULT path,
- * which is the LIVE server's log — test sessions then show up interleaved with
- * real ones and the live log stops being usable as forensics.
- */
-function privateLog(tag: string): string {
-	const f = join(tmpdir(), `auto-resume-${LOG_SALT}-${tag}-${process.pid}-${counter++}.log`)
-	rmSync(f, { force: true })
-	return f
-}
+
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -78,7 +69,7 @@ type Boot = { injected: any[]; registryLive: unknown; registryKey: string }
 async function boot(instances: number): Promise<Boot> {
 	const injected: any[] = []
 	const streams = Array.from({ length: instances }, () => makeEventStream())
-	const logFile = privateLog("registry")
+	const capture = capturePluginLogs()
 	let next = 0
 	const ctx: any = {
 		event: {
@@ -88,7 +79,7 @@ async function boot(instances: number): Promise<Boot> {
 				return s
 			},
 		},
-		options: { ...FAST, maxRetries: 1, logFile, registryScope: LOG_SALT },
+		options: { ...FAST, maxRetries: 1, registryScope: LOG_SALT },
 		session: {
 			active: async () => ({}),
 			interrupt: async () => ({}),
@@ -113,7 +104,7 @@ async function boot(instances: number): Promise<Boot> {
 	await wait(700)
 	const duringStall = (globalThis as any)[key]?.live
 	for (const c of cleanups) (c as (() => void) | undefined)?.()
-	rmSync(logFile, { force: true })
+	capture.stop()
 
 	return { injected, registryLive: duringStall ?? afterSetup, registryKey: key }
 }
@@ -150,18 +141,18 @@ describe("v2: the singleton lives on globalThis, so re-evaluations share it", ()
 	// alone. Two scopes must therefore keep two independent live instances.
 	test("differently scoped instances do NOT dispose each other", async () => {
 		const mk = () => makeEventStream()
-		const logFile = privateLog("scoped")
-		const streams = [mk(), mk()]
-		let next = 0
-		const makeCtx = (registryScope: string): any => ({
-			event: {
-				subscribe: ({ signal }: { signal?: AbortSignal } = {}) => {
-					const s = streams[next++] ?? streams[streams.length - 1]
-					signal?.addEventListener("abort", () => s.close())
-					return s
-				},
+	const capture = capturePluginLogs()
+	const streams = [mk(), mk()]
+	let next = 0
+	const makeCtx = (registryScope: string): any => ({
+		event: {
+			subscribe: ({ signal }: { signal?: AbortSignal } = {}) => {
+				const s = streams[next++] ?? streams[streams.length - 1]
+				signal?.addEventListener("abort", () => s.close())
+				return s
 			},
-			options: { ...FAST, maxRetries: 1, logFile, registryScope },
+		},
+		options: { ...FAST, maxRetries: 1, registryScope },
 			session: {
 				active: async () => ({}),
 				interrupt: async () => ({}),
@@ -186,7 +177,7 @@ describe("v2: the singleton lives on globalThis, so re-evaluations share it", ()
 		// A's teardown must not clear B's slot — different scope, different owner.
 		expect(g[`__auto_resume_singleton__:${process.pid}:scope-b`]?.live).toBeDefined()
 		disposeB()
-		rmSync(logFile, { force: true })
+		capture.stop()
 	}, 20_000)
 
 	// The shipped bug: `let activeInstance` in module scope. Six evaluations of

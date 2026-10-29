@@ -1,12 +1,8 @@
 import { describe, test, expect } from "bun:test"
-import { existsSync, readFileSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { existsSync } from "node:fs"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
-/** Unique per test FILE: bun runs every file in one process, so two files
- *  starting their counters at 0 derive the SAME tmpdir log path and read each
- *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
 const LOG_SALT = "IndexUnknownToolTest"
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
@@ -115,15 +111,14 @@ async function setup(
 ): Promise<any> {
 	const injected: Array<{ kind?: string; text?: string }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-ut-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const history: unknown[] = opts.history ?? []
 	const listed = opts.tools ?? TOOLS
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile, ...(opts.quietCorrections === undefined ? {} : { quietCorrections: opts.quietCorrections }), registryScope: LOG_SALT },
+		options: { ...OPTIONS, ...(opts.quietCorrections === undefined ? {} : { quietCorrections: opts.quietCorrections }), registryScope: LOG_SALT },
 		session: {
 			context: async () => history,
 			active: async () => ({}),
@@ -153,14 +148,14 @@ async function setup(
 	return {
 		injected,
 		history,
-		...({ cleanup, logFile, streamRef: stream } as any),
+		...({ cleanup, capture, streamRef: stream } as any),
 	}
 }
 
 async function teardown(h: any) {
 	;(h.cleanup as (() => void) | undefined)?.()
-	rmSync(h.logFile, { force: true })
-}
+	h.capture.stop()}
+
 
 /** Drive a turn to idle, which is what makes the plugin look at the history. */
 async function goIdle(h: any) {
@@ -520,7 +515,7 @@ describe("v2: the unknown-tool check degrades rather than guessing", () => {
 		})
 		await goIdle(h)
 		expect(suggestions(h)).toHaveLength(0)
-		const logs = existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : ""
+		const logs = h.capture.lines.join("\n")
 		expect(logs).toContain("failed to list tools")
 		await teardown(h)
 	})

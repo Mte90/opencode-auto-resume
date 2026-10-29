@@ -1,7 +1,6 @@
 import { describe, test, expect } from "bun:test"
-import { rmSync, readFileSync, existsSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { rmSync } from "node:fs"
+import { capturePluginLogs } from "./test-utils"
 import plugin from "./index"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
@@ -27,7 +26,6 @@ const LOG_SALT = "IndexQuotaRestoreTest"
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_parent"
 
-let counter = 18000
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -65,7 +63,7 @@ function makeEventStream() {
 
 const ev = (type: string, sid: string, data: Record<string, unknown> = {}) => ({ type, data: { sessionID: sid, ...data } })
 
-async function setup(logFile: string, history: unknown[] = []): Promise<any> {
+async function setup(capture: any, history: unknown[] = [], store = new Map<string, unknown>()): Promise<any> {
 	const injected: Array<{ text?: string }> = []
 	const stream = makeEventStream()
 
@@ -85,7 +83,6 @@ async function setup(logFile: string, history: unknown[] = []): Promise<any> {
 			injectIntervalMs: 0,
 			subagentWaitMs: 40,
 			rateLimitCooldownsMs: [150, 150],
-			logFile,
 			debug: true,
 		},
 		session: {
@@ -96,7 +93,11 @@ async function setup(logFile: string, history: unknown[] = []): Promise<any> {
 			synthetic: async (a: any) => (injected.push({ text: a?.text }), {}),
 			prompt: async (a: any) => (injected.push({ text: a?.text }), {}),
 		},
-		storage: { get: async () => ({ todos: [] }), set: async () => {}, remove: async () => {} },
+		storage: {
+			get: async (k: any) => (typeof k === "string" && store.has(k) ? store.get(k) : { todos: [] }),
+			set: async (k: any, v: any) => void store.set(String(k), v),
+			remove: async (k: any) => void store.delete(String(k)),
+		},
 		tool: { transform: async (cb: any) => (cb({ add: () => {} }), { dispose() {} }), list: async () => [] },
 	}
 
@@ -105,21 +106,19 @@ async function setup(logFile: string, history: unknown[] = []): Promise<any> {
 	return {
 		injected,
 		cleanup,
-		logFile,
 		push: (type: string, data: Record<string, unknown> = {}) => stream.push(ev(type, SID, data)),
-		logs: () => (existsSync(logFile) ? readFileSync(logFile, "utf8") : ""),
+		logs: () => capture.lines.join("\n"),
 	}
 }
 
 const OLD = Date.now() - 3600_000
 
 describe("v2: quota ladders survive a plugin reload", () => {
-	test("a fresh evaluation re-arms from the marker and retries", async () => {
-		const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-quota-restore-${process.pid}-${counter++}.log`)
-		rmSync(logFile, { force: true })
-
-		// First evaluation: quota failure arms the ladder (marker written).
-		const h1 = await setup(logFile)
+	test("a fresh evaluation re-arms from the stored record and retries", async () => {
+		// First evaluation: quota failure arms the ladder (record written).
+		const store = new Map<string, unknown>()
+		const capture = capturePluginLogs()
+		const h1 = await setup(capture, [], store)
 		h1.push("session.execution.started")
 		await wait(20)
 		h1.push("session.step.failed", { error: { type: "provider.quota", message: "Rate limit exceeded.", status: 429 } })
@@ -128,12 +127,12 @@ describe("v2: quota ladders survive a plugin reload", () => {
 		;(h1.cleanup as (() => void) | undefined)?.()
 		const marked = h1.logs()
 
-		// Second evaluation (the reload): same log file, fresh memory.
-		const h2 = await setup(logFile)
+		// Second evaluation (the reload): same capture and store, fresh memory.
+		const h2 = await setup(capture, [], store)
 		await wait(600)
 		const log = h2.logs()
 		;(h2.cleanup as (() => void) | undefined)?.()
-		rmSync(logFile, { force: true })
+		capture.stop()
 
 		expect(marked).not.toContain("quota ladder restored")
 		expect(log).toContain("quota ladder restored")
@@ -143,18 +142,21 @@ describe("v2: quota ladders survive a plugin reload", () => {
 	})
 
 	test("CONTROL: a user message after the arm means no restore", async () => {
-		const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-quota-restore-${process.pid}-${counter++}.log`)
-		rmSync(logFile, { force: true })
-
-		const h1 = await setup(logFile)
+		const store = new Map<string, unknown>()
+		const capture = capturePluginLogs()
+		const h1 = await setup(capture, [], store)
 		h1.push("session.execution.started")
 		await wait(20)
 		h1.push("session.step.failed", { error: { type: "provider.quota", message: "Rate limit exceeded.", status: 429 } })
 		await wait(150)
+		// The user's genuine turn resets the ladder and deletes the stored
+		// record, so the reload has nothing to restore.
+		h1.push("session.execution.started")
+		await wait(100)
 		;(h1.cleanup as (() => void) | undefined)?.()
 
 		// User continued the session after the arm: ladder already reset.
-		const h2 = await setup(logFile, [
+		const h2 = await setup(capture, [
 			{
 				type: "user",
 				id: "msg_u_new",
@@ -166,7 +168,7 @@ describe("v2: quota ladders survive a plugin reload", () => {
 		await wait(400)
 		const log = h2.logs()
 		;(h2.cleanup as (() => void) | undefined)?.()
-		rmSync(logFile, { force: true })
+		capture.stop()
 
 		expect(log).not.toContain("quota ladder restored")
 	})

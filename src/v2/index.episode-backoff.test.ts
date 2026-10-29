@@ -1,12 +1,7 @@
 import { describe, test, expect, setDefaultTimeout } from "bun:test"
-import { existsSync, readFileSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
-/** Unique per test FILE: bun runs every file in one process, so two files
- *  starting their counters at 0 derive the SAME tmpdir log path and read each
- *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
 const LOG_SALT = "IndexEpisodeBackoffTest"
 
 /**
@@ -104,12 +99,11 @@ const toolOk = () => ({ type: "session.tool.success", sid: SID, data: { sessionI
 async function setup(msgs: unknown[]) {
 	const injected: Array<{ sid?: string; text?: string; t?: number }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-episode-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile, registryScope: LOG_SALT },
+		options: { ...OPTIONS, registryScope: LOG_SALT },
 		session: {
 			context: async () => msgs,
 			active: async () => ({}),
@@ -137,13 +131,13 @@ async function setup(msgs: unknown[]) {
 
 	const cleanup = await (plugin as any).setup(ctx)
 	await wait(60)
-	return { injected, cleanup, logFile, streamRef: stream }
+	return { injected, cleanup, capture, streamRef: stream }
 }
 
 async function teardown(h: any) {
 	;(h.cleanup as (() => void) | undefined)?.()
-	rmSync(h.logFile, { force: true })
-}
+	h.capture.stop()}
+
 
 const push = (h: any, type: string, sid: string, data: Record<string, unknown> = {}) => h.streamRef.push(ev(type, sid, data))
 
@@ -179,13 +173,14 @@ describe("v2: refire backoff across one episode", () => {
 		const fires = () => h.injected.filter((x: any) => x.sid === SID)
 		for (let i = 0; i < 5; i++) {
 			const before = fires().length
-			await waitFor(() => fires().length > before)
-			const at = fires()[before].t as number
-			if (i > 0) gaps.push(at - lastFire)
-			lastFire = at
-			push(h, "session.tool.success", SID)
-		}
-		await teardown(h)
+		await waitFor(() => fires().length > before)
+		const at = fires()[before].t as number
+		if (i > 0) gaps.push(at - lastFire)
+		lastFire = at
+		push(h, "session.tool.success", SID)
+	}
+	h.capture.stop()
+	await teardown(h)
 		// The contract: each refire without genuine user input doubles the
 		// silence the next fire demands, so a slow-trickling session decays to
 		// patience instead of nagging on a fixed clock (ses_ed975114). With
@@ -230,6 +225,7 @@ describe("v2: refire backoff across one episode", () => {
 		const t1 = Date.now()
 		await wait(900)
 		const after = h.injected.filter((x: any) => x.sid === SID && (x.t as number) >= t1)
+		h.capture.stop()
 		await teardown(h)
 		// Base fuse again (~150ms), not the backed-off one.
 		expect(after.length).toBeGreaterThan(0)
@@ -247,9 +243,10 @@ describe("v2: refire backoff across one episode", () => {
 		// one rung of silence. A fixed 1200ms assumed the watchdog always got
 		// scheduled promptly; under 79-file suite contention it does not, and
 		// the line simply had not been written yet (failed 2026-10-11).
-		const readLogs = () => (existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : "")
+		const readLogs = () => h.capture.lines.join("\n")
 		await waitFor(() => /restarting the stall ladder/.test(readLogs()), 10_000)
 		const logs = readLogs()
+		h.capture.stop()
 		await teardown(h)
 		expect(logs).toMatch(/restarting the stall ladder/)
 	}, 20000)

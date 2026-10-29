@@ -1,8 +1,7 @@
 import { describe, test, expect } from "bun:test"
 import { rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
@@ -78,8 +77,7 @@ const assistantTurn = (text: string | null) => ({
 async function setup(opts: { text?: string | null; toolTextCheckDelayMs?: number }): Promise<any> {
 	const injected: Array<{ text?: string; description?: string }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-settle-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	// Mutable on purpose: the point of several tests below is what the deferred
 	// pass reads, so the history has to be able to change after the first idle.
@@ -97,7 +95,6 @@ async function setup(opts: { text?: string | null; toolTextCheckDelayMs?: number
 			maxBackoffMs: 2,
 			injectIntervalMs: 0,
 			toolTextCheckDelayMs: 0,
-			logFile,
 			...(opts.toolTextCheckDelayMs === undefined ? {} : { toolTextCheckDelayMs: opts.toolTextCheckDelayMs }),
 		},
 		session: {
@@ -129,14 +126,14 @@ async function setup(opts: { text?: string | null; toolTextCheckDelayMs?: number
 			]
 		},
 		cleanup,
-		logFile,
+		capture,
 		streamRef: stream,
 	}
 }
 
 async function teardown(h: any) {
 	h.cleanup?.()
-	rmSync(h.logFile, { force: true })
+	h.capture.stop()
 }
 
 async function goIdle(h: any) {
@@ -284,6 +281,6 @@ describe("v2: the settle delay defers the patterns, not the structural checks", 
 		h.cleanup()
 		await wait(800)
 		expect(h.injected).toHaveLength(0)
-		rmSync(h.logFile, { force: true })
+		h.capture.stop()
 	})
 })

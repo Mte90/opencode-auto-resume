@@ -1,28 +1,12 @@
 import { describe, test, expect } from "bun:test"
-import { existsSync, readFileSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
-/** Unique per test FILE: bun runs every file in one process, so two files
- *  starting their counters at 0 derive the SAME tmpdir log path and read each
- *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
 const LOG_SALT = "IndexDiscoveryTest"
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-/** Scratch log path per case, so parallel tests cannot read each other's lines. */
-let counter = 0
-function scratchLog(): string {
-	const p = join(tmpdir(), `auto-resume-${LOG_SALT}-discovery-${process.pid}-${counter++}.log`)
-	rmSync(p, { force: true })
-	return p
-}
-function readLogs(p: string): string[] {
-	const logs = existsSync(p) ? readFileSync(p, "utf8").split("\n") : []
-	rmSync(p, { force: true })
-	return logs
-}
+
 
 /**
  * Discovery sweep tests.
@@ -94,7 +78,7 @@ async function run(
 ): Promise<Harness> {
 	const calls: string[] = []
 	const stream = makeEventStream()
-	const logFile = scratchLog()
+	const capture = capturePluginLogs()
 
 	const listRows = [{ id: RUNNING, title: "already running" }]
 	const activeIDs = [RUNNING]
@@ -125,15 +109,16 @@ async function run(
 
 	const ctx: any = {
 		event: stream,
-		options: { warmupMs: 0, discoveryDelayMs: 20, toolTextCheckDelayMs: 0, logFile, ...opts, registryScope: LOG_SALT },
+		options: { warmupMs: 0, discoveryDelayMs: 20, toolTextCheckDelayMs: 0, ...opts, registryScope: LOG_SALT },
 		session,
 	}
 	if (client) ctx.client = client
 
 	const cleanup = await (plugin as any).setup(ctx)
 	await wait(220) // initial sweep is discoveryDelayMs out
+	capture.stop()
 	;(cleanup as (() => void) | undefined)?.()
-	return { logs: readLogs(logFile), calls, listRows, activeIDs }
+	return { logs: capture.lines, calls, listRows, activeIDs }
 }
 
 const discoveryLine = (logs: string[]) => logs.find((l) => l.includes("discovery:"))
@@ -177,12 +162,12 @@ describe("v2: session discovery sweep", () => {
 	})
 
 	test("rows without a usable id are skipped, not treated as sessions", async () => {
-		const logFile = scratchLog()
 		const stream = makeEventStream()
 		const rows = [{ id: "not-a-session" }, { id: 42 }, {}, null]
+		const capture = capturePluginLogs()
 		const ctx: any = {
 			event: stream,
-			options: { warmupMs: 0, discoveryDelayMs: 20, toolTextCheckDelayMs: 0, logFile, registryScope: LOG_SALT },
+			options: { warmupMs: 0, discoveryDelayMs: 20, toolTextCheckDelayMs: 0, registryScope: LOG_SALT },
 			session: {
 				context: async () => [],
 				active: async () => ({}),
@@ -191,18 +176,19 @@ describe("v2: session discovery sweep", () => {
 		}
 		const cleanup = await (plugin as any).setup(ctx)
 		await wait(220)
+		capture.stop()
 		;(cleanup as (() => void) | undefined)?.()
-		const logs = readLogs(logFile)
+		const logs = capture.lines
 		expect(discoveryLine(logs)).not.toBeDefined()
 		expect(logs.filter((l) => l.includes("discovery failed"))).toEqual([])
 	})
 
 	test("a { data } envelope is unwrapped, matching the client's response shape", async () => {
-		const logFile = scratchLog()
 		const stream = makeEventStream()
+		const capture = capturePluginLogs()
 		const ctx: any = {
 			event: stream,
-			options: { warmupMs: 0, discoveryDelayMs: 20, toolTextCheckDelayMs: 0, logFile, registryScope: LOG_SALT },
+			options: { warmupMs: 0, discoveryDelayMs: 20, toolTextCheckDelayMs: 0, registryScope: LOG_SALT },
 			session: {
 				context: async () => [],
 				active: async () => ({ [RUNNING]: { type: "running" } }),
@@ -211,18 +197,19 @@ describe("v2: session discovery sweep", () => {
 		}
 		const cleanup = await (plugin as any).setup(ctx)
 		await wait(220)
+		capture.stop()
 		;(cleanup as (() => void) | undefined)?.()
-		expect(discoveryLine(readLogs(logFile))).toContain("adopted 1 already running")
+		expect(discoveryLine(capture.lines)).toContain("adopted 1 already running")
 	})
 
 	test("cleanup stops every timer — no API calls after teardown", async () => {
 		const calls: string[] = []
 		const stream = makeEventStream()
-		const logFile = scratchLog()
+		const capture = capturePluginLogs()
 		const ctx: any = {
 			event: stream,
 			// Tight watchdog so a leaked interval is visible inside the wait.
-			options: { warmupMs: 0, discoveryDelayMs: 20, checkIntervalMs: 20, chunkTimeoutMs: 10_000, toolTextCheckDelayMs: 0, logFile, registryScope: LOG_SALT },
+			options: { warmupMs: 0, discoveryDelayMs: 20, checkIntervalMs: 20, chunkTimeoutMs: 10_000, toolTextCheckDelayMs: 0, registryScope: LOG_SALT },
 			session: {
 				context: async () => [],
 				active: async () => {
@@ -242,9 +229,9 @@ describe("v2: session discovery sweep", () => {
 		expect(calls.filter((c) => c === "active").length).toBeGreaterThan(0)
 
 		cleanup()
+		capture.stop()
 		const atTeardown = calls.length
 		await wait(200)
 		expect(calls.length).toBe(atTeardown)
-		rmSync(logFile, { force: true })
 	})
 })

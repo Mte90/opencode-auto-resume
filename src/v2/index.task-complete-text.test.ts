@@ -1,12 +1,7 @@
 import { describe, test, expect } from "bun:test"
-import { rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
-/** Unique per test FILE: bun runs every file in one process, so two files
- *  starting their counters at 0 derive the SAME tmpdir log path and read each
- *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
 const LOG_SALT = "IndexTaskCompleteTextTest"
 
 /**
@@ -83,13 +78,12 @@ async function setup(opts: {
 }): Promise<any> {
 	const injected: Array<{ sid?: string; text?: string }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-tc-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const messages = opts.messages ?? []
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile, registryScope: LOG_SALT },
+		options: { ...OPTIONS, registryScope: LOG_SALT },
 		session: {
 			context: async () => messages,
 			active: async () => ({}),
@@ -117,13 +111,13 @@ async function setup(opts: {
 
 	const cleanup = await (plugin as any).setup(ctx)
 	await wait(60)
-	return { injected, cleanup, logFile, streamRef: stream }
+	return { injected, cleanup, capture, streamRef: stream }
 }
 
 async function teardown(h: any) {
 	;(h.cleanup as (() => void) | undefined)?.()
-	rmSync(h.logFile, { force: true })
-}
+	h.capture.stop()}
+
 
 const push = (h: any, type: string, sid: string, data: Record<string, unknown> = {}) => h.streamRef.push(ev(type, sid, data))
 

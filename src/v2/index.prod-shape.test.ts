@@ -1,8 +1,8 @@
 import { describe, test, expect } from "bun:test"
-import { rmSync, readFileSync, existsSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { readFileSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
@@ -32,7 +32,6 @@ const LOG_SALT = "IndexProdShapeTest"
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_prod"
 
-let counter = 31000
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -87,7 +86,7 @@ const OPTS = {
 }
 
 async function setup(
-	logFile: string,
+	capture: any,
 	history: unknown[] = [],
 	extra: Record<string, unknown> = {},
 	contextDelayMs = 0,
@@ -97,7 +96,7 @@ async function setup(
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTS, logFile, ...extra, registryScope: LOG_SALT },
+		options: { ...OPTS, capture, ...extra, registryScope: LOG_SALT },
 		session: {
 			context: async () => {
 				if (contextDelayMs) await wait(contextDelayMs)
@@ -121,16 +120,15 @@ async function setup(
 	return {
 		injected,
 		cleanup,
-		logFile,
 		push: (type: string, data: Record<string, unknown> = {}) => stream.push(ev(type, data)),
-		logs: () => (existsSync(logFile) ? readFileSync(logFile, "utf8") : ""),
+		logs: () => capture.lines.join("\n"),
+		capture,
 	}
 }
 
 const freshLog = () => {
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-prodshape-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
-	return logFile
+	const capture = capturePluginLogs()
+	return capture
 }
 
 // --- prod-shaped fixtures ---------------------------------------------------
@@ -151,8 +149,8 @@ const TYPE_ASSISTANT = (at: number, content: any[]) => ({ type: "assistant", con
 
 describe("v2: history readers accept the production message shape", () => {
 	test("PROD: a user message after a quota arm suppresses the restore (fails OPEN today)", async () => {
-		const logFile = freshLog()
-		const h1 = await setup(logFile)
+		const capture = freshLog()
+		const h1 = await setup(capture)
 		h1.push("session.execution.started")
 		await wait(20)
 		h1.push("session.step.failed", { error: { type: "provider.quota", message: "Rate limit exceeded.", status: 429 } })
@@ -161,17 +159,17 @@ describe("v2: history readers accept the production message shape", () => {
 		;(h1.cleanup as (() => void) | undefined)?.()
 
 		// Restart with the user having replied since the arm. Role shape.
-		const h2 = await setup(logFile, [prodUser(Date.now(), "keep going")])
+		const h2 = await setup(capture, [prodUser(Date.now(), "keep going")])
 		await wait(400)
 		const log = h2.logs()
 		;(h2.cleanup as (() => void) | undefined)?.()
-		rmSync(logFile, { force: true })
+		capture.stop()
 
 		expect(log).not.toContain("quota ladder restored")
 	})
 
 	test("PROD: a trailing tool error is retried (stuck-tool reader)", async () => {
-		const logFile = freshLog()
+		const capture = freshLog()
 		const now = Date.now()
 		// The user message must sit outside the 5-minute active window or the
 		// stand-down guard fires first and the reader is never reached.
@@ -186,20 +184,20 @@ describe("v2: history readers accept the production message shape", () => {
 					time: { created: now - 115_000 },
 				},
 			]),
-		]
-		const h = await setup(logFile, history)
+	]
+	const h = await setup(capture, history)
 		h.push("session.idle")
 		await wait(500)
 		const log = h.logs()
 		;(h.cleanup as (() => void) | undefined)?.()
-		rmSync(logFile, { force: true })
+		capture.stop()
 
 		expect(log).toContain("failed at end of turn")
 		expect(h.injected.some((i: any) => /Retry it now/.test(i.text ?? ""))).toBe(true)
 	})
 
 	test("TYPE: the same trailing tool error still retries (no shape regression)", async () => {
-		const logFile = freshLog()
+		const capture = freshLog()
 		const now = Date.now()
 		const history = [
 			TYPE_USER(now - 600_000),
@@ -212,37 +210,37 @@ describe("v2: history readers accept the production message shape", () => {
 					time: { created: now - 115_000 },
 				},
 			]),
-		]
-		const h = await setup(logFile, history)
+	]
+	const h = await setup(capture, history)
 		h.push("session.idle")
 		await wait(500)
 		const log = h.logs()
 		;(h.cleanup as (() => void) | undefined)?.()
-		rmSync(logFile, { force: true })
+		capture.stop()
 
 		expect(log).toContain("failed at end of turn")
 	})
 
 	test("PROD: a reasoning-only turn is nudged (silent-reasoning reader)", async () => {
-		const logFile = freshLog()
+		const capture = freshLog()
 		const now = Date.now()
 		const history = [
 			prodUser(now - 600_000),
 			prodAssistant(now - 60_000, [{ type: "reasoning", text: "thinking about it" }]),
 		]
-		const h = await setup(logFile, history)
+		const h = await setup(capture, history)
 		h.push("session.idle")
 		await wait(500)
 		const log = h.logs()
 		;(h.cleanup as (() => void) | undefined)?.()
-		rmSync(logFile, { force: true })
+		capture.stop()
 
 		expect(log).toContain("reasoning-only turn with no output")
 	})
 
 	test("PROD: a restored ladder does not re-announce a notice it already sent", async () => {
-		const logFile = freshLog()
-		const h1 = await setup(logFile)
+		const capture = freshLog()
+		const h1 = await setup(capture)
 		h1.push("session.execution.started")
 		await wait(20)
 		h1.push("session.step.failed", { error: { type: "provider.quota", message: "Rate limit exceeded.", status: 429 } })
@@ -252,7 +250,7 @@ describe("v2: history readers accept the production message shape", () => {
 		// Reload mid-episode, then a fresh quota hit. The first-arm notice went
 		// out before the reload; restoring the ladder must carry that fact over
 		// or the user gets a duplicate "retrying in ~Xm" for the same episode.
-		const h2 = await setup(logFile, [])
+		const h2 = await setup(capture, [])
 		await wait(300)
 		h2.push("session.execution.started")
 		await wait(20)
@@ -260,7 +258,7 @@ describe("v2: history readers accept the production message shape", () => {
 		await wait(300)
 		const notices = h2.injected.filter((i: any) => /Rate limited, retrying in/.test(i.text ?? "")).length
 		;(h2.cleanup as (() => void) | undefined)?.()
-		rmSync(logFile, { force: true })
+		capture.stop()
 
 		expect(notices).toBeLessThanOrEqual(1)
 	})
@@ -269,7 +267,7 @@ describe("v2: history readers accept the production message shape", () => {
 		// The child-status reader keys off the last message being an assistant
 		// message carrying `error`. Prod sends `role`, so a `type`-only read
 		// never matched and a crashed subagent looked merely slow.
-		const logFile = freshLog()
+		const capture = freshLog()
 		const CHILD = "ses_child_prod"
 		const now = Date.now()
 		const stream = makeEventStream()
@@ -278,7 +276,7 @@ describe("v2: history readers accept the production message shape", () => {
 
 		const ctx: any = {
 			event: stream,
-			options: { ...OPTS, logFile, subagentDeadMs: 60_000, subagentWaitMs: 50, registryScope: LOG_SALT },
+			options: { ...OPTS, capture, subagentDeadMs: 60_000, subagentWaitMs: 50, registryScope: LOG_SALT },
 			session: {
 				context: async (a: any) => (a?.sessionID === CHILD ? childHistory : []),
 				active: async () => ({}),
@@ -305,9 +303,9 @@ describe("v2: history readers accept the production message shape", () => {
 		await wait(700)
 		stream.push({ type: "session.idle", data: { sessionID: SID } })
 		await wait(900)
-		const log = existsSync(logFile) ? readFileSync(logFile, "utf8") : ""
+		const log = capture.lines.join("\n")
 		;(cleanup as (() => void) | undefined)?.()
-		rmSync(logFile, { force: true })
+		capture.stop()
 
 		expect(log).toContain("reported an error")
 	})
@@ -337,7 +335,7 @@ describe("v2: history readers accept the production message shape", () => {
 
 describe("v2: watchdog re-entrancy", () => {
 	test("an overrunning sweep is not overlapped by the next tick", async () => {
-		const logFile = freshLog()
+		const capture = freshLog()
 		const now = Date.now()
 		const history = [
 			prodUser(now - 600_000),
@@ -352,13 +350,13 @@ describe("v2: watchdog re-entrancy", () => {
 		]
 		// context() takes 150ms against a 20ms interval: without a re-entrancy
 		// guard every tick starts another concurrent sweep over the same watch.
-		const h = await setup(logFile, history, {}, 150)
+		const h = await setup(capture, history, {}, 150)
 		h.push("session.idle")
 		await wait(900)
 		const retries = h.injected.filter((i: any) => /Retry it now/.test(i.text ?? "")).length
 		const skips = (h.logs().match(/watchdog sweep still running/g) ?? []).length
 		;(h.cleanup as (() => void) | undefined)?.()
-		rmSync(logFile, { force: true })
+		capture.stop()
 
 		// One stall is one recovery. Concurrent sweeps would double-inject.
 		expect(retries).toBeLessThanOrEqual(1)

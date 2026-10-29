@@ -1,8 +1,6 @@
 import { describe, test, expect } from "bun:test"
-import { rmSync, readFileSync, existsSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
@@ -35,7 +33,7 @@ const LOG_SALT = "IndexPermGateSetTest"
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_parent"
 
-let counter = 14000
+
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -77,8 +75,7 @@ const push = (h: any, type: string, data: Record<string, unknown> = {}) => h.str
 async function setup(): Promise<any> {
 	const injected: Array<{ text?: string }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-gateset-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	// Prod shape: `client` is undefined in production (probed live 2026-10-06) and
 	// must stay undefined here — the gate cannot lean on a discovery API.
@@ -97,7 +94,6 @@ async function setup(): Promise<any> {
 			loopMaxContinues: 99,
 			injectIntervalMs: 0,
 			subagentWaitMs: 40,
-			logFile,
 			debug: true,
 		},
 		session: {
@@ -113,15 +109,15 @@ async function setup(): Promise<any> {
 
 	const cleanup = await (plugin as any).setup(ctx)
 	await wait(60)
-	return { injected, cleanup, logFile, streamRef: stream }
+	return { injected, cleanup, capture, streamRef: stream }
 }
 
 async function teardown(h: any) {
 	;(h.cleanup as (() => void) | undefined)?.()
-	rmSync(h.logFile, { force: true })
-}
+	h.capture.stop()}
 
-const logsOf = (h: any) => (existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : "")
+
+const logsOf = (h: any) => h.capture.lines.join("\n")
 
 /** Drive one failure event and report what the plugin did. */
 async function drive(errType: string, errMsg: string, status?: number) {

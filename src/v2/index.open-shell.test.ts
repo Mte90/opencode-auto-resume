@@ -1,24 +1,15 @@
 import { describe, test, expect } from "bun:test"
 import { readFileSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
  *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
 const LOG_SALT = "IndexOpenShellTest"
 
-let counter = 0
-/** Hygiene log files must not leak: every setup creates one (to keep the run
- * out of the production log), so every setup deletes it before returning. The
- * log is never read back in these files — only passed to the plugin. */
-function hygieneLogFile(): string {
-	const p = join(tmpdir(), `auto-resume-${LOG_SALT}-hygiene-${process.pid}-${counter++}.log`)
-	rmSync(p, { force: true })
-	return p
-}
-const SOURCE = readFileSync(join(import.meta.dir, "index.ts"), "utf8")
+/** Hygiene: each setup creates a capture instance. */
+const SOURCE = readFileSync(new URL("./index.ts", import.meta.url), "utf8")
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_openshell"
 const OTHER_SID = "ses_someone_else"
@@ -107,17 +98,13 @@ function turnEvents(text: string) {
 async function replay(events: any[], messages?: any[]): Promise<Injected[]> {
 	const injected: Injected[] = []
 	const stream = makeEventStream()
-	const logFile = hygieneLogFile()
+	const capture = capturePluginLogs()
 	const ctx: any = {
 		event: stream,
 		app: { log: () => {} },
 		options: {
 			registryScope: LOG_SALT,
 			toolTextCheckDelayMs: 0,
-			// Without this the test writes into the PRODUCTION log
-			// (~/.local/state/opencode-v2/auto-resume.log), which corrupts the
-			// reload forensics — a test run looks exactly like a reload storm.
-			logFile,
 		},
 		session: {
 			context: async () => messages ?? [oldUserTurn(), assistantTurn(READY_TEXT)],
@@ -141,7 +128,7 @@ async function replay(events: any[], messages?: any[]): Promise<Injected[]> {
 	}
 	await wait(500) // handleEvent is sync; its work is async
 	;(cleanup as (() => void) | undefined)?.()
-	rmSync(logFile, { force: true })
+	capture.stop()
 	return injected
 }
 

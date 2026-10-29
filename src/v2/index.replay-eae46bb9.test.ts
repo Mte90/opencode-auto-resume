@@ -1,10 +1,7 @@
 import { describe, test, expect } from "bun:test"
-import { existsSync, readFileSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
-/** Unique per test FILE — see index.attempt-reset.test.ts for why. */
 const LOG_SALT = "IndexReplayEae46bb9Test"
 
 /**
@@ -71,8 +68,7 @@ const ev = (type: string, sid: string, data: Record<string, unknown> = {}) => ({
 async function setup(extraOpts: Record<string, unknown> = {}): Promise<any> {
 	const injected: Array<{ text?: string }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const ctx: any = {
 		event: stream,
@@ -93,7 +89,6 @@ async function setup(extraOpts: Record<string, unknown> = {}): Promise<any> {
 			loopMaxContinues: 99,
 			injectIntervalMs: 0,
 			subagentWaitMs: 40,
-			logFile,
 			debug: true,
 			...extraOpts,
 		},
@@ -117,16 +112,16 @@ async function setup(extraOpts: Record<string, unknown> = {}): Promise<any> {
 
 	const cleanup = await (plugin as any).setup(ctx)
 	await wait(60)
-	return { injected, cleanup, logFile, streamRef: stream }
+	return { injected, cleanup, capture, streamRef: stream }
 }
 
 async function teardown(h: any) {
 	;(h.cleanup as (() => void) | undefined)?.()
-	rmSync(h.logFile, { force: true })
-}
+	h.capture.stop()}
+
 
 const push = (h: any, type: string, sid: string, data: Record<string, unknown> = {}) => h.streamRef.push(ev(type, sid, data))
-const readLog = (h: any) => (existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : "")
+const readLog = (h: any) => h.capture.lines.join("\n")
 
 async function waitFor(what: () => boolean, budgetMs = 3000): Promise<boolean> {
 	const deadline = Date.now() + budgetMs

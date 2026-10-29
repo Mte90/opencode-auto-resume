@@ -1,8 +1,6 @@
 import { describe, test, expect } from "bun:test"
-import { existsSync, readFileSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
@@ -29,7 +27,7 @@ const SID = "ses_ratelimit"
  * Every group carries a control.
  */
 
-let counter = 0
+
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -91,17 +89,16 @@ const OPTIONS = {
 	debug: true,
 }
 
-type Harness = { injected: Array<{ text?: string; resume?: boolean; synth?: boolean }>; logs: string[]; stream: any; cleanup?: () => void; logFile: string; failTurn: (err: unknown) => Promise<void>; startTurn: () => Promise<void>; failStep: (err: unknown) => Promise<void>; idleTurn: () => Promise<void> }
+type Harness = { injected: Array<{ text?: string; resume?: boolean; synth?: boolean }>; logs: string[]; stream: any; cleanup?: () => void; capture: any; failTurn: (err: unknown) => Promise<void>; startTurn: () => Promise<void>; failStep: (err: unknown) => Promise<void>; idleTurn: () => Promise<void> }
 
 async function replay(opts: Record<string, unknown> = {}): Promise<Harness> {
 	const injected: Harness["injected"] = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-ratelimit-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile, ...opts, registryScope: LOG_SALT },
+		options: { ...OPTIONS, ...opts, registryScope: LOG_SALT },
 		session: {
 			context: async () => [userTurn()],
 			active: async () => ({}),
@@ -145,7 +142,7 @@ async function replay(opts: Record<string, unknown> = {}): Promise<Harness> {
 		logs: [],
 		stream,
 		cleanup,
-		logFile,
+		capture,
 		failTurn,
 		startTurn,
 		failStep,
@@ -154,9 +151,7 @@ async function replay(opts: Record<string, unknown> = {}): Promise<Harness> {
 }
 
 function readLogs(h: Harness): string[] {
-	const logs = existsSync(h.logFile) ? readFileSync(h.logFile, "utf8").split("\n") : []
-	rmSync(h.logFile, { force: true })
-	return logs
+	return h.capture.lines
 }
 
 describe("v2: rate-limit failures stand down on a ladder", () => {
@@ -166,7 +161,6 @@ describe("v2: rate-limit failures stand down on a ladder", () => {
 		await wait(600)
 		expect(h.injected.length).toBeGreaterThanOrEqual(1)
 		h.cleanup?.()
-		readLogs(h)
 	})
 
 	test("a quota hit injects nothing inside the cooldown except the notice", async () => {
@@ -179,6 +173,7 @@ describe("v2: rate-limit failures stand down on a ladder", () => {
 		const logs = readLogs(h)
 		expect(logs.some((l) => l.includes("rate limited") && l.includes("standing down"))).toBe(true)
 		expect(logs.some((l) => l.includes("session.step.failed") && l.includes("resume attempt"))).toBe(false)
+		h.capture.stop()
 		h.cleanup?.()
 	})
 
@@ -198,6 +193,7 @@ describe("v2: rate-limit failures stand down on a ladder", () => {
 		await h.failStep(QUOTA)
 		await wait(300)
 		expect(notices()).toHaveLength(1)
+		h.capture.stop()
 		h.cleanup?.()
 	})
 
@@ -213,6 +209,7 @@ describe("v2: rate-limit failures stand down on a ladder", () => {
 		const endNotices = h.injected.filter((i) => /standing down until you return/.test(i.text ?? ""))
 		expect(endNotices).toHaveLength(1)
 		expect(endNotices[0].resume).toBeFalsy()
+		h.capture.stop()
 		h.cleanup?.()
 	})
 
@@ -221,6 +218,7 @@ describe("v2: rate-limit failures stand down on a ladder", () => {
 		await h.failTurn(STREAM_ERR)
 		await wait(300)
 		expect(h.injected.some((i) => /Rate limited/.test(i.text ?? ""))).toBe(false)
+		h.capture.stop()
 		h.cleanup?.()
 	})
 
@@ -233,8 +231,8 @@ describe("v2: rate-limit failures stand down on a ladder", () => {
 		// Exactly the one first-arm notice; the second hit stays silent.
 		expect(h.injected.length).toBe(1)
 		expect(h.injected[0].text).toMatch(/Rate limited, retrying in/)
+		h.capture.stop()
 		h.cleanup?.()
-		readLogs(h)
 	})
 
 	test("a served cooldown retries through the normal path", async () => {
@@ -246,6 +244,7 @@ describe("v2: rate-limit failures stand down on a ladder", () => {
 		expect(h.injected.some((i) => /Rate limited, retrying in/.test(i.text ?? ""))).toBe(true)
 		const logs = readLogs(h)
 		expect(logs.some((l) => l.includes("cooldown served"))).toBe(true)
+		h.capture.stop()
 		h.cleanup?.()
 	})
 
@@ -264,6 +263,7 @@ describe("v2: rate-limit failures stand down on a ladder", () => {
 		expect(h.injected[2].text).toMatch(/standing down until you return/)
 		const logs = readLogs(h)
 		expect(logs.some((l) => l.includes("budget exhausted"))).toBe(true)
+		h.capture.stop()
 		h.cleanup?.()
 	})
 
@@ -286,6 +286,7 @@ describe("v2: rate-limit failures stand down on a ladder", () => {
 		await wait(200)
 		const logs = readLogs(h)
 		expect(logs.filter((l) => l.includes("next attempt in")).length).toBeGreaterThanOrEqual(2)
+		h.capture.stop()
 		h.cleanup?.()
 	})
 

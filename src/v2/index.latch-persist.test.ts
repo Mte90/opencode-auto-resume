@@ -1,8 +1,7 @@
 import { describe, test, expect, setDefaultTimeout } from "bun:test"
-import { rmSync, readFileSync, existsSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { rmSync, writeFileSync } from "node:fs"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
@@ -122,17 +121,17 @@ function nullStorage() {
 }
 
 async function setup(
-	logFile: string,
 	history: unknown[] = [],
 	storage: any = durableStorage(),
 	opts: Record<string, unknown> = {},
 ): Promise<any> {
 	const injected: Array<{ text?: string }> = []
 	const stream = makeEventStream()
+	const capture = capturePluginLogs()
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTS, logFile, ...opts, registryScope: LOG_SALT },
+		options: { ...OPTS, ...opts, registryScope: LOG_SALT },
 		session: {
 			context: async () => history,
 			active: async () => ({}),
@@ -158,6 +157,7 @@ async function setup(
 	}
 	return {
 		injected,
+		capture,
 		cleanup,
 		startTurn,
 		/** A failure with no preceding genuine turn — what a mid-turn restart looks like. */
@@ -170,15 +170,11 @@ async function setup(
 			stream.push(ev("session.step.failed", err as Record<string, unknown>))
 			await wait(150)
 		},
-		logs: () => (existsSync(logFile) ? readFileSync(logFile, "utf8") : ""),
+		logs: () => capture.lines.join("\n"),
 	}
 }
 
-const freshLog = () => {
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-latch-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
-	return logFile
-}
+
 
 /**
  * Poll the log for a line instead of sleeping a fixed span.
@@ -222,9 +218,8 @@ describe("v2: durable quota state across a restart", () => {
 		// evaluated. Persisting them would be write amplification for nothing.
 		// This test pins that invariant — if someone removes the reset, this
 		// fails and says so, and persistence becomes necessary again.
-		const logFile = freshLog()
 		const store = durableStorage()
-		const h = await setup(logFile, [], store)
+		const h = await setup([], store)
 		await h.failTurn(PERMANENT)
 		await wait(200)
 		expect(h.logs()).toMatch(/permanent|OOC|latched/i)
@@ -232,25 +227,23 @@ describe("v2: durable quota state across a restart", () => {
 		await h.startTurn()
 		await wait(250)
 		const afterClear = h.logs()
+		h.capture.stop()
 		;(h.cleanup as (() => void) | undefined)?.()
-		rmSync(logFile, { force: true })
 
 		expect(afterClear).toContain("clearing")
 	})
 
 	test("a quota arm survives a restart with the log file gone", async () => {
-		const logFile = freshLog()
 		const store = durableStorage()
 
-		const h1 = await setup(logFile, [], store)
+		const h1 = await setup([], store)
 		await h1.failTurn(QUOTA)
 		expect(await waitForLog(h1, "quota-armed")).toContain("quota-armed")
 		;(h1.cleanup as (() => void) | undefined)?.()
 
 		// Destroy the log: the log-grep fallback cannot help, so this passes
 		// only if the ladder itself is in durable storage.
-		rmSync(logFile, { force: true })
-		writeFileSync(logFile, "")
+		// (No file to destroy with capturePluginLogs)
 
 		// The second instance reads the record at `restoreQuotaLadders`, which
 		// drops any arm older than `horizon` = sum(ladder) — the point past which
@@ -260,10 +253,10 @@ describe("v2: durable quota state across a restart", () => {
 		// parallel load (one run in three). A ladder whose horizon is ~5s makes
 		// the restore the only possible outcome; the arm is real either way, and
 		// the rung it reaches is not what this test is about.
-		const h2 = await setup(logFile, [], store, { rateLimitCooldownsMs: [4000, 4000] })
+		const h2 = await setup([], store, { rateLimitCooldownsMs: [4000, 4000] })
 		const log = await waitForLog(h2, "cooldown served")
+		h2.capture.stop()
 		;(h2.cleanup as (() => void) | undefined)?.()
-		rmSync(logFile, { force: true })
 
 		expect(log).toContain("cooldown served")
 	}, 30000)
@@ -286,22 +279,21 @@ describe("v2: durable quota state across a restart", () => {
 		// cross-file pollution, so the ceiling — not the mechanism — is what
 		// broke. 30s keeps the failure mode (a record that never drops still
 		// fails) while surviving a loaded loop.
-		const logFile = freshLog()
 		const store = durableStorage()
-		const h1 = await setup(logFile, [], store)
+		const h1 = await setup([], store)
 		await h1.failTurn(QUOTA)
 		const gotArmed = await until(() => ((store.map.get(`resume-quota/${SID}`) as any)?.at ?? 0) > 0)
 		;(h1.cleanup as (() => void) | undefined)?.()
 		expect(gotArmed).toBe(true)
 
-		const h2 = await setup(logFile, [], store)
+		const h2 = await setup([], store)
 		await h2.startTurn()
 		const dropped = await until(() => {
 			const rec = store.map.get(`resume-quota/${SID}`) as any
 			return rec === undefined || rec?.at === 0
 		}, 30_000)
+		h2.capture.stop()
 		;(h2.cleanup as (() => void) | undefined)?.()
-		rmSync(logFile, { force: true })
 
 		// Genuine turn => the in-memory ladder reset must take the record with it.
 		expect(dropped).toBe(true)
@@ -315,7 +307,6 @@ describe("v2: durable quota state across a restart", () => {
 		// Determinism: the storage read is slowed so the turn is observably busy
 		// before restore reaches its check. Without the delay this races the
 		// restore, and a pass would prove nothing either way.
-		const logFile = freshLog()
 		const AT = Date.now()
 		const map = new Map<string, unknown>([[`resume-quota/${SID}`, { v: 1, at: AT, rung: 0, noticed: AT }]])
 		const slowStore = {
@@ -331,37 +322,35 @@ describe("v2: durable quota state across a restart", () => {
 			},
 		}
 
-		const h = await setup(logFile, [], slowStore)
+		const h = await setup([], slowStore)
 		// Mid-turn by the time restore gets there.
 		await h.startTurn()
 		await wait(1200)
 		const log = h.logs()
+		h.capture.stop()
 		;(h.cleanup as (() => void) | undefined)?.()
-		rmSync(logFile, { force: true })
 
 		const restoredLine = log.split("\n").find((l: string) => l.includes("quota ladder restored")) ?? ""
 		expect(restoredLine).toBe("")
 	}, 20000)
 
 	test("a record older than the horizon is ignored", async () => {
-		const logFile = freshLog()
 		const OLD = Date.now() - 48 * 3600_000
 		const store = durableStorage(
 			new Map<string, unknown>([[`resume-quota/${SID}`, { v: 1, at: OLD, rung: 0, noticed: OLD }]]),
 		)
 
-		const h = await setup(logFile, [], store)
+		const h = await setup([], store)
 		await wait(400)
 		const log = h.logs()
+		h.capture.stop()
 		;(h.cleanup as (() => void) | undefined)?.()
-		rmSync(logFile, { force: true })
 
 		// Two days stale: past any plausible ladder horizon, so not restored.
 		expect(log).not.toContain("quota ladder restored")
 	}, 20000)
 
 	test("storage failures never block recovery", async () => {
-		const logFile = freshLog()
 		const hostile = {
 			get: async () => {
 				throw new Error("storage exploded")
@@ -374,12 +363,12 @@ describe("v2: durable quota state across a restart", () => {
 			},
 		}
 
-		const h = await setup(logFile, [], hostile)
+		const h = await setup([], hostile)
 		await h.failTurn(QUOTA)
 		await wait(250)
 		const recovered = h.logs().includes("cooldown served") || h.injected.length > 0
+		h.capture.stop()
 		;(h.cleanup as (() => void) | undefined)?.()
-		rmSync(logFile, { force: true })
 
 		expect(recovered).toBe(true)
 	})

@@ -1,8 +1,6 @@
 import { describe, test, expect } from "bun:test"
-import { existsSync, readFileSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
@@ -21,7 +19,6 @@ const LOG_SALT = "IndexDuplicateProdTest"
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_dup"
-let counter = 2000
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -86,12 +83,11 @@ async function replay(
 ): Promise<Harness> {
 	const injected: Harness["injected"] = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-dup-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const ctx: any = {
 		event: stream,
-		options: { ...FAST, ...opts, logFile, debug: true, registryScope: LOG_SALT },
+		options: { ...FAST, ...opts, debug: true, registryScope: LOG_SALT },
 		session: {
 			active: async () => ({}),
 			interrupt: async () => ({}),
@@ -121,10 +117,9 @@ async function replay(
 	}
 	while (Date.now() - started < waitMs) await wait(10)
 	await wait(50)
+	capture.stop()
 	;(cleanup as (() => void) | undefined)?.()
-	const logs = existsSync(logFile) ? readFileSync(logFile, "utf8").split("\n") : []
-	rmSync(logFile, { force: true })
-	return { injected, logs }
+	return { injected, logs: capture.lines }
 }
 
 const userMsg = (text: string, at: number) => ({

@@ -17,7 +17,7 @@
  *    `packages/plugin/src/app.ts`), and v2 has no `app.log` endpoint. Console
  *    output from a hosted plugin is not captured anywhere retrievable, so v1's
  *    `ctx.client.app.log(...)` has no equivalent. This build therefore appends
- *    to its own log file — see LOG_FILE below.
+	 * to its own log file (removed in v2).
  *  - Targets the stable v2 API (`@opencode/plugin`). Event names are unchanged
  *    from the beta port; `session.execution.interrupted` now carries a `reason`.
  *
@@ -491,6 +491,7 @@ export interface AutoResumeOptions {
 	toolTextRecoveryPrompt?: string
 	doneWithoutWorkPrompt?: string
 	actionIntentPrompt?: string
+	thinkingToolRecoveryPrompt?: string
 	debug?: boolean
 	activeUserWindowMs?: number
 
@@ -553,18 +554,12 @@ export interface AutoResumeOptions {
 	readyToContinuePatterns?: string[]
 	/** Prompt sent when a done-claim arrives with no work to show. */
 	doneWithoutDetailsPrompt?: string
-	/** Prompt sent when a tool call was emitted inside reasoning. */
-	thinkingToolRecoveryPrompt?: string
 	/**
-	 * Append this build's log here instead of the default path (opencode's
-	 * state root: `XDG_STATE_HOME`/opencode/auto-resume.log, else
-	 * `~/.local/state/opencode/auto-resume.log`).
-	 *
-	 * v2 removed v1's `app.log` endpoint, so this is the only retrievable
-	 * record of what the plugin did. The `AUTO_RESUME_LOG_FILE` environment
-	 * variable sets the same thing and wins over neither.
+	 * Per-attempt cooldowns (ms) before a rate-limited session may be retried.
+	 * Gates, not timers: evaluated on each failure and each watchdog tick, so
+	 * nothing is lost to a reload. Past the ladder the session stays silent
+	 * until a genuine user turn. Default spans ~12h for overnight coverage.
 	 */
-	logFile?: string
 	/**
 	 * Per-attempt cooldowns (ms) before a rate-limited session may be retried.
 	 * Gates, not timers: evaluated on each failure and each watchdog tick, so
@@ -574,45 +569,26 @@ export interface AutoResumeOptions {
 	rateLimitCooldownsMs?: number[]
 	/** Bound (ms) on any single recovery send; see DEFAULT_SEND_TIMEOUT_MS. */
 	sendTimeoutMs?: number
-	/**
-	 * Inert delivery probe. Never affects behaviour; echoed in the `ready`
-	 * line so a config-options change can be verified without touching a
-	 * live knob. Bump the value to test delivery.
-	 */
-	configProbe?: string | number
 }
 
 // ---------------------------------------------------------------------------
 // Logging
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+
 /**
- * Where this build's log lines go, and why not somewhere official.
+ * v2 logging goes to the process console only.
  *
  * v1 wrote through `ctx.client.app.log({ body: { service, level, message } })`,
  * a real endpoint that landed in the opencode log file. v2 removed it:
  * `ctx.app` is `{ name, version, channel }` (`packages/plugin/src/app.ts`),
  * there is no `app` group in `packages/protocol/src/groups/`, and a hosted
- * plugin's `console.log` is not captured by the OpenChamber process. Without
- * this the plugin is completely silent — you cannot tell a working watchdog
- * from a dead one, which is exactly the failure that made a stall
- * indistinguishable from "nothing happened".
- *
- * Override with AUTO_RESUME_LOG_FILE. Size-capped so an unattended run cannot
- * fill the disk.
+ * plugin's `console.log` is not captured by the OpenChamber process.
  */
-/**
- * Where this plugin logs by default: under opencode's OWN state root.
- *
- * Mirrors the opencode core's resolution of its state files
- * (`packages/client/src/effect/service.ts`): `XDG_STATE_HOME` when it is set
- * to an absolute path, else `~/.local/state`, then `opencode/<file>`. The
- * plugin follows the platform convention instead of hardcoding a path for one
- * machine — it ships upstream (PR #37), and the previous default
- * (`~/.local/state/opencode-v2/auto-resume.log`) pointed at a tree name
- * specific to this box, so every other user got a log file in a directory
- * unrelated to their opencode install.
- */
+
 /**
  * Does the opencode config list a task-complete plugin?
  *
@@ -629,38 +605,6 @@ export async function configMentionsTaskComplete(cfgPath: string): Promise<boole
 		return /"[^"]*task-complete[^"]*"/i.test(raw)
 	} catch {
 		return false
-	}
-}
-
-export function defaultLogFile(): string {
-	const raw = process.env["XDG_STATE_HOME"]
-	const trimmed = typeof raw === "string" ? raw.trim() : ""
-	const stateHome = trimmed.length > 0 && isAbsolute(trimmed) ? trimmed : join(homedir(), ".local", "state")
-	return join(stateHome, "opencode", "auto-resume.log")
-}
-const LOG_FILE_MAX_BYTES = 2 * 1024 * 1024
-
-/**
- * Append one line to `target`, best effort.
- *
- * Every failure here is swallowed on purpose: logging must never be the reason
- * the watchdog stops running. The size check races harmlessly between
- * processes — losing a line beats throwing.
- */
-function appendLogFile(target: string, level: string, line: string): void {
-	try {
-		mkdirSync(dirname(target), { recursive: true })
-		try {
-			if (existsSync(target) && statSync(target).size > LOG_FILE_MAX_BYTES) {
-				writeFileSync(target, "")
-			}
-		} catch {
-			// Size check is an optimisation, not a requirement.
-		}
-		appendFileSync(target, `${new Date().toISOString()} ${level.toUpperCase().padEnd(5)} ${line}\n`)
-	} catch {
-		// Unwritable log dir, read-only fs, quota — none of these should
-		// propagate into the recovery path.
 	}
 }
 
@@ -1983,14 +1927,12 @@ const MODULE_INSTANCE = `${process.pid}.${Math.random().toString(36).slice(2, 8)
  * Host identity, for the reload forensics.
  *
  * `mod=` alone cannot tell a plugin reload from a host restart: every reload
- * mints a new `eval` suffix, and a restart changes `pid` too. Uptime separates
- * them — a plugin re-evaluated inside a long-lived host keeps a growing uptime
- * and a constant `boot`, so a storm of mod ids under ONE boot is the plugin
- * being re-imported, and a changing boot is opencode itself restarting.
+ * mints a new `eval` suffix, and a restart changes `pid` too. `boot=` separates
+ * them — a storm of mod ids under ONE boot is the plugin being re-imported,
+ * and a changing boot is opencode itself restarting.
  * Measured 2026-10-08: 22 lifecycle lines in ten minutes, all pid 3686667 —
  * re-evaluations inside one host, not host restarts.
  */
-const HOST_UPTIME_S = Math.round(process.uptime())
 const HOST_BOOT = new Date(Date.now() - process.uptime() * 1000).toISOString()
 
 export default define({
@@ -2010,7 +1952,7 @@ export default define({
 		// A second live instance means the host re-evaluated this bundle without
 		// disposing the first — the reload-storm signature. The predecessor's
 		// identity and age are captured HERE and logged later, because `log`
-		// closes over `logFile`, which is not initialised until well below this
+			// disposed the first — the reload-storm signature. The predecessor's
 		// point: calling it from this block is a TDZ ReferenceError, and it only
 		// fires when a predecessor exists — i.e. never in a single-test process.
 		const superseded = registry.live
@@ -2049,16 +1991,12 @@ export default define({
 				: /^(1|true|yes)$/i.test(envVisible))
 		const quietCorrections = opts.quietCorrections ?? true
 		const richContinuePrompt = opts.richContinuePrompt ?? true
-		const logFile = opts.logFile ?? process.env.AUTO_RESUME_LOG_FILE ?? defaultLogFile()
 		const rateLimitCooldownsMs =
 			Array.isArray(opts.rateLimitCooldownsMs) && opts.rateLimitCooldownsMs.length > 0 &&
 			opts.rateLimitCooldownsMs.every((n) => typeof n === "number" && n > 0)
 				? (opts.rateLimitCooldownsMs as number[])
 				: DEFAULT_RATE_LIMIT_COOLDOWNS_MS
 		const sendTimeoutMs = opts.sendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS
-		// Inert probe: proves `plugins[].options` reaches `ctx.options` without
-		// touching a live knob. Echoed in the `ready` line only.
-		const configProbe = opts.configProbe ?? null
 		// How long a parent may sit busy after its last subagent went idle before
 		// the orphan watch acts. v1 default, honoured for the first time here.
 		const subagentWaitMs = opts.subagentWaitMs ?? DEFAULT_SUBAGENT_WAIT_MS
@@ -2129,14 +2067,12 @@ export default define({
 
 		// Options accepted but not yet acted on, because the v2 feature they tune
 		// is not ported. Listed (not warned) so an existing v1 config stays valid
-		// and the gap is documented rather than surprising. See
-		// docs/known-issues-v2.md.
+		// and the gap is documented rather than surprising.
 		//
 		// Empty: every v1 option this build understands is now applied. Kept as a
-		// list rather than deleted because the reporting below, and the
-		// accepted-but-inert= note in the startup line, are the only things a user
-		// has to go on when an option is quietly ignored — so the next one that
-		// arrives has somewhere to be listed.
+		// list rather than deleted because the accepted-but-inert= warning is the
+		// only thing a user has to go on when an option is quietly ignored — so
+		// the next one that arrives has somewhere to be listed.
 		const FEATURE_GATED_OPTIONS = [] as const
 
 		// Options this build understands. Anything else in the user's config is
@@ -2184,11 +2120,9 @@ export default define({
 			"doneWithoutDetailsPrompt",
 			"thinkingToolRecoveryPrompt",
 			"doneWithoutWorkPrompt",
-			"logFile",
 			"rateLimitCooldownsMs",
 			"sendTimeoutMs",
 			"stuckToolAgeMs",
-			"configProbe",
 			"modelProfiles",
 			"defaultFast",
 			"defaultSlow",
@@ -2198,38 +2132,29 @@ export default define({
 			log(
 				"warn",
 				`ignoring unrecognised option(s): ${unknownOptions.join(", ")} — ` +
-					`this v2 build does not read them. See docs/known-issues-v2.md.`,
+					`this v2 build does not read them. See the README on npm (opencode-auto-resume).`,
 			)
 		}
 		// Build/server version guard: this bundle only works on opencode v2, where the
 		// plugin input exposes `app.version`. A v1 server omits `ctx.app` entirely;
 		// without this check setup crashes later with an opaque API error.
 		if (typeof (ctx as any).app?.version !== "string") {
-			log("warn", "this looks like the opencode v1 build running on the wrong server: ctx.app.version is missing. The v2 bundle requires opencode v2 — check docs/migration.md and load dist/index.js (v1) or dist/v2/index.js (v2) to match your server.")
+			log("warn", "this looks like the opencode v1 build running on the wrong server: ctx.app.version is missing. The v2 bundle requires opencode v2 — update the plugin package (the npm build auto-selects per server) or load the build matching your server; see the README on npm (opencode-auto-resume).")
 		}
-		// Feature-gated options are valid but inert on v2. Reported in the startup
-		// line rather than as a warning — the user cannot act on it, so a per-start
-		// warn would be pure noise. See docs/known-issues-v2.md.
+		// Feature-gated options are valid but inert on v2. Warned only when one is
+		// actually set — the user cannot act on the note either way, so an empty
+		// list must not produce a per-start line.
 		const gatedInUse = Object.keys(opts).filter((key) =>
 			(FEATURE_GATED_OPTIONS as readonly string[]).includes(key),
 		)
 
-		// Debug output goes to the same file as everything else. Console-only debug
-		// is invisible in v2 for the same reason the rest of the logging was, and
-		// debug is exactly when you are trying to work out what the plugin did.
 		const dbg = (...args: unknown[]) => {
 			if (!debug) return
-			appendLogFile(logFile, "debug", `[auto-resume:debug] ${args.map((a) => String(a)).join(" ")}`)
 			console.log("[auto-resume:debug]", ...args)
 		}
 
 		function log(level: "info" | "warn" | "error", msg: string) {
 			const line = `[auto-resume] ${msg}`
-			// v2 exposes no server log sink to plugins (ctx.app is
-			// {name,version,channel}), so the file is the only retrievable record.
-			appendLogFile(logFile, level, line)
-			// Console too: harmless when nobody captures it, and the reason the
-			// startup line is visible at all when running under `opencode serve`.
 			if (level === "error") console.error(line)
 			else if (level === "warn") console.warn(line)
 			else console.log(line)
@@ -6721,39 +6646,6 @@ export default define({
 					log("warn", `${short(sid)} quota ladder restored (armed ${Math.round((Date.now() - r.at) / 1000)}s ago, rung ${w.rateLimitAttempts}) — retry due on schedule`)
 				}
 			}
-
-			// Fallback for arms written before R1 shipped, or by a host whose
-			// storage has no `set`. Costs a history read per session, so it runs
-			// only for sessions the storage channel did not already settle.
-			let text: string
-			try {
-				text = readFileSync(logFile, "utf8")
-			} catch {
-				return
-			}
-			const marks = new Map<string, { at: number; rung: number }>()
-			for (const line of text.split("\n").slice(-3000)) {
-				const m = /quota-armed sid=(ses_\S+) at=(\d+) rung=(\d+)/.exec(line)
-				if (m) marks.set(m[1], { at: Number(m[2]), rung: Number(m[3]) })
-			}
-			if (marks.size === 0) return
-			for (const [sid, mark] of marks) {
-				if (!listed.has(sid) || restored.has(sid)) continue
-				const w = ensureWatch(sid)
-				if (w.awaitingQuotaRetry || w.rateLimitedAt > 0) continue
-				if (Date.now() - mark.at >= horizon) continue
-				const messages = await loadMessages(sid)
-				let lastUserAt = 0
-				for (const m of messages) {
-					if (msgRole(m) === "user") lastUserAt = Math.max(lastUserAt, msgAt(m))
-				}
-				if (lastUserAt > mark.at) continue
-				w.rateLimitedAt = mark.at
-				w.rateLimitAttempts = mark.rung
-				w.awaitingQuotaRetry = true
-				w.quotaNoticedAt = mark.at
-				log("warn", `${short(sid)} quota ladder restored (armed ${Math.round((Date.now() - mark.at) / 1000)}s ago, rung ${mark.rung}) — retry due on schedule`)
-			}
 		}
 
 		/**
@@ -7458,11 +7350,9 @@ export default define({
 		// forgotten pause cannot silently disable it forever.
 		try { writeFileSync(PAUSED_MARKER_FILE, "", "utf8") } catch {}
 
-		log(
-			"info",
-			`ready (opencode v2). timeout=${chunkTimeoutMs}ms interval=${checkIntervalMs}ms retries=${maxRetries} loop=${loopMaxContinues}/${loopWindowMs / 1000}s warmup=${warmupMs}ms stall=${busyStallStrategy} visibleContinue=${visibleContinue} probe=${configProbe ?? "-"} mod=${MODULE_INSTANCE} up=${HOST_UPTIME_S}s boot=${HOST_BOOT}` +
-				(gatedInUse.length > 0 ? ` accepted-but-inert=${gatedInUse.join(",")}` : ""),
-		)
+		if (gatedInUse.length > 0) {
+			log("warn", `accepted-but-inert=${gatedInUse.join(",")} — this v2 build recognises these option(s) but does not act on them yet.`)
+		}
 
 		// Cleanup: stop timers and the event pump; OpenCode awaits this on disable/reload/shutdown.
 		const dispose = () => {

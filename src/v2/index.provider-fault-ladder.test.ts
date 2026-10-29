@@ -1,8 +1,7 @@
 import { describe, test, expect } from "bun:test"
-import { existsSync, readFileSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { rmSync } from "node:fs"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE — see index.attempt-reset.test.ts for why. */
 const LOG_SALT = "IndexProviderFaultLadderTest"
@@ -23,8 +22,6 @@ const LOG_SALT = "IndexProviderFaultLadderTest"
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_parent"
-
-let counter = 22000
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -65,8 +62,7 @@ const ev = (type: string, sid: string, data: Record<string, unknown> = {}) => ({
 async function setup(extraOpts: Record<string, unknown> = {}): Promise<any> {
 	const injected: Array<{ text?: string }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const ctx: any = {
 		event: stream,
@@ -83,7 +79,6 @@ async function setup(extraOpts: Record<string, unknown> = {}): Promise<any> {
 			loopMaxContinues: 99,
 			injectIntervalMs: 0,
 			subagentWaitMs: 40,
-			logFile,
 			debug: true,
 			...extraOpts,
 		},
@@ -107,16 +102,15 @@ async function setup(extraOpts: Record<string, unknown> = {}): Promise<any> {
 
 	const cleanup = await (plugin as any).setup(ctx)
 	await wait(60)
-	return { injected, cleanup, logFile, streamRef: stream }
+	return { injected, cleanup, capture, streamRef: stream }
 }
 
 async function teardown(h: any) {
 	;(h.cleanup as (() => void) | undefined)?.()
-	rmSync(h.logFile, { force: true })
+	h.capture.stop()
 }
 
 const push = (h: any, type: string, sid: string, data: Record<string, unknown> = {}) => h.streamRef.push(ev(type, sid, data))
-const readLog = (h: any) => (existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : "")
 
 async function waitFor(what: () => boolean, budgetMs = 3000): Promise<boolean> {
 	const deadline = Date.now() + budgetMs
@@ -159,12 +153,11 @@ describe("v2: a provider-scheduled retry holds the ladder and never gives up", (
 		push(h, "session.step.failed", SID, ECONNRESET)
 		await waitFor(() => h.injected.length >= 2)
 		const attempts = h.injected.map((i: any) => attemptOf(i.text))
-		const logs = readLog(h)
 		await teardown(h)
 		// Pre-fix this climbed to ["1","2"] and could then latch gaveUp.
 		expect(attempts.slice(0, 2)).toEqual(["1", "1"])
-		expect(logs).toContain("provider-fault stall")
-		expect(logs).not.toContain("giving up after")
+		expect(h.capture.lines.join("\n")).toContain("provider-fault stall")
+		expect(h.capture.lines.join("\n")).not.toContain("giving up after")
 	})
 
 	test("the nudge still fires — holding the rung is not silence", async () => {

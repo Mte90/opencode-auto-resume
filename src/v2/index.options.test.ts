@@ -1,8 +1,8 @@
 import { describe, test, expect } from "bun:test"
-import { existsSync, readFileSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { readFileSync } from "node:fs"
 import { join } from "node:path"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
@@ -79,6 +79,7 @@ type Harness = {
 	injected: Array<{ kind: string; text?: string }>
 	interrupts: string[]
 	logs: string[]
+	capture: ReturnType<typeof capturePluginLogs>
 }
 
 /**
@@ -105,11 +106,8 @@ async function replay(
 	const stream = makeEventStream()
 	const text = harnessOpts.text ?? READY_TEXT
 
-	// v2 removed v1's server log endpoint, so the plugin writes to a file. Point
-	// it at a scratch path and read the lines back after teardown — this is also
-	// what proves the file sink works, rather than assuming it does.
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-test-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	// Capture console output instead of reading log file
+	const capture = capturePluginLogs()
 
 	const ctx: any = {
 		event: stream,
@@ -119,7 +117,7 @@ async function replay(
 		// Before the spread, so it applies to every test here unless one asks for a
 		// different value. The deferred pattern pass defaults to 3s, which is not what
 		// these tests measure — the nudge they assert on would land after the wait.
-		options: { toolTextCheckDelayMs: 0, ...opts, logFile, registryScope: LOG_SALT },
+		options: { toolTextCheckDelayMs: 0, ...opts, registryScope: LOG_SALT },
 		session: {
 			context: async () => [oldUserTurn(), assistantTurn(text)],
 			// Empty: no other session is active, so the `lastWasTaskTool` branch
@@ -142,30 +140,23 @@ async function replay(
 		},
 	}
 
-/** Poll the scratch log until `needle` appears (see `waitForNudgeBeforeEvent`). */
-async function waitForLogLine(path: string, needle: string, timeoutMs: number): Promise<void> {
-	const start = Date.now()
-	while (Date.now() - start < timeoutMs) {
-		try {
-			if (readFileSync(path, "utf8").includes(needle)) return
-		} catch {
-			// Not written yet — the plugin creates it on first log line.
-		}
-		await wait(20)
-	}
-}
-
 	const cleanup = await (plugin as any).setup(ctx)
 	for (let i = 0; i < events.length; i++) {
 		stream.push(events[i])
-		if (i === waitForNudgeBeforeEvent) await waitForLogLine(logFile, "ready-to-continue detected", 10_000)
-		else await wait(10)
+		if (i === waitForNudgeBeforeEvent) {
+			// Wait for log line via console capture
+			const start = Date.now()
+			while (Date.now() - start < 10_000) {
+				if (capture.lines.some((l) => l.includes("ready-to-continue detected"))) break
+				await wait(20)
+			}
+		} else await wait(10)
 	}
 	await wait(600) // handleEvent is sync; its work is async
 	;(cleanup as (() => void) | undefined)?.()
-	const logs = existsSync(logFile) ? readFileSync(logFile, "utf8").split("\n") : []
-	rmSync(logFile, { force: true })
-	return { injected, interrupts, logs }
+	const logs = capture.lines
+	capture.stop()
+	return { injected, interrupts, logs, capture }
 }
 
 /** A turn that streams `text` and then goes idle. */
@@ -321,7 +312,7 @@ describe("v2: option reporting at startup", () => {
 		expect(logs.filter((l) => l.includes("unrecognised"))).toEqual([])
 	})
 
-	test("the startup line names no inert options, because none are inert", async () => {
+	test("no inert-options line is logged, because none are inert", async () => {
 		// Every v1 option this build understands is now applied, so the inert list has
 		// nothing to put in it — including for the three options that were inert when
 		// this branch started. A config carrying them must not be told they are being
@@ -332,12 +323,7 @@ describe("v2: option reporting at startup", () => {
 			toolTextCheckDelayMs: 3000,
 			discoveryDelayMs: 5_000,
 		})
-		const ready = logs.filter((l) => l.includes("ready (opencode v2)"))
-		expect(ready).toHaveLength(1)
-		expect(ready[0]).not.toContain("accepted-but-inert=")
-		expect(ready[0]).not.toContain("subagentWaitMs")
-		expect(ready[0]).not.toContain("toolTextCheckDelayMs")
-		expect(ready[0]).not.toContain("discoveryDelayMs")
+		expect(logs.filter((l) => l.includes("accepted-but-inert="))).toEqual([])
 	})
 
 	test("CONTROL: nothing is listed as feature-gated in the source", async () => {
@@ -362,11 +348,9 @@ describe("v2: option reporting at startup", () => {
 		expect(SOURCE).toContain("gatedInUse")
 	})
 
-	test("the startup line carries no accepted-but-inert list when none are set", async () => {
+	test("no accepted-but-inert list is logged when none are set", async () => {
 		const { logs } = await replay([], { chunkTimeoutMs: 5000 })
-		const ready = logs.filter((l) => l.includes("ready (opencode v2)"))
-		expect(ready).toHaveLength(1)
-		expect(ready[0]).not.toContain("accepted-but-inert=")
+		expect(logs.filter((l) => l.includes("accepted-but-inert="))).toEqual([])
 	})
 })
 

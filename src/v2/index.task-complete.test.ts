@@ -1,8 +1,7 @@
 import { describe, test, expect } from "bun:test"
-import { existsSync, readFileSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { rmSync } from "node:fs"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
@@ -35,7 +34,6 @@ const SID = "ses_task_complete"
  * Every group carries a control.
  */
 
-let counter = 0
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -122,8 +120,7 @@ async function setup(
 ): Promise<Harness> {
 	const injected: Harness["injected"] = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-tc-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	let registered: Registered | null = null
 	const history: unknown[] = [userMessage("do the work", OLD), ...(opts.extraMessages ?? [])]
@@ -133,7 +130,6 @@ async function setup(
 		options: {
 			registryScope: LOG_SALT,
 			...OPTIONS,
-			logFile,
 			// Raise maxRetries so the "blocked call does not count toward the ack
 			// escalation" test can stay inside the block for several calls instead of
 			// walking into the bounded-block path.
@@ -172,21 +168,21 @@ async function setup(
 	}
 
 	const cleanup = await (plugin as any).setup(ctx)
-	const logs = existsSync(logFile) ? readFileSync(logFile, "utf8").split("\n") : []
+		const logs = capture.lines
 	return {
 		get tool() {
 			return registered
 		},
 		injected,
 		logs,
-		// Exposed for the few tests that deliver an event or a message mid-session.
-		...({ cleanup, logFile, streamRef: stream, historyRef: history } as any),
+		cleanup,
+		streamRef: stream,
+		historyRef: history,
 	}
 }
 
 async function teardown(h: any) {
 	;(h.cleanup as (() => void) | undefined)?.()
-	rmSync(h.logFile, { force: true })
 }
 
 const call = (h: Harness, sid = SID) => h.tool!.execute({}, { sessionID: sid })
@@ -407,11 +403,10 @@ describe("v2: task_complete degrades rather than failing the watchdog", () => {
 		// Registration failure is the one thing that must never take down the
 		// session recovery that the rest of this plugin exists for.
 		const stream = makeEventStream()
-		const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-tc-throw-${process.pid}-${counter++}.log`)
-		rmSync(logFile, { force: true })
+		const capture = capturePluginLogs()
 		const ctx: any = {
 			event: stream,
-			options: { ...OPTIONS, logFile, registryScope: LOG_SALT },
+			options: { ...OPTIONS, registryScope: LOG_SALT },
 			session: {
 				context: async () => [userMessage("go", OLD)],
 				active: async () => ({}),
@@ -435,8 +430,7 @@ describe("v2: task_complete degrades rather than failing the watchdog", () => {
 		}
 		await wait(400)
 		;(cleanup as (() => void) | undefined)?.()
-		const logs = existsSync(logFile) ? readFileSync(logFile, "utf8").split("\n") : []
-		rmSync(logFile, { force: true })
+		const logs = capture.lines
 		expect(logs.some((l) => l.includes("task_complete registration failed"))).toBe(true)
 		// And the plugin is still running: it logged its startup line.
 		expect(logs.some((l) => l.includes("task_complete registration failed") && l.includes("continuing without it"))).toBe(

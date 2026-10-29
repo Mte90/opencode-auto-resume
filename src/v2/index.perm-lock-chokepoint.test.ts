@@ -1,7 +1,7 @@
 import { describe, test, expect } from "bun:test"
 import { rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { capturePluginLogs } from "./test-utils"
+import { capturePluginLogs } from "./test-utils"
 import plugin from "./index"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
@@ -28,7 +28,6 @@ const LOG_SALT = "IndexPermLockChokepointTest"
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_choke"
 
-let counter = 15000
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -116,13 +115,12 @@ const TYPO_HISTORY = [
 async function setup(history: unknown[]): Promise<any> {
 	const injected: Array<{ text?: string }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-choke-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	// Prod shape: no ctx.client, empty active set.
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile, registryScope: LOG_SALT },
+		options: { ...OPTIONS, registryScope: LOG_SALT },
 		session: {
 			context: async () => history,
 			active: async () => ({}),
@@ -139,12 +137,12 @@ async function setup(history: unknown[]): Promise<any> {
 
 	const cleanup = await (plugin as any).setup(ctx)
 	await wait(60)
-	return { injected, cleanup, logFile, streamRef: stream }
+	return { injected, cleanup, capture, streamRef: stream }
 }
 
 async function teardown(h: any) {
 	;(h.cleanup as (() => void) | undefined)?.()
-	rmSync(h.logFile, { force: true })
+	h.capture.stop()
 }
 
 async function goIdle(h: any) {

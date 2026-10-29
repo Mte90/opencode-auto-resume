@@ -1,8 +1,6 @@
 import { describe, test, expect } from "bun:test"
-import { rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
@@ -23,7 +21,7 @@ const LOG_SALT = "IndexDupProgressTest"
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_parent"
 
-let counter = 10000
+
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -64,8 +62,7 @@ const ev = (type: string, data: Record<string, unknown> = {}) => ({ type, data: 
 async function setup(extraEvents: Array<{ at: number; event: any }>, waitMs: number): Promise<any> {
 	const injected: Array<{ text?: string }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-dupprog-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const ctx: any = {
 		event: stream,
@@ -86,7 +83,6 @@ async function setup(extraEvents: Array<{ at: number; event: any }>, waitMs: num
 			loopMaxContinues: 99,
 			injectIntervalMs: 0,
 			continuePrompt: "go",
-			logFile,
 			debug: false,
 		},
 		session: {
@@ -120,8 +116,8 @@ async function setup(extraEvents: Array<{ at: number; event: any }>, waitMs: num
 		await wait(10)
 	}
 	await wait(50)
+	capture.stop()
 	;(cleanup as (() => void) | undefined)?.()
-	rmSync(logFile, { force: true })
 	return { injected }
 }
 

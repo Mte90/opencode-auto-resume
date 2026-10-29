@@ -15,9 +15,8 @@
  */
 import { describe, test, expect, setDefaultTimeout } from "bun:test"
 import { rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const POLL_MS = 10_000
@@ -25,8 +24,6 @@ setDefaultTimeout(45_000)
 
 const LOG_SALT = "IndexStopPhraseTest"
 const SID = "ses_stop"
-
-let counter = 91000
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -72,8 +69,7 @@ const TOOLS = [{ id: "read" }, { id: "write" }, { id: "shell" }, { id: "task_com
 async function setup(history: unknown[], opts: Record<string, unknown> = {}): Promise<any> {
 	const injected: Array<{ text?: string }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const ctx: any = {
 		event: stream,
@@ -90,7 +86,6 @@ async function setup(history: unknown[], opts: Record<string, unknown> = {}): Pr
 			loopMaxContinues: 99,
 			injectIntervalMs: 0,
 			subagentWaitMs: 40,
-			logFile,
 			debug: true,
 			...opts,
 		},
@@ -110,12 +105,12 @@ async function setup(history: unknown[], opts: Record<string, unknown> = {}): Pr
 
 	const cleanup = await (plugin as any).setup(ctx)
 	await wait(60)
-	return { injected, cleanup, logFile, streamRef: stream }
+	return { injected, cleanup, capture, streamRef: stream }
 }
 
 async function teardown(h: any) {
 	;(h.cleanup as (() => void) | undefined)?.()
-	rmSync(h.logFile, { force: true })
+	h.capture.stop()
 }
 
 const OLD = Date.now() - 3600_000

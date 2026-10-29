@@ -1,8 +1,6 @@
 import { describe, test, expect, afterEach } from "bun:test"
-import { rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
@@ -27,7 +25,7 @@ const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_parent"
 const CHILD = "ses_eed4521bdffeHLLmpomhiB0KXx"
 
-let counter = 3000
+
 const realFetch = globalThis.fetch
 const realServerPort = process.env.OPENCODE_SERVER_PORT
 
@@ -111,8 +109,7 @@ async function setup(opts: {
 	const injected: Array<{ sid?: string; text?: string }> = []
 	const interrupted: string[] = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-childguard-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const history: History = opts.history ?? {}
 	const active = new Set(opts.active ?? [])
@@ -122,7 +119,6 @@ async function setup(opts: {
 		options: {
 			registryScope: LOG_SALT,
 			...OPTIONS,
-			logFile,
 			...(opts.backoffMs ? { baseBackoffMs: opts.backoffMs, maxBackoffMs: opts.backoffMs } : {}),
 		},
 		session: {
@@ -146,13 +142,13 @@ async function setup(opts: {
 
 	const cleanup = await (plugin as any).setup(ctx)
 	await wait(60)
-	return { injected, interrupted, cleanup, logFile, streamRef: stream }
+	return { injected, interrupted, cleanup, capture, streamRef: stream }
 }
 
 async function teardown(h: any) {
 	;(h.cleanup as (() => void) | undefined)?.()
-	rmSync(h.logFile, { force: true })
-}
+	h.capture.stop()}
+
 
 const push = (h: any, type: string, sid: string, data: Record<string, unknown> = {}) => h.streamRef.push(ev(type, sid, data))
 

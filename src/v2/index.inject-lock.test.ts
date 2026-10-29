@@ -1,12 +1,9 @@
 import { describe, test, expect } from "bun:test"
-import { readFileSync, rmSync } from "node:fs"
+import { readFileSync } from "node:fs"
 import { join } from "node:path"
-import { tmpdir } from "node:os"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
-/** Unique per test FILE: bun runs every file in one process, so two files
- *  starting their counters at 0 derive the SAME tmpdir log path and read each
- *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
 const LOG_SALT = "IndexInjectLockTest"
 
 const SOURCE = readFileSync(join(import.meta.dir, "index.ts"), "utf8")
@@ -14,16 +11,7 @@ const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_lock"
 let counter = 0
 
-/**
- * A private log file. Without `logFile` the plugin writes to its DEFAULT path,
- * which is the LIVE server's log — test sessions then show up interleaved with
- * real ones and the live log stops being usable as forensics.
- */
-function privateLog(tag: string): string {
-	const f = join(tmpdir(), `auto-resume-${LOG_SALT}-${tag}-${process.pid}-${counter++}.log`)
-	rmSync(f, { force: true })
-	return f
-}
+
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -81,10 +69,10 @@ const FAST = {
 async function run(slowMs: number) {
 	const injected: any[] = []
 	const stream = makeEventStream()
-	const logFile = privateLog("lock")
+	const capture = capturePluginLogs()
 	const ctx: any = {
 		event: stream,
-		options: { ...FAST, maxRetries: 1, debug: true, logFile, registryScope: LOG_SALT },
+		options: { ...FAST, maxRetries: 1, debug: true, registryScope: LOG_SALT },
 		session: {
 			active: async () => ({}),
 			interrupt: async () => ({}),
@@ -104,8 +92,8 @@ async function run(slowMs: number) {
 	const cleanup = await (plugin as any).setup(ctx)
 	stream.push(ev("session.execution.started"))
 	await wait(800)
+	capture.stop()
 	;(cleanup as (() => void) | undefined)?.()
-	rmSync(logFile, { force: true })
 	return injected
 }
 

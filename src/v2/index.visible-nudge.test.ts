@@ -1,8 +1,6 @@
 import { describe, test, expect } from "bun:test"
-import { rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 const LOG_SALT = "VisibleNudgeTest"
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
@@ -58,12 +56,11 @@ async function setup(opts: any = {}) {
 	const injected: any[] = []
 	const interrupted: string[] = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile, registryScope: LOG_SALT, ...opts },
+		options: { ...OPTIONS, registryScope: LOG_SALT, ...opts },
 		session: {
 			context: async (a: any) => [],
 			active: async () => ({}),
@@ -83,13 +80,13 @@ async function setup(opts: any = {}) {
 
 	const cleanup = await (plugin as any).setup(ctx)
 	await wait(60)
-	return { injected, interrupted, cleanup, logFile, streamRef: stream }
+	return { injected, interrupted, cleanup, capture, streamRef: stream }
 }
 
 async function teardown(h: any) {
 	;(h.cleanup as (() => void) | undefined)?.()
-	rmSync(h.logFile, { force: true })
-}
+	h.capture.stop()}
+
 
 const push = (h: any, type: string, sid: string, data: Record<string, unknown> = {}) => h.streamRef.push(ev(type, sid, data))
 

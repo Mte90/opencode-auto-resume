@@ -1,7 +1,7 @@
 import { describe, test, expect } from "bun:test"
 import { rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { capturePluginLogs } from "./test-utils"
+import { capturePluginLogs } from "./test-utils"
 import plugin from "./index"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
@@ -23,7 +23,6 @@ const LOG_SALT = "IndexUserWaitTest"
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_parent"
 
-let counter = 2000
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -94,15 +93,14 @@ async function setup(history: History, active: string[]): Promise<any> {
 	const injected: Array<{ sid?: string; text?: string }> = []
 	const interrupted: string[] = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-userwait-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const activeSet = new Set(active)
 	const rows: Array<{ id: string; parentID?: string }> = [{ id: SID }]
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile, registryScope: LOG_SALT },
+		options: { ...OPTIONS, registryScope: LOG_SALT },
 		session: {
 			context: async (a: any) => history[a?.sessionID ?? SID] ?? [],
 			active: async () => Object.fromEntries([...activeSet].map((s) => [s, {}])),
@@ -125,12 +123,12 @@ async function setup(history: History, active: string[]): Promise<any> {
 
 	const cleanup = await (plugin as any).setup(ctx)
 	await wait(60)
-	return { injected, interrupted, cleanup, logFile, streamRef: stream }
+	return { injected, interrupted, cleanup, capture, streamRef: stream }
 }
 
 async function teardown(h: any) {
 	;(h.cleanup as (() => void) | undefined)?.()
-	rmSync(h.logFile, { force: true })
+	h.capture.stop()
 }
 
 const push = (h: any, type: string, sid: string, data: Record<string, unknown> = {}) => h.streamRef.push(ev(type, sid, data))

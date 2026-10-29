@@ -1,8 +1,6 @@
 import { describe, test, expect } from "bun:test"
-import { existsSync, readFileSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
@@ -23,7 +21,7 @@ const SID = "ses_ooc_throttle"
  * phrasing still latches (control).
  */
 
-let counter = 0
+
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -83,17 +81,16 @@ const OPTIONS = {
 	debug: true,
 }
 
-type Harness = { injected: Array<{ text?: string; resume?: boolean; synth?: boolean }>; stream: any; cleanup?: () => void; logFile: string; failTurn: (err: unknown) => Promise<void> }
+type Harness = { injected: Array<{ text?: string; resume?: boolean; synth?: boolean }>; stream: any; cleanup?: () => void; capture: any; failTurn: (err: unknown) => Promise<void> }
 
 async function replay(opts: Record<string, unknown> = {}): Promise<Harness> {
 	const injected: Harness["injected"] = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-ooc-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile, ...opts, registryScope: LOG_SALT },
+		options: { ...OPTIONS, ...opts, registryScope: LOG_SALT },
 		session: {
 			context: async () => [userTurn()],
 			active: async () => ({}),
@@ -119,14 +116,10 @@ async function replay(opts: Record<string, unknown> = {}): Promise<Harness> {
 		stream.push(ev("session.step.failed", err as Record<string, unknown>))
 		await wait(10)
 	}
-	return { injected, stream, cleanup, logFile, failTurn }
+	return { injected, stream, cleanup, capture, failTurn }
 }
 
-function readLogs(h: Harness): string[] {
-	const logs = existsSync(h.logFile) ? readFileSync(h.logFile, "utf8").split("\n") : []
-	rmSync(h.logFile, { force: true })
-	return logs
-}
+
 
 describe("v2: throttle phrasing never latches OOC (issue #46)", () => {
 	test("throttle 'too many tokens ... wait before retrying' stands down on the ladder, no OOC latch", async () => {
@@ -134,8 +127,9 @@ describe("v2: throttle phrasing never latches OOC (issue #46)", () => {
 		await h.failTurn(THROTTLE)
 		await wait(300)
 		expect(h.injected.some((i) => /Rate limited, retrying in/.test(i.text ?? ""))).toBe(true)
-		const logs = readLogs(h)
+		const logs = h.capture.lines
 		expect(logs.some((l) => l.includes("OOC error latched"))).toBe(false)
+		h.capture.stop()
 		h.cleanup?.()
 	})
 
@@ -143,8 +137,9 @@ describe("v2: throttle phrasing never latches OOC (issue #46)", () => {
 		const h = await replay({ rateLimitCooldownsMs: [60_000] })
 		await h.failTurn(GENUINE_OOC)
 		await wait(300)
-		const logs = readLogs(h)
+		const logs = h.capture.lines
 		expect(logs.some((l) => l.includes("OOC error latched"))).toBe(true)
+		h.capture.stop()
 		h.cleanup?.()
 	})
 })

@@ -1,8 +1,7 @@
 import { describe, test, expect, setDefaultTimeout } from "bun:test"
-import { rmSync, existsSync, readFileSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { rmSync } from "node:fs"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /**
  * Behavioural coverage for the STALL WATCHDOG's shell guard.
@@ -94,8 +93,7 @@ async function setup(opts: SetupOpts = {}): Promise<any> {
 	const injected: Array<{ text?: string }> = []
 	const interrupted: string[] = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	// A SHORT stall window so the watchdog crosses it inside the test budget.
 	// This is the production shape: a busy session, a long shell, and a stall
@@ -112,7 +110,6 @@ async function setup(opts: SetupOpts = {}): Promise<any> {
 			maxRetries: 3,
 			loopMaxContinues: 99,
 			injectIntervalMs: 0,
-			logFile,
 			debug: true,
 		},
 		session: {
@@ -127,15 +124,14 @@ async function setup(opts: SetupOpts = {}): Promise<any> {
 	}
 	const cleanup = await (plugin as any).setup(ctx)
 	await wait(60)
-	return { injected, interrupted, streamRef: stream, logFile, cleanup }
+	return { injected, interrupted, streamRef: stream, capture, cleanup }
 }
 
 async function teardown(h: any) {
 	;(h.cleanup as (() => void) | undefined)?.()
-	rmSync(h.logFile, { force: true })
+	h.capture.stop()
 }
 
-const logs = (h: any) => (existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : "")
 
 const assistantWith = (at: number, text: string) => ({
 	type: "assistant",
@@ -324,7 +320,7 @@ describe("v2: the busy stall ladder latches completion claims", () => {
 		await wait(10)
 		h.streamRef.push(ev("session.step.started"))
 		await wait(1600)
-		const said = logs(h)
+		const said = h.capture.lines.join("\n")
 		await teardown(h)
 		expect(h.injected).toEqual([])
 		expect(said).toContain("latching completion")
@@ -359,7 +355,7 @@ describe("v2: the busy stall ladder latches completion claims", () => {
 		h.streamRef.push(ev("session.step.started"))
 		await wait(10)
 		await wait(1600)
-		const said = logs(h)
+		const said = h.capture.lines.join("\n")
 		await teardown(h)
 		expect(h.injected).toEqual([])
 		expect(said).toContain("latching completion")

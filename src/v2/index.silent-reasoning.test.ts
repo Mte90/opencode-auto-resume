@@ -1,8 +1,6 @@
 import { describe, test, expect } from "bun:test"
-import { rmSync, readFileSync, existsSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
@@ -23,7 +21,7 @@ const LOG_SALT = "IndexSilentReasoningTest"
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_parent"
 
-let counter = 21000
+
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -91,8 +89,7 @@ const toolPart = (id: string, name: string, status: string) => ({
 async function setup(history: unknown[], opts: { chunkTimeoutMs?: number } = {}): Promise<any> {
 	const injected: Array<{ text?: string }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-silreason-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const ctx: any = {
 		event: stream,
@@ -109,7 +106,6 @@ async function setup(history: unknown[], opts: { chunkTimeoutMs?: number } = {})
 			loopMaxContinues: 99,
 			injectIntervalMs: 0,
 			subagentWaitMs: 40,
-			logFile,
 			debug: true,
 		},
 		session: {
@@ -128,13 +124,13 @@ async function setup(history: unknown[], opts: { chunkTimeoutMs?: number } = {})
 
 	const cleanup = await (plugin as any).setup(ctx)
 	await wait(60)
-	return { injected, cleanup, logFile, streamRef: stream }
+	return { injected, cleanup, capture, streamRef: stream }
 }
 
 async function teardown(h: any) {
 	;(h.cleanup as (() => void) | undefined)?.()
-	rmSync(h.logFile, { force: true })
-}
+	h.capture.stop()}
+
 
 const nudges = (h: any) => h.injected.filter((i: any) => /no visible output/.test(i.text ?? ""))
 

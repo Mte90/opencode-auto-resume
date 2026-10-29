@@ -1,8 +1,7 @@
 import { describe, test, expect } from "bun:test"
-import { existsSync, readFileSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { rmSync } from "node:fs"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
@@ -28,7 +27,6 @@ const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_parent"
 const CHILD = "ses_child"
 
-let counter = 5000
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -104,8 +102,7 @@ async function setup(opts: {
 	const injected: Array<{ sid?: string; text?: string }> = []
 	const interrupted: string[] = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-patience-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const history: History = opts.history ?? {}
 	const active = new Set(opts.active ?? [])
@@ -116,7 +113,6 @@ async function setup(opts: {
 		options: {
 			registryScope: LOG_SALT,
 			...OPTIONS,
-			logFile,
 			...(opts.maxRetries !== undefined ? { maxRetries: opts.maxRetries } : {}),
 		},
 		session: {
@@ -141,15 +137,14 @@ async function setup(opts: {
 
 	const cleanup = await (plugin as any).setup(ctx)
 	await wait(60)
-	return { injected, interrupted, logFile, streamRef: stream, cleanup }
+	return { injected, interrupted, capture, streamRef: stream, cleanup }
 }
 
 async function teardown(h: any) {
 	;(h.cleanup as (() => void) | undefined)?.()
-	rmSync(h.logFile, { force: true })
+	h.capture.stop()
 }
 
-const logs = (h: any) => (existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : "")
 const push = (h: any, type: string, sid: string, data: Record<string, unknown> = {}) => h.streamRef.push(ev(type, sid, data))
 
 async function makeBusy(h: any, sid: string) {
@@ -222,7 +217,7 @@ describe("v2: quiet subagents wait inside a patience window", () => {
 		// which the watch skips; gaveUp lands on the first tick after that.
 		await wait(3000)
 		expect(h.interrupted).toHaveLength(1)
-		expect(logs(h)).toContain("gave up")
+		expect(h.capture.warns.join("\n")).toContain("gave up")
 		await teardown(h)
 	})
 })

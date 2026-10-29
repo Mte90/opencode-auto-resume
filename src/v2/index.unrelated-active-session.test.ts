@@ -1,12 +1,7 @@
 import { describe, test, expect } from "bun:test"
-import { rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
-/** Unique per test FILE: bun runs every file in one process, so two files
- *  starting their counters at 0 derive the SAME tmpdir log path and read each
- *  other's writes. */
 const LOG_SALT = "IndexUnrelatedActiveSessionTest"
 
 /**
@@ -107,8 +102,7 @@ async function setup(opts: { history?: Record<string, unknown[]>; active?: strin
 	const injected: Array<{ sid?: string; text?: string }> = []
 	const interrupted: string[] = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const history = opts.history ?? {}
 	const active = new Set(opts.active ?? [])
@@ -116,7 +110,7 @@ async function setup(opts: { history?: Record<string, unknown[]>; active?: strin
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile, registryScope: LOG_SALT },
+		options: { ...OPTIONS, registryScope: LOG_SALT },
 		session: {
 			context: async (a: any) => history[a?.sessionID ?? SID] ?? [],
 			active: async () => Object.fromEntries([...active].map((s) => [s, {}])),
@@ -139,13 +133,13 @@ async function setup(opts: { history?: Record<string, unknown[]>; active?: strin
 
 	const cleanup = await (plugin as any).setup(ctx)
 	await wait(60)
-	return { injected, interrupted, history, active, cleanup, logFile, streamRef: stream }
+	return { injected, interrupted, history, active, cleanup, capture, streamRef: stream }
 }
 
 async function teardown(h: any) {
 	;(h.cleanup as (() => void) | undefined)?.()
-	rmSync(h.logFile, { force: true })
-}
+	h.capture.stop()}
+
 
 const push = (h: any, type: string, sid: string, data: Record<string, unknown> = {}) => h.streamRef.push(ev(type, sid, data))
 const parentInjects = (h: any) => h.injected.filter((i: any) => i.sid === SID)

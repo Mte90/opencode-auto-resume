@@ -1,8 +1,6 @@
 import { describe, test, expect, setDefaultTimeout } from "bun:test"
-import { rmSync, existsSync, readFileSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /**
  * Behavioural counterpart to index.continue-guardrail.test.ts.
@@ -18,7 +16,7 @@ const SID = "ses_parent"
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 setDefaultTimeout(30_000)
 
-let counter = 91_000
+
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -75,8 +73,7 @@ const DESTRUCTIVE = "destructive or irreversible actions"
 async function setup(opts: Record<string, unknown>, history: unknown[]): Promise<any> {
 	const injected: Array<{ text?: string }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 	const ctx: any = {
 		event: stream,
 		options: {
@@ -90,7 +87,6 @@ async function setup(opts: Record<string, unknown>, history: unknown[]): Promise
 			maxRetries: 1,
 			loopMaxContinues: 99,
 			injectIntervalMs: 0,
-			logFile,
 			debug: true,
 			...opts,
 		},
@@ -106,13 +102,13 @@ async function setup(opts: Record<string, unknown>, history: unknown[]): Promise
 	}
 	const cleanup = await (plugin as any).setup(ctx)
 	await wait(60)
-	return { injected, streamRef: stream, logFile, cleanup }
+	return { injected, streamRef: stream, capture, cleanup }
 }
 
 async function teardown(h: any) {
 	;(h.cleanup as (() => void) | undefined)?.()
-	rmSync(h.logFile, { force: true })
-}
+	h.capture.stop()}
+
 
 describe("v2: the guardrail reaches the model, not just the source", () => {
 	test("the stall recovery continue carries the guardrail", async () => {

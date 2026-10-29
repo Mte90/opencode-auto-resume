@@ -101,7 +101,7 @@ describe("build/server mismatch guard", () => {
             expect(warns.length).toBe(1)
             expect(warns[0]).toContain("ctx.serverUrl is missing")
             expect(warns[0]).toContain("opencode v1")
-            expect(warns[0]).toContain("migration.md")
+            expect(warns[0]).toContain("README")
 
             // Assert the plugin still loaded successfully
             expect(hooks).toBeDefined()

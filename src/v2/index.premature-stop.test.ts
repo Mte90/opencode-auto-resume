@@ -1,8 +1,7 @@
 import { describe, test, expect } from "bun:test"
-import { existsSync, readFileSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { rmSync } from "node:fs"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
@@ -33,10 +32,9 @@ const SID = "ses_premature"
 
 type Harness = {
 	injected: Array<{ kind: string; text?: string }>
-	logs: string[]
+	capture: any
 }
 
-let counter = 0
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -124,12 +122,11 @@ async function replay(
 ): Promise<Harness> {
 	const injected: Harness["injected"] = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-premature-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile, ...opts, registryScope: LOG_SALT },
+		options: { ...OPTIONS, ...opts, registryScope: LOG_SALT },
 		session: {
 			context: async () => [userTurn(harnessOpts.userAgeMs), assistantTurn(TEXT_FOR_HARNESS.value)],
 			active: async () => ({}),
@@ -152,9 +149,8 @@ async function replay(
 	}
 	await wait(600)
 	;(cleanup as (() => void) | undefined)?.()
-	const logs = existsSync(logFile) ? readFileSync(logFile, "utf8").split("\n") : []
-	rmSync(logFile, { force: true })
-	return { injected, logs }
+	capture.stop()
+	return { injected, capture }
 }
 
 /**
@@ -233,32 +229,32 @@ describe("v2: celebration latches completion", () => {
 	})
 
 	test("a trailing 🎉 latches completion instead of nudging", async () => {
-		const { injected, logs } = await replay(turnEvents("All set.\n\nChanged the parser. 🎉"))
+		const { injected, capture } = await replay(turnEvents("All set.\n\nChanged the parser. 🎉"))
 		expect(injected).toEqual([])
-		expect(logs.some((l) => l.includes("latching completion"))).toBe(true)
+		expect(capture.lines.some((l) => l.includes("latching completion"))).toBe(true)
 	})
 
 	test("the latch survives a later idle with no new text", async () => {
 		// debug:true so the second (silent) visit is observable at all — before
 		// the log-sink fix these lines only reached a console nobody captures.
-		const { injected, logs } = await replay(
+		const { injected, capture } = await replay(
 			[...turnEvents("All set. 🎉"), ...idleAgain, ...idleAgain],
 			{ debug: true },
 		)
 		expect(injected).toEqual([])
-		expect(logs.filter((l) => l.includes("latching completion"))).toHaveLength(1)
-		expect(logs.some((l) => l.includes("completion already latched"))).toBe(true)
+		expect(capture.lines.filter((l) => l.includes("latching completion"))).toHaveLength(1)
+		expect(capture.lines.some((l) => l.includes("completion already latched"))).toBe(true)
 	})
 
 	test("a new turn clears the latch, so a later done-claim is judged on its own", async () => {
-		const { injected, logs } = await replay([
+		const { injected, capture } = await replay([
 			...turnEvents("All set. 🎉"),
 			...idleAgain,
 			// A fresh turn: budgets reset, latch resets, and this one is bare.
 			...turnEvents(BARE_DONE),
 		])
 		expect(injected.length).toBeGreaterThan(0)
-		expect(logs.filter((l) => l.includes("latching completion"))).toHaveLength(1)
+		expect(capture.lines.filter((l) => l.includes("latching completion"))).toHaveLength(1)
 	})
 
 	test("punctuation after the emoji still counts as celebration", async () => {
@@ -271,10 +267,10 @@ describe("v2: celebration latches completion", () => {
 		// Boundary markers come in beginning/end pairs, so only the last line
 		// counts: an emoji anywhere earlier belongs to structure, not to the
 		// turn's close. The turn below ends mid-task with no other signal.
-		const { logs } = await replay(
+		const { capture } = await replay(
 			turnEvents("🎉 Step one done.\n\nLine one.\nLine two.\nLine three.\nLine four.\nStill working on step two."),
 		)
-		expect(logs.some((l) => l.includes("latching completion"))).toBe(false)
+		expect(capture.lines.some((l) => l.includes("latching completion"))).toBe(false)
 	})
 })
 

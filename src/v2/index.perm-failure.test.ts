@@ -1,8 +1,6 @@
 import { describe, test, expect } from "bun:test"
-import { rmSync, readFileSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
@@ -28,7 +26,7 @@ const LOG_SALT = "IndexPermFailureTest"
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_parent"
 
-let counter = 13000
+
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -70,8 +68,7 @@ const push = (h: any, type: string, sid: string, data: Record<string, unknown> =
 async function setup(): Promise<any> {
 	const injected: Array<{ text?: string }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-permfail-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const ctx: any = {
 		event: stream,
@@ -88,7 +85,6 @@ async function setup(): Promise<any> {
 			loopMaxContinues: 99,
 			injectIntervalMs: 0,
 			subagentWaitMs: 40,
-			logFile,
 			debug: true,
 		},
 		session: {
@@ -111,13 +107,13 @@ async function setup(): Promise<any> {
 
 	const cleanup = await (plugin as any).setup(ctx)
 	await wait(60)
-	return { injected, cleanup, logFile, streamRef: stream }
+	return { injected, cleanup, capture, streamRef: stream }
 }
 
 async function teardown(h: any) {
 	;(h.cleanup as (() => void) | undefined)?.()
-	rmSync(h.logFile, { force: true })
-}
+	h.capture.stop()}
+
 
 const stepFailed = (h: any, message: string, type = "provider.invalid-request") =>
 	push(h, "session.step.failed", SID, { error: { type, message } })
@@ -129,7 +125,7 @@ describe("v2: permanent failures latch recovery out", () => {
 		await wait(20)
 		stepFailed(h, "Model exo-free has been deprecated.")
 		await wait(400)
-		const log = readFileSync(h.logFile, "utf8")
+		const log = h.capture.lines.join("\n")
 		await teardown(h)
 		expect(h.injected.length).toBe(0)
 		expect(log).toContain("latched")

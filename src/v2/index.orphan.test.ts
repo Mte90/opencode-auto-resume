@@ -1,12 +1,7 @@
 import { describe, test, expect } from "bun:test"
-import { existsSync, readFileSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
-/** Unique per test FILE: bun runs every file in one process, so two files
- *  starting their counters at 0 derive the SAME tmpdir log path and read each
- *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
 const LOG_SALT = "IndexOrphanTest"
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
@@ -99,8 +94,7 @@ async function setup(
 	const injected: Array<{ sid?: string; text?: string }> = []
 	const interrupted: string[] = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-orphan-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const history: History = opts.history ?? { [SID]: [userMessage("go", Date.now() - 60_000)] }
 	const active = new Set(opts.active ?? [])
@@ -108,7 +102,7 @@ async function setup(
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile, ...(opts.subagentWaitMs ? { subagentWaitMs: opts.subagentWaitMs } : {}), registryScope: LOG_SALT },
+		options: { ...OPTIONS, ...(opts.subagentWaitMs ? { subagentWaitMs: opts.subagentWaitMs } : {}), registryScope: LOG_SALT },
 		session: {
 			context: async (a: any) => history[a?.sessionID ?? SID] ?? [],
 			active: async () => Object.fromEntries([...active].map((s) => [s, {}])),
@@ -141,16 +135,16 @@ async function setup(
 		interrupted,
 		history,
 		active,
-		...({ cleanup, logFile, streamRef: stream } as any),
+		...({ cleanup, capture, streamRef: stream } as any),
 	}
 }
 
 async function teardown(h: any) {
 	;(h.cleanup as (() => void) | undefined)?.()
-	rmSync(h.logFile, { force: true })
-}
+	h.capture.stop()}
 
-const logs = (h: any) => (existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : "")
+
+const logs = (h: any) => h.capture.lines.join("\n")
 
 const push = (h: any, type: string, sid: string, data: Record<string, unknown> = {}) => h.streamRef.push(ev(type, sid, data))
 

@@ -1,12 +1,8 @@
 import { describe, test, expect } from "bun:test"
-import { existsSync, readFileSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { existsSync } from "node:fs"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
-/** Unique per test FILE: bun runs every file in one process, so two files
- *  starting their counters at 0 derive the SAME tmpdir log path and read each
- *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
 const LOG_SALT = "IndexSaturationTest"
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
@@ -112,8 +108,7 @@ async function replay(h: HarnessOpts) {
 	const commands: Array<{ sessionID: string; name: string }> = []
 	const compacted: string[] = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-saturation-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const limit = h.limit ?? { context: 200_000, output: 32_000 }
 	const model = { id: MODEL, providerID: PROVIDER, limit, name: MODEL }
@@ -149,7 +144,6 @@ async function replay(h: HarnessOpts) {
 			gracePeriodMs: 0,
 			warmupMs: 0,
 			injectIntervalMs: 0,
-			logFile,
 			...(h.opts ?? {}),
 		},
 		session,
@@ -176,8 +170,8 @@ async function replay(h: HarnessOpts) {
 	await wait(600)
 	;(cleanup as (() => void) | undefined)?.()
 
-	const logs = existsSync(logFile) ? readFileSync(logFile, "utf8").split("\n") : []
-	rmSync(logFile, { force: true })
+	const logs = capture.lines
+	capture.stop()
 	return { commands, compacted, logs }
 }
 
@@ -230,11 +224,10 @@ describe("v2: context saturation — parent sessions", () => {
 	test("a host with no plugin inventory treats magic-context as absent", async () => {
 		const logs: string[] = []
 		const stream = makeEventStream()
-		const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-saturation-${process.pid}-${counter++}.log`)
-		rmSync(logFile, { force: true })
+		const capture = capturePluginLogs()
 		const ctx: any = {
 			event: stream,
-			options: { warmupMs: 0, checkIntervalMs: 20, chunkTimeoutMs: 600_000, gracePeriodMs: 0, logFile, registryScope: LOG_SALT },
+			options: { warmupMs: 0, checkIntervalMs: 20, chunkTimeoutMs: 600_000, gracePeriodMs: 0, registryScope: LOG_SALT },
 			session: { context: async () => [], active: async () => ({}), interrupt: async () => ({}), synthetic: async () => ({}) },
 			model: { get: () => ({ limit: { context: 200_000, output: 32_000 } }) },
 		}
@@ -244,8 +237,8 @@ describe("v2: context saturation — parent sessions", () => {
 		stream.push(ev("session.idle"))
 		await wait(400)
 		;(cleanup as (() => void) | undefined)?.()
-		if (existsSync(logFile)) logs.push(...readFileSync(logFile, "utf8").split("\n"))
-		rmSync(logFile, { force: true })
+		logs.push(...capture.lines)
+		capture.stop()
 		// Must not raise, and must not invent a verdict.
 		expect(logs.filter((l) => l.includes("ERROR"))).toEqual([])
 	})
@@ -335,11 +328,10 @@ describe("v2: the saturation arithmetic matches v1", () => {
 
 	test("an unknown model yields no limit, so no intervention", async () => {
 		const stream = makeEventStream()
-		const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-saturation-${process.pid}-${counter++}.log`)
-		rmSync(logFile, { force: true })
+		const capture = capturePluginLogs()
 		const ctx: any = {
 			event: stream,
-			options: { warmupMs: 0, checkIntervalMs: 20, chunkTimeoutMs: 600_000, gracePeriodMs: 0, logFile, registryScope: LOG_SALT },
+			options: { warmupMs: 0, checkIntervalMs: 20, chunkTimeoutMs: 600_000, gracePeriodMs: 0, registryScope: LOG_SALT },
 			session: { context: async () => [], active: async () => ({}), interrupt: async () => ({}), synthetic: async () => ({}) },
 			model: { get: () => undefined },
 			plugin: { list: async () => [{ id: "magic-context" }] },
@@ -350,8 +342,8 @@ describe("v2: the saturation arithmetic matches v1", () => {
 		stream.push(ev("session.idle"))
 		await wait(400)
 		;(cleanup as (() => void) | undefined)?.()
-		const logs = existsSync(logFile) ? readFileSync(logFile, "utf8") : ""
-		rmSync(logFile, { force: true })
+		const logs = capture.lines.join("\n")
+		capture.stop()
 		expect(logs).not.toContain("context saturation")
 	})
 })

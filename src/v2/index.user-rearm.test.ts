@@ -1,8 +1,7 @@
 import { describe, test, expect } from "bun:test"
-import { rmSync, existsSync, readFileSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { rmSync } from "node:fs"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
@@ -24,7 +23,6 @@ const LOG_SALT = "IndexUserRearmTest"
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_parent"
 
-let counter = 6000
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -93,12 +91,11 @@ const assistantText = (text: string, at: number) => ({
 async function setup(history: Record<string, unknown[]>, extraOpts: Record<string, unknown> = {}): Promise<any> {
 	const injected: Array<{ sid?: string; text?: string }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-rearm-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile, registryScope: LOG_SALT, ...extraOpts },
+		options: { ...OPTIONS, registryScope: LOG_SALT, ...extraOpts },
 		session: {
 			context: async (a: any) => history[a?.sessionID ?? SID] ?? [],
 			active: async () => ({ [SID]: {} }),
@@ -118,25 +115,21 @@ async function setup(history: Record<string, unknown[]>, extraOpts: Record<strin
 
 	const cleanup = await (plugin as any).setup(ctx)
 	await wait(60)
-	return { injected, cleanup, logFile, streamRef: stream, history }
+	return { injected, cleanup, capture, streamRef: stream, history }
 }
 
 async function teardown(h: any) {
 	;(h.cleanup as (() => void) | undefined)?.()
-	rmSync(h.logFile, { force: true })
+	h.capture.stop()
 }
 
 const push = (h: any, type: string, sid: string, data: Record<string, unknown> = {}) => h.streamRef.push(ev(type, sid, data))
 
 /** Poll the log file for a line instead of sleeping a fixed span. */
-async function waitForLog(logFile: string, needle: string, timeoutMs = 5000): Promise<boolean> {
+async function waitForLog(capture: any, needle: string, timeoutMs = 5000): Promise<boolean> {
 	const deadline = Date.now() + timeoutMs
 	for (;;) {
-		try {
-			if (readFileSync(logFile, "utf8").includes(needle)) return true
-		} catch {
-			// Log file not written yet.
-		}
+		if (capture.lines.join("\n").includes(needle)) return true
 		if (Date.now() >= deadline) return false
 		await wait(25)
 	}
@@ -210,10 +203,10 @@ describe("v2: genuine user message re-arms after user interrupt", () => {
 		// unprocessed, and everything after it (chunk silence, declaration,
 		// arm) shifts by the same lag. Polling the precondition beats
 		// assuming it (1-in-14 flake, 2026-10-11).
-		expect(await waitForLog(h.logFile, "idle/unknown -> busy", 5000)).toBe(true)
+		expect(await waitForLog(h.capture, "idle/unknown -> busy", 5000)).toBe(true)
 		// Wait out the 300ms chunk timeout until the watchdog declares the
 		// stall and arms the timer (200ms fuse from there).
-		const armed = await waitForLog(h.logFile, "resume attempt 1/3", 5000)
+		const armed = await waitForLog(h.capture, "resume attempt 1/3", 5000)
 		expect(armed).toBe(true)
 		history[SID] = [
 			userMessage("go", now - 60_000, "msg_u1"),
@@ -221,7 +214,7 @@ describe("v2: genuine user message re-arms after user interrupt", () => {
 		]
 		// The guard logs when it parks; absence of injection alone would not
 		// distinguish "parked" from "never fired".
-		const parked = await waitForLog(h.logFile, "parking recovery", 5000)
+		const parked = await waitForLog(h.capture, "parking recovery", 5000)
 		await teardown(h)
 		expect(parked).toBe(true)
 		expect(h.injected.filter((i: any) => i.sid === SID)).toHaveLength(0)

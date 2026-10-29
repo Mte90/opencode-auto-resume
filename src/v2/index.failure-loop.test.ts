@@ -1,8 +1,7 @@
 import { describe, test, expect } from "bun:test"
-import { rmSync, readFileSync, existsSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { rmSync } from "node:fs"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
@@ -26,7 +25,6 @@ const LOG_SALT = "IndexFailureLoopTest"
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_parent"
 
-let counter = 20000
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -70,8 +68,7 @@ const fail = { error: { type: "provider.internal", message: "upstream command ex
 async function setup(): Promise<any> {
 	const injected: Array<{ text?: string }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-failloop-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const ctx: any = {
 		event: stream,
@@ -92,7 +89,7 @@ async function setup(): Promise<any> {
 			loopMaxContinues: 99,
 			injectIntervalMs: 0,
 			subagentWaitMs: 40,
-			logFile,
+
 			debug: true,
 		},
 		session: {
@@ -111,15 +108,15 @@ async function setup(): Promise<any> {
 	return {
 		injected,
 		cleanup,
-		logFile,
+		capture,
 		streamRef: stream,
-		logs: () => (existsSync(logFile) ? readFileSync(logFile, "utf8") : ""),
+		logs: () => capture.lines.join("\n"),
 	}
 }
 
 async function teardown(h: any, keepLog = false) {
 	;(h.cleanup as (() => void) | undefined)?.()
-	if (!keepLog) rmSync(h.logFile, { force: true })
+	if (!keepLog) h.capture.stop()
 }
 
 async function driveFailure(h: any) {

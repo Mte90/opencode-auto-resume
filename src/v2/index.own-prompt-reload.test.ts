@@ -1,8 +1,7 @@
 import { describe, test, expect } from "bun:test"
-import { existsSync, readFileSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { rmSync } from "node:fs"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
@@ -43,7 +42,6 @@ const LOG_SALT = "IndexOwnPromptReloadTest"
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_own_prompt"
 
-let counter = 41000
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -96,8 +94,7 @@ const ownStallRecord = (at: number, id: string) => ({
 async function setup(extraOpts: Record<string, unknown> = {}, messages: any[] = []): Promise<any> {
 	const injected: Array<{ text?: string }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const ctx: any = {
 		event: stream,
@@ -117,7 +114,7 @@ async function setup(extraOpts: Record<string, unknown> = {}, messages: any[] = 
 			subagentWaitMs: 40,
 			// Without this the test writes into the PRODUCTION log, where a run is
 			// indistinguishable from a reload storm.
-			logFile,
+
 			debug: true,
 			...extraOpts,
 		},
@@ -141,16 +138,16 @@ async function setup(extraOpts: Record<string, unknown> = {}, messages: any[] = 
 
 	const cleanup = await (plugin as any).setup(ctx)
 	await wait(60)
-	return { injected, cleanup, logFile, streamRef: stream }
+	return { injected, cleanup, capture, streamRef: stream }
 }
 
 async function teardown(h: any) {
 	;(h.cleanup as (() => void) | undefined)?.()
-	rmSync(h.logFile, { force: true })
+	h.capture.stop()
 }
 
 const push = (h: any, type: string, sid: string, data: Record<string, unknown> = {}) => h.streamRef.push(ev(type, sid, data))
-const readLog = (h: any) => (existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : "")
+
 
 async function waitFor(what: () => boolean, budgetMs = 4000): Promise<boolean> {
 	const deadline = Date.now() + budgetMs
@@ -185,7 +182,7 @@ describe("v2: our own stall prompt is not a genuine user message", () => {
 		const h = await setup({}, messages)
 		push(h, "session.execution.started", SID)
 		await wait(120)
-		const logs = readLog(h)
+		const logs = h.capture.lines.join("\n")
 		await teardown(h)
 		expect(logs).toContain("newest user message is our own prompt")
 		expect(logs).not.toContain("new user message — restarting the stall ladder")
@@ -207,7 +204,7 @@ describe("v2: our own stall prompt is not a genuine user message", () => {
 		await waitFor(() => h.injected.length >= 2)
 		const attempts = h.injected.map((i: any) => attemptOf(i.text))
 		const retries = h.injected.map((i: any) => retryOf(i.text))
-		const logs = readLog(h)
+		const logs = h.capture.lines.join("\n")
 		await teardown(h)
 		expect(attempts.length).toBeGreaterThanOrEqual(2)
 		// The model produced nothing between the stalls, so the ATTEMPTS climb

@@ -1,8 +1,7 @@
 import { describe, test, expect } from "bun:test"
 import { rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
@@ -23,8 +22,6 @@ const LOG_SALT = "IndexDeliveryOnceTest"
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_parent"
-
-let counter = 4000
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -99,13 +96,12 @@ async function setup(opts: {
 }): Promise<any> {
 	const sends: Array<{ channel: string; text?: string }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-delivery-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const logMessages: unknown[] = opts.logMessages ?? []
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile, registryScope: LOG_SALT },
+		options: { ...OPTIONS, registryScope: LOG_SALT },
 		session: {
 			context: async () => [],
 			active: async () => ({ [SID]: {} }),
@@ -145,12 +141,12 @@ async function setup(opts: {
 
 	const cleanup = await (plugin as any).setup(ctx)
 	await wait(60)
-	return { sends, cleanup, logFile, streamRef: stream }
+	return { sends, cleanup, capture, streamRef: stream }
 }
 
 async function teardown(h: any) {
 	;(h.cleanup as (() => void) | undefined)?.()
-	rmSync(h.logFile, { force: true })
+	h.capture.stop()
 }
 
 const push = (h: any, type: string, sid: string, data: Record<string, unknown> = {}) => h.streamRef.push(ev(type, sid, data))
@@ -175,11 +171,10 @@ describe("v2: a disposed instance sends nothing more", () => {
 		const sent: string[] = []
 		const now = Date.now()
 		const stream = makeEventStream()
-		const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-disposed-${process.pid}-${counter++}.log`)
-		rmSync(logFile, { force: true })
+		const capture = capturePluginLogs()
 		const ctx: any = {
 			event: stream,
-			options: { ...OPTIONS, logFile, maxRetries: 1, registryScope: LOG_SALT },
+			options: { ...OPTIONS, maxRetries: 1, registryScope: LOG_SALT },
 			session: {
 				context: async () => [
 					{ type: "assistant", time: { created: now - 5_000 }, content: [{ type: "text", text: "working" }] },
@@ -213,7 +208,7 @@ describe("v2: a disposed instance sends nothing more", () => {
 		releasePrompt(new Error("transport blew up"))
 		await wait(300)
 		expect(sent.filter((s) => s.startsWith("synthetic:"))).toHaveLength(0)
-		rmSync(logFile, { force: true })
+		capture.stop()
 	})
 
 	test("prompt delivers-then-throws: no synthetic fallback", async () => {

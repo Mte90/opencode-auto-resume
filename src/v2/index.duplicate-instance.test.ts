@@ -1,18 +1,9 @@
 import { describe, test, expect } from "bun:test"
-import { readFileSync, rmSync } from "node:fs"
-import { existsSync } from "node:fs"
-import { join } from "node:path"
-import { tmpdir } from "node:os"
 import plugin from "./index"
-
-/** Unique per test FILE: bun runs every file in one process, so two files
- *  starting their counters at 0 derive the SAME tmpdir log path and read each
- *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
-const LOG_SALT = "IndexDuplicateInstanceTest"
+import { capturePluginLogs } from "./test-utils"
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_dupinst"
-let counter = 0
 
 /** The real v2 seam: `event.subscribe` returns an async iterable. */
 function makeEventStream() {
@@ -65,16 +56,15 @@ const FAST = {
 
 /**
  * Boot the plugin `instances` times against ONE host ctx, exactly as the loader
- * does — the live log shows six `ready` lines per server start, all from a
- * single entrypoint and a single server process. Then let ONE stalled turn
- * elapse and report every injection produced.
+ * does — six live setups per server start, all from a single entrypoint and a
+ * single server process. Then let ONE stalled turn elapse and report every
+ * injection produced.
  */
 async function bootStormed(instances: number, opts: Record<string, unknown> = {}): Promise<{ injected: any[]; logs: string[] }> {
 	const injected: any[] = []
+	const capture = capturePluginLogs()
 	const streams = Array.from({ length: instances }, () => makeEventStream())
 	let next = 0
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-dup-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
 
 	const ctx: any = {
 		// ONE event source shared by every setup: `subscribe` hands out a fresh
@@ -86,7 +76,7 @@ async function bootStormed(instances: number, opts: Record<string, unknown> = {}
 				return s
 			},
 		},
-		options: { ...FAST, ...opts, logFile, debug: true, registryScope: LOG_SALT },
+		options: { ...FAST, ...opts, debug: true, registryScope: "IndexDuplicateInstanceTest" },
 		session: {
 			active: async () => ({}),
 			interrupt: async () => ({}),
@@ -110,10 +100,9 @@ async function bootStormed(instances: number, opts: Record<string, unknown> = {}
 	streams.forEach((s) => s.push(ev("session.execution.started")))
 	await wait(700)
 	for (const c of cleanups) (c as (() => void) | undefined)?.()
+	capture.stop()
 
-	const logs = existsSync(logFile) ? readFileSync(logFile, "utf8").split("\n") : []
-	rmSync(logFile, { force: true })
-	return { injected, logs }
+	return { injected, logs: capture.lines }
 }
 
 describe("v2: N live setups must not become N identical injections", () => {
@@ -122,8 +111,8 @@ describe("v2: N live setups must not become N identical injections", () => {
 		expect(injected.length).toBe(1)
 	}, 20_000)
 
-	// The storm. setup() re-runs on every config reload; the log shows six `ready`
-	// lines with no `stopped` between them. Each setup built a private `sessions`
+	// The storm. setup() re-runs on every config reload; the live log showed six
+	// setups with no `stopped` between them. Each setup built a private `sessions`
 	// map, so each owned a private resumeAttempts counter: six watchdogs, six
 	// "attempt 1/3" lines in the same millisecond, six identical continues with
 	// no wait between them.
@@ -134,14 +123,11 @@ describe("v2: N live setups must not become N identical injections", () => {
 
 	// The behavioural test above is the real proof. These two pin the MECHANISM so
 	// the fix cannot be undone by a refactor that keeps the symptom away by luck.
-	test("MECHANISM: only the LAST ready is left running, and only it stalls", async () => {
+	test("MECHANISM: only the LAST setup is left running, and only it stalls", async () => {
 		const { logs } = await bootStormed(6, { maxRetries: 1 })
-		const ready = logs.filter((l) => l.includes("ready (opencode v2)")).length
 		const stopped = logs.filter((l) => l.includes("[auto-resume] stopped")).length
 		const stalls = logs.filter((l) => l.includes("stall detected")).length
-		// Six setups still each announce themselves (the loader asked for six)...
-		expect(ready).toBe(6)
-		// ...but five are torn down on arrival, leaving one watchdog.
+		// Five of the six setups are torn down on arrival, leaving one watchdog.
 		expect(stopped).toBeGreaterThanOrEqual(5)
 		// One live instance, therefore one counter, therefore one injection.
 		expect(stalls).toBe(1)

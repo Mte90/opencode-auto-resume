@@ -1,8 +1,6 @@
 import { describe, test, expect, mock } from "bun:test"
-import { rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import dispatcher from "./dispatch"
+import { capturePluginLogs } from "./v2/test-utils"
 
 describe("dispatch.ts — dual-shape plugin entry", () => {
     describe("shape contract", () => {
@@ -160,13 +158,12 @@ describe("dispatch.ts — dual-shape plugin entry", () => {
         let counter = 0
 
         test("without app key warns about ctx.app.version is missing", async () => {
-            const logFile = join(tmpdir(), `auto-resume-dispatch-test-${process.pid}-${counter++}.log`)
-            rmSync(logFile, { force: true })
+            const capture = capturePluginLogs()
 
             const stream = makeEventStream()
             const ctx: any = {
                 event: stream,
-                options: { toolTextCheckDelayMs: 0, logFile, registryScope: "DispatchTest" },
+                options: { toolTextCheckDelayMs: 0, registryScope: "DispatchTest" },
                 session: {
                     context: async () => [
                         {
@@ -191,28 +188,27 @@ describe("dispatch.ts — dual-shape plugin entry", () => {
             }
 
             const cleanup = await (dispatcher.setup as any)(ctx)
-            await new Promise(r => setTimeout(r, 100))
+            await new Promise(r => setTimeout(r, 200))
 
             try {
-                const logs = logFile ? (await import("node:fs")).readFileSync(logFile, "utf8").split("\n") : []
-                const warnLines = logs.filter((l: string) =>
+                // Check BEFORE stopping capture
+                const warnLines = capture.warns.filter((l: string) =>
                     l.includes("ctx.app.version is missing")
                 )
                 expect(warnLines.length).toBe(1)
             } finally {
+                capture.stop()
                 cleanup?.()
-                rmSync(logFile, { force: true })
             }
         })
 
         test("with proper app context emits no warning", async () => {
-            const logFile = join(tmpdir(), `auto-resume-dispatch-test-${process.pid}-${counter++}.log`)
-            rmSync(logFile, { force: true })
+            const capture = capturePluginLogs()
 
             const stream = makeEventStream()
             const ctx: any = {
                 event: stream,
-                options: { toolTextCheckDelayMs: 0, logFile, registryScope: "DispatchTest" },
+                options: { toolTextCheckDelayMs: 0, registryScope: "DispatchTest" },
                 session: {
                     context: async () => [
                         {
@@ -241,17 +237,17 @@ describe("dispatch.ts — dual-shape plugin entry", () => {
             }
 
             const cleanup = await (dispatcher.setup as any)(ctx)
-            await new Promise(r => setTimeout(r, 100))
+            await new Promise(r => setTimeout(r, 200))
 
             try {
-                const logs = logFile ? (await import("node:fs")).readFileSync(logFile, "utf8").split("\n") : []
-                const warnLines = logs.filter((l: string) =>
+                // Check BEFORE stopping capture
+                const warnLines = capture.warns.filter((l: string) =>
                     l.includes("ctx.app.version is missing")
                 )
                 expect(warnLines.length).toBe(0)
             } finally {
+                capture.stop()
                 cleanup?.()
-                rmSync(logFile, { force: true })
             }
         })
     })

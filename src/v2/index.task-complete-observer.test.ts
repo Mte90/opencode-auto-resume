@@ -1,8 +1,6 @@
 import { describe, test, expect } from "bun:test"
-import { existsSync, readFileSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /**
  * auto-resume CONSUMES the `task_complete` tool; it does not own it.
@@ -85,27 +83,25 @@ const userMessage = (text: string, at: number, id = `msg_u_${at}`) => ({
 type Harness = {
 	hooks: Map<string, (event: any) => unknown>
 	injected: Array<{ text?: string }>
-	logFile: string
+	capture: any
 	history: unknown[]
 	streamRef: any
 	cleanup: () => void
 }
 
-/** The log file, read fresh: the plugin keeps appending after setup. */
-const readLog = (h: Harness) => (existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : "")
+const readLog = (h: Harness) => h.capture.lines.join("\n")
 
 async function setup(opts: { toolRegistry?: boolean } = {}): Promise<Harness> {
 	const injected: Harness["injected"] = []
 	const hooks = new Map<string, (event: any) => unknown>()
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const history: unknown[] = [userMessage("do the work", OLD)]
 
 	const ctx: any = {
 		event: stream,
-		options: { registryScope: LOG_SALT, ...OPTIONS, logFile },
+		options: { registryScope: LOG_SALT, ...OPTIONS },
 		session: {
 			context: async () => history,
 			active: async () => ({}),
@@ -133,7 +129,7 @@ async function setup(opts: { toolRegistry?: boolean } = {}): Promise<Harness> {
 	return {
 		hooks,
 		injected,
-		logFile,
+		capture,
 		history,
 		streamRef: stream,
 		cleanup: cleanup as () => void,
@@ -142,7 +138,8 @@ async function setup(opts: { toolRegistry?: boolean } = {}): Promise<Harness> {
 
 async function teardown(h: any) {
 	;(h.cleanup as (() => void) | undefined)?.()
-}
+	h.capture.stop()}
+
 
 /** The tool call, as the registry reports it. */
 const toolCall = (opts: { completed?: boolean; content?: string; status?: string } = {}) => ({

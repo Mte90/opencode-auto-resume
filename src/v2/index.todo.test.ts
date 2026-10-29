@@ -1,8 +1,7 @@
 import { describe, test, expect } from "bun:test"
-import { existsSync, readFileSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { rmSync } from "node:fs"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
@@ -45,7 +44,6 @@ const SID = "ses_todo"
  * Every group carries a control.
  */
 
-let counter = 0
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -143,15 +141,14 @@ async function replay(
 	const storageWrites: string[] = []
 	const storageReads: string[] = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-todo-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	// The history grows turn by turn, exactly as a real session's does.
 	let history: unknown[] = []
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile, ...opts, registryScope: LOG_SALT },
+		options: { ...OPTIONS, ...opts, registryScope: LOG_SALT },
 		session: {
 			context: async () => history,
 			active: async () => ({}),
@@ -200,8 +197,7 @@ async function replay(
 	await wait(700)
 	;(cleanup as (() => void) | undefined)?.()
 
-	const logs = existsSync(logFile) ? readFileSync(logFile, "utf8").split("\n") : []
-	rmSync(logFile, { force: true })
+	const logs = capture.lines
 	return { injected, logs, storageWrites, storageReads }
 }
 
@@ -331,12 +327,11 @@ describe("v2: the todo list, read from the tool that owns it", () => {
 		// Both malformed shapes must fall back to the old behaviour instead.
 		for (const bad of [{ todos: "nope" }, { todos: [null, 7] }, null]) {
 			const stream = makeEventStream()
-			const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-todo-bad-${process.pid}-${counter++}.log`)
-			rmSync(logFile, { force: true })
+			const capture = capturePluginLogs()
 			const injected: unknown[] = []
 			const ctx: any = {
 				event: stream,
-				options: { ...OPTIONS, logFile, registryScope: LOG_SALT },
+				options: { ...OPTIONS, registryScope: LOG_SALT },
 				session: {
 					context: async () => [userMessage("ask", OLD), assistantMessage(CELEBRATED, Date.now())],
 					active: async () => ({}),
@@ -359,7 +354,7 @@ describe("v2: the todo list, read from the tool that owns it", () => {
 			}
 			await wait(600)
 			;(cleanup as (() => void) | undefined)?.()
-			rmSync(logFile, { force: true })
+			capture.stop()
 			expect(injected).toEqual([])
 		}
 	})

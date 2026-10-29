@@ -1,12 +1,7 @@
 import { describe, test, expect, setDefaultTimeout } from "bun:test"
-import { rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
-/** Unique per test FILE: bun runs every file in one process, so two files
- *  starting their counters at 0 derive the SAME tmpdir log path and read each
- *  other's writes. Discovered 2026-10-10 while chasing suite flakiness. */
 const LOG_SALT = "IndexUsageActivityTest"
 
 /**
@@ -91,11 +86,10 @@ const BASE_OPTS = {
 async function setup(history: unknown[], extraOpts: Record<string, unknown> = {}) {
 	const injected: Array<{ text?: string }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-usage-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 	const ctx: any = {
 		event: stream,
-		options: { ...BASE_OPTS, logFile, registryScope: LOG_SALT, ...extraOpts },
+		options: { ...BASE_OPTS, registryScope: LOG_SALT, ...extraOpts },
 		session: {
 			context: async () => history,
 			active: async () => ({}),
@@ -110,13 +104,14 @@ async function setup(history: unknown[], extraOpts: Record<string, unknown> = {}
 	return {
 		injected,
 		cleanup,
+		capture,
 		push: async (type: string, data: Record<string, unknown> = {}) => {
 			stream.push(ev(type, data))
 			await wait(10)
 		},
 		teardown: () => {
 			;(cleanup as (() => void) | undefined)?.()
-			rmSync(logFile, { force: true })
+			capture.stop()
 		},
 	}
 }
@@ -149,6 +144,7 @@ describe("v2: token flow counts as activity", () => {
 			await h.push("session.usage.updated", { tokens: usage(total) })
 			await wait(20)
 		}
+		h.capture.stop()
 		await h.teardown()
 		expect(h.injected).toEqual([])
 	}, 20000)
@@ -165,6 +161,7 @@ describe("v2: token flow counts as activity", () => {
 		}
 		await wait(200)
 		const count = h.injected.length
+		h.capture.stop()
 		await h.teardown()
 		expect(count).toBeGreaterThanOrEqual(1)
 	}, 20000)

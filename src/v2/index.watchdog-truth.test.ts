@@ -1,7 +1,6 @@
 import { describe, test, expect } from "bun:test"
-import { rmSync, readFileSync, existsSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { rmSync } from "node:fs"
+import { capturePluginLogs } from "./test-utils"
 import plugin from "./index"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
@@ -25,7 +24,6 @@ const LOG_SALT = "IndexWatchdogTruthTest"
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_parent"
 
-let counter = 19000
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -64,8 +62,7 @@ function makeEventStream() {
 async function setup(): Promise<any> {
 	const injected: Array<{ text?: string }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-watchtruth-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	// Prod shape: NO session.active, NO client. The only server truth available
 	// is the HTTP loopback (stubbed fetch here).
@@ -84,7 +81,6 @@ async function setup(): Promise<any> {
 			loopMaxContinues: 99,
 			injectIntervalMs: 0,
 			subagentWaitMs: 40,
-			logFile,
 			debug: true,
 		},
 		session: {
@@ -100,12 +96,12 @@ async function setup(): Promise<any> {
 
 	const cleanup = await (plugin as any).setup(ctx)
 	await wait(60)
-	return { injected, cleanup, logFile, streamRef: stream }
+	return { injected, cleanup, capture, streamRef: stream }
 }
 
 async function teardown(h: any) {
 	;(h.cleanup as (() => void) | undefined)?.()
-	rmSync(h.logFile, { force: true })
+	h.capture.stop()
 }
 
 const attemptOf = (text: string | undefined): string | null => {

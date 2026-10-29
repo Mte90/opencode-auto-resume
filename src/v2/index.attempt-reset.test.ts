@@ -1,8 +1,7 @@
 import { describe, test, expect } from "bun:test"
-import { existsSync, readFileSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { rmSync } from "node:fs"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
@@ -24,7 +23,6 @@ const LOG_SALT = "IndexAttemptResetTest"
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_parent"
 
-let counter = 11000
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -65,8 +63,7 @@ const ev = (type: string, sid: string, data: Record<string, unknown> = {}) => ({
 async function setup(extraOpts: Record<string, unknown> = {}): Promise<any> {
 	const injected: Array<{ text?: string }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-attemptreset-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const ctx: any = {
 		event: stream,
@@ -83,9 +80,7 @@ async function setup(extraOpts: Record<string, unknown> = {}): Promise<any> {
 			loopMaxContinues: 99,
 			injectIntervalMs: 0,
 			subagentWaitMs: 40,
-			// Without this the test writes into the PRODUCTION log, where a run is
-			// indistinguishable from a reload storm.
-			logFile,
+	
 			debug: true,
 			...extraOpts,
 		},
@@ -109,12 +104,12 @@ async function setup(extraOpts: Record<string, unknown> = {}): Promise<any> {
 
 	const cleanup = await (plugin as any).setup(ctx)
 	await wait(60)
-	return { injected, cleanup, logFile, streamRef: stream }
+	return { injected, cleanup, capture, streamRef: stream }
 }
 
 async function teardown(h: any) {
 	;(h.cleanup as (() => void) | undefined)?.()
-	rmSync(h.logFile, { force: true })
+	h.capture.stop()
 }
 
 const push = (h: any, type: string, sid: string, data: Record<string, unknown> = {}) => h.streamRef.push(ev(type, sid, data))
@@ -173,7 +168,7 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		// Model produces text (progress, no completion), then goes quiet.
 		push(h, "session.text.delta", SID, { assistantMessageID: "m1", delta: "new findings from the probe" })
 		await waitFor(() => h.injected.length >= 2)
-		const logs = existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : ""
+		const logs = h.capture.lines.join("\n")
 		await teardown(h)
 		const attempts = h.injected.map((i: any) => attemptOf(i.text))
 		const retries = h.injected.map((i: any) => retryOf(i.text))
@@ -221,7 +216,7 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		push(h, "session.tool.success", SID, { tool: "read", id: "call_1" })
 		await waitFor(() => h.injected.length >= 2)
 		const attempts = h.injected.map((i: any) => attemptOf(i.text))
-		const logs = existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : ""
+		const logs = h.capture.lines.join("\n")
 		await teardown(h)
 		// A successful tool IS work: the attempts reset to 1/3 ...
 		expect(attempts.slice(0, 2)).toEqual(["1", "1"])
@@ -263,7 +258,7 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		h.streamRef.push({ type: "shell.exited", data: { id: "sh_1", status: "exited", exit: 0 } })
 		await waitFor(() => h.injected.length >= 2)
 		const attempts = h.injected.map((i: any) => attemptOf(i.text))
-		const logs = existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : ""
+		const logs = h.capture.lines.join("\n")
 		await teardown(h)
 		expect(attempts.slice(0, 2)).toEqual(["1", "1"])
 		expect(ladderOf(logs).slice(0, 2)).toEqual(["1", "1"])
@@ -295,7 +290,7 @@ describe("v2: model progress between stalls restarts the attempt ladder", () => 
 		await waitFor(() => h.injected.length >= 2)
 		const attempts = h.injected.map((i: any) => attemptOf(i.text))
 		const retries = h.injected.map((i: any) => retryOf(i.text))
-		const logs = existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : ""
+		const logs = h.capture.lines.join("\n")
 		await teardown(h)
 		// The ladder keeps climbing, and the ordinal continues through the
 		// model's own turn (no genuine user message in between).

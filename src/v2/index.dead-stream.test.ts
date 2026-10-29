@@ -1,8 +1,6 @@
 import { describe, test, expect } from "bun:test"
-import { existsSync, readFileSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
@@ -133,12 +131,11 @@ async function replay(
 ): Promise<Harness> {
 	const injected: Harness["injected"] = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-deadstream-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const ctx: any = {
 		event: stream,
-		options: { ...OPTIONS, logFile, ...opts, registryScope: LOG_SALT },
+		options: { ...OPTIONS, ...opts, registryScope: LOG_SALT },
 		session: {
 			context: async () => [userTurn(), ...messages],
 			// The server's own record of what is running, which is what the
@@ -170,11 +167,10 @@ async function replay(
 		await wait(10)
 	}
 	await wait(700)
+	capture.stop()
 	;(cleanup as (() => void) | undefined)?.()
 
-	const logs = existsSync(logFile) ? readFileSync(logFile, "utf8").split("\n") : []
-	rmSync(logFile, { force: true })
-	return { injected, logs }
+	return { injected, logs: capture.lines }
 }
 
 /** Reasoning-only finish with plenty of output: the real dead stream. */
@@ -290,12 +286,11 @@ describe("v2: silent dead stream", () => {
 
 	test("a user-cancelled session is never resumed", async () => {
 		const stream = makeEventStream()
-		const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-deadstream-${process.pid}-${counter++}.log`)
-		rmSync(logFile, { force: true })
+		const capture = capturePluginLogs()
 		const injected: unknown[] = []
 		const ctx: any = {
 			event: stream,
-			options: { ...OPTIONS, logFile, registryScope: LOG_SALT },
+			options: { ...OPTIONS, registryScope: LOG_SALT },
 			session: {
 				context: async () => [userTurn(), finished({ output: 400 })],
 				active: async () => ({}),
@@ -315,8 +310,8 @@ describe("v2: silent dead stream", () => {
 			await wait(10)
 		}
 		await wait(600)
+		capture.stop()
 		;(cleanup as (() => void) | undefined)?.()
-		rmSync(logFile, { force: true })
 		expect(injected).toEqual([])
 	})
 
@@ -345,12 +340,11 @@ describe("v2: silent dead stream", () => {
 	test("CONTROL: a user-cancelled empty turn is never nudged", async () => {
 		// The user's stop is final, even when the turn delivered nothing.
 		const stream = makeEventStream()
-		const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-deadstream-${process.pid}-${counter++}.log`)
-		rmSync(logFile, { force: true })
+		const capture = capturePluginLogs()
 		const injected: unknown[] = []
 		const ctx: any = {
 			event: stream,
-			options: { ...OPTIONS, logFile, registryScope: LOG_SALT },
+			options: { ...OPTIONS, registryScope: LOG_SALT },
 			session: {
 				context: async () => [userTurn()],
 				active: async () => ({}),
@@ -370,8 +364,8 @@ describe("v2: silent dead stream", () => {
 			await wait(10)
 		}
 		await wait(600)
+		capture.stop()
 		;(cleanup as (() => void) | undefined)?.()
-		rmSync(logFile, { force: true })
 		expect(injected).toEqual([])
 	})
 
@@ -379,12 +373,11 @@ describe("v2: silent dead stream", () => {
 		// Two idle transitions with no new turn between them: the second finds
 		// the flag set and stays quiet. A new turn (markBusy) re-arms it.
 		const stream = makeEventStream()
-		const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-deadstream-${process.pid}-${counter++}.log`)
-		rmSync(logFile, { force: true })
+		const capture = capturePluginLogs()
 		const injected: unknown[] = []
 		const ctx: any = {
 			event: stream,
-			options: { ...OPTIONS, logFile, registryScope: LOG_SALT },
+			options: { ...OPTIONS, registryScope: LOG_SALT },
 			session: {
 				context: async () => [userTurn()],
 				active: async () => ({}),
@@ -407,7 +400,6 @@ describe("v2: silent dead stream", () => {
 		}
 		await wait(700)
 		;(cleanup as (() => void) | undefined)?.()
-		rmSync(logFile, { force: true })
 		expect(injected).toHaveLength(1)
 	})
 })

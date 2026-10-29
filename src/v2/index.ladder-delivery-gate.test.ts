@@ -1,8 +1,7 @@
 import { describe, test, expect } from "bun:test"
-import { existsSync, readFileSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { rmSync } from "node:fs"
 import plugin from "./index"
+import { capturePluginLogs } from "./test-utils"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
@@ -24,7 +23,6 @@ const LOG_SALT = "IndexLadderDeliveryGateTest"
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const SID = "ses_parent"
 
-let counter = 21000
 
 function makeEventStream() {
 	const queue: any[] = []
@@ -65,8 +63,7 @@ const ev = (type: string, sid: string, data: Record<string, unknown> = {}) => ({
 async function setup(extraOpts: Record<string, unknown> = {}): Promise<any> {
 	const injected: Array<{ text?: string }> = []
 	const stream = makeEventStream()
-	const logFile = join(tmpdir(), `auto-resume-${LOG_SALT}-${process.pid}-${counter++}.log`)
-	rmSync(logFile, { force: true })
+	const capture = capturePluginLogs()
 
 	const ctx: any = {
 		event: stream,
@@ -86,7 +83,7 @@ async function setup(extraOpts: Record<string, unknown> = {}): Promise<any> {
 			loopMaxContinues: 99,
 			injectIntervalMs: 0,
 			subagentWaitMs: 40,
-			logFile,
+			
 			debug: true,
 			...extraOpts,
 		},
@@ -110,16 +107,14 @@ async function setup(extraOpts: Record<string, unknown> = {}): Promise<any> {
 
 	const cleanup = await (plugin as any).setup(ctx)
 	await wait(60)
-	return { injected, cleanup, logFile, streamRef: stream }
+	return { injected, cleanup, capture, streamRef: stream }
 }
 
 async function teardown(h: any) {
 	;(h.cleanup as (() => void) | undefined)?.()
-	rmSync(h.logFile, { force: true })
 }
 
 const push = (h: any, type: string, sid: string, data: Record<string, unknown> = {}) => h.streamRef.push(ev(type, sid, data))
-const readLog = (h: any) => (existsSync(h.logFile) ? readFileSync(h.logFile, "utf8") : "")
 
 async function waitFor(what: () => boolean, budgetMs = 3000): Promise<boolean> {
 	const deadline = Date.now() + budgetMs
@@ -147,13 +142,13 @@ describe("v2: a declined inject must not consume a ladder rung", () => {
 		push(h, "session.step.failed", SID, FAIL)
 		await wait(50)
 		push(h, "session.step.started", SID, { agent: "build" })
-		await waitFor(() => readLog(h).includes("still busy and live at inject time"), 2000)
+		await waitFor(() => h.capture.lines.join("\n").includes("still busy and live at inject time"), 2000)
 		const afterDecline = h.injected.length
 		// Stall #2: nothing else happened, so this must still be the FIRST rung.
 		push(h, "session.step.failed", SID, FAIL)
 		await waitFor(() => h.injected.length > afterDecline, 3000)
 		const attempts = h.injected.map((i: any) => attemptOf(i.text))
-		const logs = readLog(h)
+		const logs = h.capture.lines.join("\n")
 		await teardown(h)
 		expect(afterDecline).toBe(0) // the declined fire delivered nothing
 		expect(attempts).toEqual(["1"]) // pre-fix this read ["2"]: the phantom rung
