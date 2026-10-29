@@ -1,0 +1,7490 @@
+/**
+ * opencode-auto-resume — adapted for OpenCode v2 plugin API.
+ *
+ * Port of https://github.com/Mte90/opencode-auto-resume (v1 hooks API) to the
+ * v2 promise-plugin API (`Plugin.define` + `ctx.event.subscribe()`).
+ *
+ * What changed vs. v1:
+ *  - Default export is `{ id, setup }` via `Plugin.define`; setup returns a cleanup fn.
+ *  - Events come from `ctx.event.subscribe()` (AsyncIterable) with flat payloads
+ *    (`{ type, data }`) instead of the v1 `event` hook (`{ type, properties }`).
+ *  - SDK calls are flattened: `ctx.session.prompt({ sessionID, text })`,
+ *    `ctx.session.interrupt({ sessionID })`, `ctx.session.active()`.
+ *  - Assistant text is accumulated from `session.text.delta` events for liveness;
+ *    `ctx.session.context()` (stable v2) supplies the authoritative final
+ *    assistant text at idle time — replacing v1's `session.messages()` polling.
+ *  - No `ctx.app.log` in v2: `ctx.app` is only `{name, version, channel}` (see
+ *    `packages/plugin/src/app.ts`), and v2 has no `app.log` endpoint. Console
+ *    output from a hosted plugin is not captured anywhere retrievable, so v1's
+ *    `ctx.client.app.log(...)` has no equivalent. This build therefore appends
+ *    to its own log file — see LOG_FILE below.
+ *  - Targets the stable v2 API (`@opencode/plugin`). Event names are unchanged
+ *    from the beta port; `session.execution.interrupted` now carries a `reason`.
+ *
+ * Detection/recovery features ported:
+ *  - Stalled stream watchdog (busy session with no events for chunkTimeoutMs)
+ *  - Execution/step failure recovery (`session.execution.failed`, `session.step.failed`)
+ *  - Provider retry awareness (`session.retry.scheduled`)
+ *  - Tool-call-printed-as-text detection + targeted recovery prompt
+ *  - "Ready to continue" / stalled-intent ("...:") nudges
+ *  - "Done" claim without work verification
+ *  - Hallucination loop guard (too many auto-continues → interrupt + resume)
+ *  - Subagent-awareness: does not recover a parent blocked on a running subagent
+ *  - Permission-awareness: never recovers while a permission dialog is open
+ *
+ * Install: drop this file in ~/.config/opencode/plugins/ (auto-loaded), or add:
+ *   { "plugins": [{ "package": "./plugins/auto-resume-v2.ts", "options": { ... } }] }
+ */
+
+/**
+ * v2 entrypoint shape.
+ *
+ * The package depends on `@opencode-ai/plugin`, which exports `Plugin` only as a
+ * *type* — `(input, options?) => Promise<Hooks>`. There is no runtime
+ * `Plugin.define` in it, so the previous `import { Plugin } from
+ * "@opencode/plugin"` did not resolve and the file could not be built or
+ * type-checked at all (see the build script, which only ever built v1's
+ * `src/index.ts`). The v2 contract is simply `{ id, setup }`, so define the
+ * identity helper locally rather than importing a symbol that does not exist.
+ */
+type AutoResumePlugin = {
+	id: string
+	setup: (ctx: AutoResumePluginInput) => unknown
+}
+
+const define = <T>(plugin: T): T => plugin
+
+import { appendFileSync, readFileSync, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs"
+import { homedir } from "node:os"
+import { dirname, isAbsolute, join } from "node:path"
+import { fileURLToPath } from "node:url"
+import { readFile } from "node:fs/promises"
+
+/**
+ * The subset of the v2 plugin input this plugin actually consumes. Typed
+ * structurally so the file type-checks standalone, without pinning a
+ * @opencode-ai/plugin version whose `Plugin` type describes the v1 contract.
+ */
+interface AutoResumePluginInput {
+	/** Per-plugin options from config. */
+	options?: Record<string, unknown>
+	/** Event stream (AsyncIterable of `{ type, data }`). */
+	event: { subscribe: (opts?: { signal?: AbortSignal }) => AsyncIterable<V2Event> }
+	/** Server-side session/messaging operations. */
+	session: Record<string, (...args: any[]) => any>
+	/**
+	 * Opencode API client, when the host provides one. Declared on the real
+	 * `@opencode-ai/plugin` `PluginInput` (`client: ReturnType<typeof
+	 * createOpencodeClient>`); typed here structurally so the file still
+	 * type-checks standalone. Optional: a host may not supply it, and every
+	 * use must degrade gracefully when it is absent.
+	 */
+	client?: { session: Record<string, (...args: any[]) => any> }
+	/**
+	 * Model catalogue. v2's `ModelDomain.get(providerID, modelID)` returns
+	 * `Model.Info`, whose `limit` is `{ context, input?, output }` — the usable
+	 * context window for context-saturation checks. Optional: a host may not
+	 * supply it, and the saturation check degrades to "no intervention".
+	 */
+	model?: { get: (providerID: string, modelID: string) => unknown }
+	/**
+	 * Installed-plugin inventory (`ctx.plugin.list()`). v2 removed the `config`
+	 * domain, so this is how a plugin detects that magic-context is present before
+	 * routing a saturated parent to it.
+	 */
+	plugin?: { list: () => Promise<unknown> }
+	/**
+	 * Key/value store scoped to the plugin (`ctx.storage.get/set/remove/scan`).
+	 *
+	 * Two consumers. It READS the todo list the installed todo tool writes —
+	 * auto-resume does not own that list. And since R1 it WRITES its own
+	 * `resume-quota/<sid>` records, so the rate-limit ladder survives a real
+	 * process restart. That used to ride on the log file, which is the worst
+	 * available channel: a 2MB rotation cap and a fixed 3000-line tail can drop
+	 * a live arm. `set`/`remove` are optional so a host that only offers `get`
+	 * still works — the ladder then simply falls back to the log markers.
+	 */
+	storage?: {
+		get: (key: string) => Promise<unknown>
+		set?: (key: string, value: unknown) => Promise<unknown>
+		remove?: (key: string) => Promise<unknown>
+	}
+	/**
+	 * Tool registry (`ctx.tool.transform` / `ctx.tool.list` / `ctx.tool.hook`).
+	 * v2 plugins register their own tools here, which is how `task_complete`
+	 * exists: there is no built-in equivalent in v2, so the plugin provides it.
+	 */
+	tool?: {
+		transform: (cb: (editor: AutoResumeToolEditor) => void) => Promise<unknown>
+		list: () => Promise<readonly unknown[]>
+		/** Observe every tool call: `execute.after` carries the tool name, the
+		 *  session and the result. This is how auto-resume watches the
+		 *  task_complete tool it does not own. */
+		hook?: (name: string, callback: (event: any) => unknown) => unknown
+	}
+	/** Application logger, when the host provides one. */
+	app?: { log?: (level: string, message: string) => unknown }
+}
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+interface ToolCallRecord {
+	toolName: string
+	at: number
+}
+
+/** Minimal structural view of a V2Event (avoids depending on client internals). */
+interface V2Event {
+	type: string
+	created: number
+	data?: Record<string, any>
+}
+
+/** The tool registry handle passed to `ctx.tool.transform`. */
+interface AutoResumeToolEditor {
+	add(tool: {
+		name: string
+		description: string
+		input: Record<string, unknown>
+		/**
+		 * `codemode: false` puts the tool in the MODEL'S OWN tool list. Without
+		 * it a plugin tool lands in the Code Mode catalog and is only reachable
+		 * through the `execute` runtime (packages/core/src/tool.ts) - the model
+		 * can then never call it. `namespace` and `permission` mirror the core
+		 * tool options.
+		 */
+		options?: { codemode?: boolean; namespace?: string; permission?: string }
+		execute: (input: any, context: { sessionID: string }) => Promise<{ content: string }>
+	}): void
+}
+
+interface SessionWatch {
+	createdAt: number
+	lastActivityAt: number
+	status: "busy" | "idle" | "unknown"
+	userCancelled: boolean
+	/** When the user-cancel latch was set. Re-arm requires an inbound user
+	 * message newer than this — otherwise a pre-interrupt message the plugin
+	 * simply hadn't observed yet would clear a latch it postdates. */
+	userCancelledAt: number
+	resumeAttempts: number
+	/**
+	 * Consecutive ladder restarts driven by trickled progress with no genuine
+	 * user message in between (ses_ed975114, 2026-10-10: 1/3 every ~3.5min
+	 * forever). Each refire doubles the silence fuse (cap x8) so slow
+	 * workers decay to patience instead of nagging on a fixed clock. Cleared
+	 * only by a genuine user message — never by lifecycle transitions.
+	 */
+	episodeRefires: number
+	/** Recoveries sent this episode, all paths that build stall text. Unlike the
+	 * ladder rung (which progress restarts) and episodeRefires (which counts only
+	 * progress restarts), this counts every fire so the nudge text can say which
+	 * recovery of the episode it is. Reset at the same genuine-episode sites. */
+	/**
+	 * The model produced output (text or a completed tool) since the last
+	 * nudge. Set at detection, consumed by a DELIVERED nudge: the retry count
+	 * must not move for a nudge the user never saw.
+	 */
+	workSinceNudge: boolean
+	/** How many times the model DID work after a nudge. The visible
+	 *  `retry #N`; it moves when the attempts reset, never with them. */
+	workRetries: number
+	/** Lifetime stall continues this genuine user episode. Unlike
+	 * `resumeAttempts` (restarted by model text) this only resets on a
+	 * genuine user message, so a model that keeps answering "done" cannot
+	 * stretch 1/3 forever. Past the max the session stands down. */
+	lifetimeContinues: number
+	lastRetryAt: number
+	/** Newest `session.retry.scheduled` for this session: the provider is
+	 * retrying this turn itself, so a stall that follows within
+	 * PROVIDER_RETRY_GRACE_MS is a transport fault, not model unresponsiveness. */
+	providerRetryAt: number
+	/** Last wall-clock a user-visible quota notice was sent (first arm +
+	 * budget-exhausted). One notice per episode: the stand-down itself is
+	 * silent by design, but a session that looks dead for hours with no
+	 * explanation reads as broken (ses_edd3d940, 2026-10-10). */
+	quotaNoticedAt: number
+	gaveUp: boolean
+	/** Timestamp of the last quota notice sent (dedupes back-to-back duplicates
+	 * from concurrent event paths; 100ms window). */
+	lastQuotaNoticeAt: number
+	/** User-paused: auto-resume will not inject or arm quota for this session
+	 * until explicitly resumed. Persisted via the marker file + storage. */
+	paused: boolean
+	/** Newest genuine (non-own-prompt) user message observed, by timestamp. Our
+	 * own injections travel as user messages but carry no new instructions, so
+	 * they must not read as the user taking over (see noteInboundUserMessage).
+	 * Compared against lastInjectAt to tell our episode continuing from the
+	 * user starting a new one. */
+	lastGenuineUserAt: number
+	/** Consecutive failure-driven recoveries with no model output between them.
+	 * A dead backend turns every injected continue into the next failure, so
+	 * without this the ladder cycles 1/3, 2/3, 3/3, gaveUp, abort+resume,
+	 * 1/3… forever, one user-visible prod per cycle (ses_ede801ca, 2026-10-09:
+	 * backend down, prods every ~90s indefinitely). Past FAILURE_LOOP_MAX the
+	 * session stands down until a genuine user turn or fresh model output —
+	 * and neither our own injections nor markBusy clear it, or the loop that
+	 * set it would clear it too. */
+	consecFailureRecovers: number
+	failureLoopLatched: boolean
+	aborting: boolean
+	/** Timestamp of the last plugin-initiated `session.interrupt()`. Any abort-shaped
+	 * event inside `SELF_ABORT_TTL_MS` of it is ours, not the user's. */
+	selfAbortAt: number
+	/** Count of plugin-initiated interrupts in the current `INTERRUPT_WINDOW_MS`. */
+	interruptsThisWindow: number
+	interruptWindowStart: number
+	/** Timestamp of the last recovery injection, for `injectIntervalMs` debouncing. */
+	lastInjectAt: number
+	/** Last injected prod text + assistant snapshot at prod time, for duplicate suppression. */
+	lastProdText: string
+	prodAssistantSnapshot: string
+	/** Tool/shell completions since the last successful prod. The
+	 * duplicate skip promises 'zero model progress' but text growth
+	 * plus in-flight tools cannot see a tool that ran silently. */
+	completedSinceProd: number
+	/** Successful tool/shell completions since the last successful prod.
+	 * Success-only on purpose: failures increment completedSinceProd but
+	 * must keep the ladder climbing (failure-loop latch owns that path).
+	 * Reset on every own-inject next to completedSinceProd. */
+	succeededSinceProd: number
+	/** Texts this plugin injected (visible channel posts them as real user
+	 * messages). `noteInboundUserMessage` must not read them as new user
+	 * instructions, or every injection re-arms the budgets it just spent and
+	 * the same errors refire on the next idle. Capped; identity is exact text. */
+	ownPromptTexts: string[]
+	recovering: boolean
+	/** Latched when a failure carries an OOC error that `continue` can never clear; recovery (continue + abort+resume) is refused until a genuine user/agent turn. */
+	oocLocked: boolean
+	oocLockReason: string | null
+	/** Latched when a failure names a model that no longer exists. Same shape as
+	 * oocLocked but for a different unresolvable class, and for the same reason:
+	 * attempt budgets live per instance and reset on reload, so only the class
+	 * stops a retry loop that spans restarts. */
+	permLocked: boolean
+	permLockReason: string | null
+	/** Occurrences of an indeterminate failure seen this turn; see
+	 * INDETERMINATE_ERROR_TYPES. Reset only by a genuine turn, so our own
+	 * recovery turns cannot keep clearing the count. */
+	indeterminateStrikes: number
+	/** True while one of our own recovery continues is in flight — distinguishes a self-caused execution.started from a genuine turn. */
+	selfRecovery: boolean
+
+	// Assistant text accumulation (v2 replacement for session.messages())
+	textParts: Map<string, string> // assistantMessageID -> accumulated text
+	lastAssistantText: string
+	lastAssistantMessageID: string | null
+
+	// Recovery budgets
+	toolTextAttempts: number
+	/** Turns ended with a tool call that never returned. Re-arms per request
+	 * like the other nudge budgets: a new user message means new work, and an
+	 * old stuck call says nothing about this one. */
+	stuckToolAttempts: number
+	continueTimestamps: number[]
+	doneClaimAttempts: number
+	/** Done-claim with todos still open. Separate from `doneClaimAttempts`: the two
+	 * prompts ask for different things, so spending one budget must not silence the other. */
+	doneClaimOpenTodosAttempts: number
+	/** Open-todos reminders (the celebration false positive). Persists across turns —
+	 * an open list does not become finished by the model saying it is. */
+	todoNudgeAttempts: number
+	intentNudgeAttempts: number
+	/** Set when the model's own completion signal was seen (a trailing 🎉).
+	 * Latches so a finished session stops being nudged. */
+	completionSignaled: boolean
+	/** When the latch above was set (Date.now()). Compared against genuine new
+	 * user messages: only work that arrived AFTER the latch re-opens it.
+	 * Without the timestamp the latch could only be cleared on lifecycle
+	 * transitions (markBusy) — but the watchdog re-marks busy from server truth
+	 * with no new work, which wiped freshly-set latches within seconds
+	 * (ses_ed33c0da, 2026-10-11: TASK COMPLETE latched at idle would have died
+	 * at the re-mark 1s later). Cleared alongside completionSignaled. */
+	completionSignaledAt: number
+	/** Set once the empty-idle instant nudge has fired for the current episode.
+	 * A turn that ends with nothing delivered gets exactly one quiet continue;
+	 * a new turn (markBusy) re-arms it. Without the flag every repeat idle
+	 * would nag a session that is legitimately quiet. */
+	emptyIdleNudged: boolean
+	/** The session's todo list, read from the todo tool's storage key. */
+	todos: Todo[]
+	todosFetchedAt: number
+	/** Consecutive `task_complete` acks with no new user message or other tool
+	 * work between them. Guards the ack self-loop, where the ack tool-result is
+	 * fed back and the model re-emits the tool instead of ending its turn. Persists
+	 * across busy/idle cycles by design. */
+	taskCompleteSignals: number
+	/** Failed tool calls by name, for the unknown-tool suggestion. Counted, not
+	 * latched: one bad call is a typo, two is a model that will not self-correct. */
+	/** When the orphan watch was armed: the moment the last busy subagent of this
+	 * session went idle. A parent still busy after that is the case this exists for.
+	 * null means not armed. */
+	orphanWatchStartAt: number | null
+	/** When the current orphan episode was ARMED, kept distinct from
+	 * orphanWatchStartAt (which the clock advances on every deferral). The user
+	 * guard compares against this so a deferral cannot "age out" the very
+	 * message it was deferring for: ses_ed726872 escalated 187ms after the
+	 * user spoke because nothing here compared arm-time to user-message-time. */
+	orphanWatchArmedAt: number | null
+	/** Last time the subagents of this session were polled, so the watchdog does not
+	 * ask the server on every tick. */
+	lastSubagentCheckAt: number
+	/** Whether this orphan episode has already tried waking its subagent. Without a
+	 * budget the same prompt goes out on every watchdog tick — v1's structure
+	 * assumed the subagent goes busy again, and a dead one never does. */
+	orphanRecoveryTried: boolean
+	/** The child this orphan episode already escalated for. ses_ed726872
+	 * (2026-10-11): a subagent that ended 2.5h earlier kept returning a
+	 * "crashed" verdict, so the parent was aborted + re-continued 8 times across
+	 * 3 hours — `orphanRecoveryTried` only bounds the WAKE attempt, and once
+	 * that fails every later crashed verdict escalates again. Recording the
+	 * child means one dead subagent can cost the parent exactly one abort;
+	 * a genuinely NEW stuck child still gets its own. */
+	orphanEscalatedChildSid?: string
+	/** The pending deferred pattern pass, if any. Held so a new idle can replace
+	 * it rather than stack a second judgement on the same turn, and so a new turn
+	 * can cancel it. */
+	toolTextTimer: ReturnType<typeof setTimeout> | null
+	/** The pending deferred stall-recovery inject, if any. Held so dispose
+	 * can cancel it: without this, a reloaded-away instance fires its
+	 * backoff timer after disposal and injects from a dead sessions map
+	 * (observed 2026-10-06: twin identical prods 5ms apart). */
+	recoverTimer: ReturnType<typeof setTimeout> | null
+	/** Generation counter for the recover timer. Incremented each time recover()
+	 * arms a new timer. Stale timer callbacks check this before injecting to
+	 * prevent duplicate nudges (observed 2026-10-23: twin identical prods). */
+	recoverGeneration: number
+	/** Tool calls started but not finished, tracked from the tool lifecycle events.
+	 * The orphan watch must never abort a session that is legitimately working. */
+	pendingTools: number
+	/** Snapshot of `pendingTools` taken at the `session.idle` transition, before
+	 * `markIdle()` zeroes the live counter. Idle does not mean nothing is in
+	 * flight — the event fires between steps while tools run — so any idle-path
+	 * check that reads the live counter always sees zero. Same class of bug the
+	 * `busyBefore` sample above guards against. */
+	toolsInFlightAtIdle: number
+	/** In-flight tool calls by call id, with start times. The busy-stall guard
+	 * defers recovery while young tools run (and never interrupts exempt names
+	 * like `compress`); unlike the bare `pendingTools` counter this carries the
+	 * ages the decision needs. Entries die with the watch; results remove them. */
+	inflightTools: Map<string, { name: string; at: number }>
+	/** Rate-limit ladder state. `rateLimitedAt` is the last quota decision
+	 * point, `rateLimitAttempts` counts served attempts in this episode, and
+	 * `awaitingQuotaRetry` arms the watchdog-tick gate. A fresh turn resets
+	 * all three: new activity means quota is available again. */
+	rateLimitedAt: number
+	rateLimitAttempts: number
+	awaitingQuotaRetry: boolean
+	unknownToolErrors: Map<string, number>
+	/** Set once a suggestion has been injected, so it is sent at most once per
+	 * user message rather than on every idle. */
+	unknownToolSuggestionSent: boolean
+	/** Tool parts already examined. The history is re-walked on every idle, so
+	 * without this the same error would be counted again each time. */
+	checkedToolPartIDs: Set<string>
+	/** How many times a `task_complete` call was overridden because todos were
+	 * still open. Bounded by `maxRetries` — past that the call is honoured, because
+	 * an unbounded block is its own kind of loop. */
+	taskCompleteOverrides: number
+	/** Id of the newest inbound user message already acted on, so a replayed or
+	 * re-delivered message does not re-arm the done-claim budgets. Identity, not
+	 * clock time — see noteInboundUserMessage. */
+	lastUserMessageID?: string
+	/** Timestamp fallback for the same check, for messages carrying no id. */
+	lastUserMessageSeenAt: number
+	/** Tokens currently in the context window, from `session.usage.updated`. */
+	lastTokenTotal: number
+	/** Saturation intervention is one-shot per turn, like v1's `contextWrapupAttempts`. */
+	contextWrapupAttempts: number
+	/** Set when a failure-triggered recovery is pending, so the delayed prompt isn't cancelled by the failure's own idle transition. */
+	pendingRecoveryArmed: boolean
+
+	// Guards
+	permissionPending: boolean
+	/** Timestamp of the latest `permission.asked` (stale-guard for the flag). */
+	permissionPendingAt: number | null
+	lastWasTaskTool: boolean
+	/** Cached verdict from `isSubAgentSession()`: true when the server reports a
+	 * `parentID` for this session, i.e. it is a child and must never be injected
+	 * into or interrupted. `undefined` = not yet resolved. */
+	isSubAgent?: boolean
+	idleSince: number | null
+	/** Last time the silent-reasoning sweep examined this session. Bounds the
+	 * history read to ~one per stall window per idle session. */
+	lastSilentReasoningCheck: number
+	/** Last time the watchdog's idle branch re-ran the stuck-tool pass. The
+	 * event-driven pass only sees a call that is ALREADY past the age gate when
+	 * `session.idle` fires; a call that was younger then ages into stuck with no
+	 * further idle event, so only the watchdog can still catch it. Throttled to
+	 * the stuck-tool age gate so a parked session costs ~one history read per
+	 * gate, not one per tick. Reset on a fresh turn, like lastSilentReasoningCheck. */
+	lastStuckToolCheck: number
+	/** Set while the session is mid native compaction — recovery must never interrupt it. */
+	compacting: boolean
+	/** Timestamp of the latest `session.compaction.started` (stale-guard for the flag). */
+	compactionStartedAt: number | null
+
+	// Tool-loop tracking
+	recentToolCalls: ToolCallRecord[]
+
+	// Agent/model from last step (informational logging only; sessions are stateful in v2)
+	agent?: string
+	model?: string
+	/** `Model.Ref` from the last step, for the usable-context lookup. */
+	modelRef?: { providerID: string; modelID: string }
+}
+
+export interface AutoResumeOptions {
+	chunkTimeoutMs?: number
+	gracePeriodMs?: number
+	stuckToolAgeMs?: number
+	/** Tool names the busy-stall path never interrupts (case-insensitive).
+	 * Default `["compress"]`: every tool gets the young-tool deferral, and
+	 * `compress` is additionally never interrupted while fresh;
+	 * `compress` is exempt because interrupting it mid-flight risks leaving
+	 * half-compacted state, the same reason compaction is never interrupted. */
+	neverInterruptTools?: string[]
+	checkIntervalMs?: number
+	maxRetries?: number
+	baseBackoffMs?: number
+	maxBackoffMs?: number
+	loopMaxContinues?: number
+	loopWindowMs?: number
+	/** Lifetime stall continues per genuine user episode. The per-stall
+	 * `maxRetries` ladder restarts on model text, so a model that keeps
+	 * replying "done" reads 1/3 forever — this caps total fires until a
+	 * genuine user message clears it. Default 9. */
+	lifetimeMaxContinues?: number
+	/** Minimum gap between recovery injections for one session. */
+	injectIntervalMs?: number
+	continuePrompt?: string
+	/**
+	 * When true, a stall continue is sent via `ctx.session.prompt()` — a real
+	 * user message visible in session history (cattleprod-style) — instead of
+	 * the hidden `ctx.session.synthetic({resume:true})`. Default true: the
+	 * intervention — and any loop — is self-evident in the transcript, which
+	 * is the point. Set false for the old hidden channel. Explicit option
+	 * wins; else `AUTO_RESUME_VISIBLE_CONTINUE` (`1`/`true`/`yes` = visible,
+	 * anything else set = hidden) wins over the default. (Options set via
+	 * the config `plugin` entry are dropped by this box's parser and the
+	 * top-level `env` block never reaches the plugin process, so code
+	 * default is the only live knob.)
+	 */
+	visibleContinue?: boolean
+	/**
+	 * When false, feature-correction nudges (unknown-tool suggestion, stuck-tool,
+	 * targeted pattern nudges) go through the visible prompt channel instead of
+	 * synthetic. Default true: the user cannot see the question, so the model
+	 * should not produce visible traffic for it — and every synthetic correction
+	 * already carries its own do-not-acknowledge order. Stall recovery always
+	 * stays visible so an intervention loop is self-evident.
+	 */
+	quietCorrections?: boolean
+	/**
+	 * When true (default), a stall continue names the stall reason, attempt
+	 * count, and remaining todos instead of sending bare "continue". A custom
+	 * `continuePrompt` always wins verbatim. Same channel and guards either way.
+	 */
+	richContinuePrompt?: boolean
+	toolTextRecoveryPrompt?: string
+	doneWithoutWorkPrompt?: string
+	actionIntentPrompt?: string
+	debug?: boolean
+	activeUserWindowMs?: number
+
+	// ---- Ported from v1 (Mte90/opencode-auto-resume#33) ----
+	/** v1 name for `maxRetries`. Still accepted so v1 configs port unchanged. */
+	maxRecoveryRetries?: number
+	/** How a stall is recovered: "continue" (default), "abort", or "off". */
+	busyStallStrategy?: "continue" | "abort" | "off"
+	/** Fraction of the usable context window that counts as saturated. */
+	contextSaturationThreshold?: number
+	/** Trigger native compaction on saturation for subagent sessions. */
+	subagentNativeCompactionEnabled?: boolean
+	/** Resume on action-intent detection (default true). */
+	resumeOnActionIntent?: boolean
+	/** Delay before the first session discovery sweep. */
+	discoveryDelayMs?: number
+	/** Quiet period after startup before stall recovery arms. */
+	warmupMs?: number
+	/** Minimum gap between recorded activity timestamps. */
+	minActivityGapMs?: number
+	/** Grace before a raw-tool-call-as-text check fires. */
+	toolTextCheckDelayMs?: number
+	/** Wait for a subagent to report before treating it as stalled. */
+	subagentWaitMs?: number
+	/** Successor setups inherit the watch map instead of starting blank.
+	 * Off by default (test files share one process); prod opts in so
+	 * session attach/restore stops restoring amnesia. */
+	shareWatchState?: boolean
+	/** Model profiles: operator can override per-provider or set defaults. */
+	modelProfiles?: Record<string, Partial<StallProfile>>
+	/** Default profile for fast (online) models. */
+	defaultFast?: Partial<StallProfile>
+	/** Default profile for slow (local) models. */
+	defaultSlow?: Partial<StallProfile>
+
+	/**
+	 * Which process-wide registry slot this instance owns.
+	 *
+	 * Unset (the production case) means the pid-wide slot, where a fresh setup
+	 * disposes its predecessor — that is what stops a reload storm stacking six
+	 * live instances. Set it, and this instance neither disposes nor is
+	 * disposed by instances using a different scope.
+	 *
+	 * Required for test harnesses: `bun test` runs every file in one process, so
+	 * without a per-file scope each file's setup kills the file before it.
+	 * Test-only; production has one instance per process.
+	 */
+	registryScope?: string
+	/** Outer bound: quiet past this with no error evidence reads as dead. */
+	subagentDeadMs?: number
+	/** Token floor for the silent-dead-stream heuristic. */
+	silentDeadStreamMinTokens?: number
+	/** Error names that mark a streaming failure. */
+	streamingFailureErrorNames?: string[]
+	/** Regex sources that mark a streaming failure message. */
+	streamingFailureMessagePatterns?: string[]
+	/** Regex sources that mark a "task is done" claim. */
+	doneClaimPatterns?: string[]
+	/** Regex sources that mark the model ready to continue. */
+	readyToContinuePatterns?: string[]
+	/** Prompt sent when a done-claim arrives with no work to show. */
+	doneWithoutDetailsPrompt?: string
+	/** Prompt sent when a tool call was emitted inside reasoning. */
+	thinkingToolRecoveryPrompt?: string
+	/**
+	 * Append this build's log here instead of the default path (opencode's
+	 * state root: `XDG_STATE_HOME`/opencode/auto-resume.log, else
+	 * `~/.local/state/opencode/auto-resume.log`).
+	 *
+	 * v2 removed v1's `app.log` endpoint, so this is the only retrievable
+	 * record of what the plugin did. The `AUTO_RESUME_LOG_FILE` environment
+	 * variable sets the same thing and wins over neither.
+	 */
+	logFile?: string
+	/**
+	 * Per-attempt cooldowns (ms) before a rate-limited session may be retried.
+	 * Gates, not timers: evaluated on each failure and each watchdog tick, so
+	 * nothing is lost to a reload. Past the ladder the session stays silent
+	 * until a genuine user turn. Default spans ~12h for overnight coverage.
+	 */
+	rateLimitCooldownsMs?: number[]
+	/** Bound (ms) on any single recovery send; see DEFAULT_SEND_TIMEOUT_MS. */
+	sendTimeoutMs?: number
+	/**
+	 * Inert delivery probe. Never affects behaviour; echoed in the `ready`
+	 * line so a config-options change can be verified without touching a
+	 * live knob. Bump the value to test delivery.
+	 */
+	configProbe?: string | number
+}
+
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+
+/**
+ * Where this build's log lines go, and why not somewhere official.
+ *
+ * v1 wrote through `ctx.client.app.log({ body: { service, level, message } })`,
+ * a real endpoint that landed in the opencode log file. v2 removed it:
+ * `ctx.app` is `{ name, version, channel }` (`packages/plugin/src/app.ts`),
+ * there is no `app` group in `packages/protocol/src/groups/`, and a hosted
+ * plugin's `console.log` is not captured by the OpenChamber process. Without
+ * this the plugin is completely silent — you cannot tell a working watchdog
+ * from a dead one, which is exactly the failure that made a stall
+ * indistinguishable from "nothing happened".
+ *
+ * Override with AUTO_RESUME_LOG_FILE. Size-capped so an unattended run cannot
+ * fill the disk.
+ */
+/**
+ * Where this plugin logs by default: under opencode's OWN state root.
+ *
+ * Mirrors the opencode core's resolution of its state files
+ * (`packages/client/src/effect/service.ts`): `XDG_STATE_HOME` when it is set
+ * to an absolute path, else `~/.local/state`, then `opencode/<file>`. The
+ * plugin follows the platform convention instead of hardcoding a path for one
+ * machine — it ships upstream (PR #37), and the previous default
+ * (`~/.local/state/opencode-v2/auto-resume.log`) pointed at a tree name
+ * specific to this box, so every other user got a log file in a directory
+ * unrelated to their opencode install.
+ */
+/**
+ * Does the opencode config list a task-complete plugin?
+ *
+ * The config is the decisive signal when the other plugin has not loaded yet:
+ * the load order IS the config order, so auto-resume can set up first and the
+ * live tool list cannot see the plugin that comes later. A missing or
+ * unreadable config answers false - the caller then PROVIDES the fallback,
+ * which is the safe direction (a duplicate tool is confusion, a missing one is
+ * a missing feature).
+ */
+export async function configMentionsTaskComplete(cfgPath: string): Promise<boolean> {
+	try {
+		const raw = await readFile(cfgPath, "utf8")
+		return /"[^"]*task-complete[^"]*"/i.test(raw)
+	} catch {
+		return false
+	}
+}
+
+export function defaultLogFile(): string {
+	const raw = process.env["XDG_STATE_HOME"]
+	const trimmed = typeof raw === "string" ? raw.trim() : ""
+	const stateHome = trimmed.length > 0 && isAbsolute(trimmed) ? trimmed : join(homedir(), ".local", "state")
+	return join(stateHome, "opencode", "auto-resume.log")
+}
+const LOG_FILE_MAX_BYTES = 2 * 1024 * 1024
+
+/**
+ * Append one line to `target`, best effort.
+ *
+ * Every failure here is swallowed on purpose: logging must never be the reason
+ * the watchdog stops running. The size check races harmlessly between
+ * processes — losing a line beats throwing.
+ */
+function appendLogFile(target: string, level: string, line: string): void {
+	try {
+		mkdirSync(dirname(target), { recursive: true })
+		try {
+			if (existsSync(target) && statSync(target).size > LOG_FILE_MAX_BYTES) {
+				writeFileSync(target, "")
+			}
+		} catch {
+			// Size check is an optimisation, not a requirement.
+		}
+		appendFileSync(target, `${new Date().toISOString()} ${level.toUpperCase().padEnd(5)} ${line}\n`)
+	} catch {
+		// Unwritable log dir, read-only fs, quota — none of these should
+		// propagate into the recovery path.
+	}
+}
+
+/**
+ * The command magic-context registers to reclaim context on a saturated parent.
+ * Sent through `session.command` rather than as prompt text, because prompt text is
+ * not expanded into a command.
+ */
+const CTX_WRAPUP_TRIGGER = "ctx-wrapup"
+
+// ---------------------------------------------------------------------------
+// Constants & defaults
+// ---------------------------------------------------------------------------
+
+// 45s -> 180s (2026-09-29): silence is the ONLY stall signal here, and 45s +
+// 3s grace misfires on a single shared GPU where one subagent turn legitimately
+// emits no events for over a minute. Widening the window is a mitigation, not
+// the principled fix — that is positive hang detection (a tool call stuck in
+// running/pending is a real hang; model generation is not), which changes
+// recovery semantics and is still an open decision.
+const DEFAULT_CHUNK_TIMEOUT_MS = 180_000
+const DEFAULT_CHECK_INTERVAL_MS = 5_000
+const DEFAULT_GRACE_PERIOD_MS = 3_000
+/** How old an unanswered tool part must be before the stuck-tool pass acts.
+ * Deliberately far shorter than the stall window: an idle session with an
+ * unfinished call is not 'maybe still working' — the turn already ended, so
+ * the only race is late-flushing results (seconds-scale, per the settle-delay
+ * design). 60s gives 20x margin over that while cutting the ~3min stall-window
+ * wait the pass used before (ses_edf403f5: parked 94 min on a wedged compress). */
+const DEFAULT_STUCK_TOOL_AGE_MS = 60_000
+/**
+ * Stall-path patience for tools that are legitimately long. A 60s gate fits
+ * interactive tools (read/write/edit: seconds-scale work), but a `shell`
+ * call is routinely minutes long — a full test suite runs 400s+ while
+ * emitting no events. Judging it by the 60s gate declared live work wedged:
+ * 2026-10-11, three stall injections in nineteen minutes onto a session
+ * running `bun test`, one telling the user to abandon the run. Shells get
+ * 10 minutes on the STALL path only: past that a shell is wedged for real
+ * and the stall answers normally. The idle stuck pass (turn already ended —
+ * an unfinished call there is abandoned, not running) keeps the flat 60s
+ * gate for every tool, so this changes WHEN a busy stall fires, never
+ * whether an abandoned call gets nudged.
+ */
+const LONG_RUNNING_TOOL_STALE_TTL_MS = 10 * 60_000
+const LONG_RUNNING_TOOLS = ["shell"]
+/** Random jitter (±ms) added to stall threshold to prevent UI minute-rounding collisions.
+ * Nudges on exact 3-min boundaries all show the same display minute.
+ * Seeded by session ID for deterministic behavior across reloads and tests. */
+const STALL_JITTER_MS = 60_000
+const DEFAULT_MAX_RETRIES = 3
+/** Providers known to be local (run on user's hardware). */
+const LOCAL_PROVIDERS = new Set([
+	"llama-server",
+	"ollama",
+	"llama.cpp",
+	"llama-cpp",
+	"vllm",
+	"text-generation-inference",
+	"tgi",
+	"lmstudio",
+	"koboldcpp",
+	"exllama",
+	"mlc-llm",
+	"ggml",
+	"llamacpp",
+])
+/** Session-specific stall profile based on model provider. */
+type StallProfile = {
+	chunkTimeoutMs: number
+	gracePeriodMs: number
+	maxRetries: number
+	lifetimeMaxContinues: number
+}
+const FAST_PROFILE: StallProfile = {
+	chunkTimeoutMs: 180_000,
+	gracePeriodMs: 3_000,
+	maxRetries: 3,
+	lifetimeMaxContinues: 9,
+}
+const SLOW_PROFILE: StallProfile = {
+	chunkTimeoutMs: 600_000,
+	gracePeriodMs: 60_000,
+	maxRetries: 5,
+	lifetimeMaxContinues: 20,
+}
+/** Consecutive failure-driven recoveries tolerated before the failure-loop
+ * latch stands the session down. Counts recoveries with no model output
+ * between them, not attempts: a dead backend fails every turn identically. */
+const FAILURE_LOOP_MAX = 3
+/** How long after a `session.retry.scheduled` a stall is still read as the
+ * provider's own retry rather than a fresh model stall. Wide enough to cover a
+ * backoff-plus-retry cycle: the prod still fires inside it, only the ladder
+ * escalation is held. */
+const PROVIDER_RETRY_GRACE_MS = 120_000
+const DEFAULT_BASE_BACKOFF_MS = 1_000
+const DEFAULT_MAX_BACKOFF_MS = 8_000
+const DEFAULT_LOOP_MAX_CONTINUES = 3
+const DEFAULT_LOOP_WINDOW_MS = 10 * 60_000
+const DEFAULT_LIFETIME_MAX_CONTINUES = 9
+const DEFAULT_DEBUG = false
+// Mirrors v1 (Mte90 e1b8374): an inbound user message this recent means the
+// user is engaged (likely composing), so idle nudges stand down. Was 15min here.
+const DEFAULT_ACTIVE_USER_WINDOW_MS = 5 * 60_000
+
+// ---- Defaults ported from v1 (Mte90/opencode-auto-resume#33) ----
+// v1 keeps SESSION_DISCOVERY_INTERVAL_MS as an internal constant rather than an
+// option, so it is not configurable here either. 60s matches v1.
+const DEFAULT_DISCOVERY_DELAY_MS = 5_000
+const DEFAULT_SESSION_DISCOVERY_INTERVAL_MS = 60_000
+const DEFAULT_WARMUP_MS = 15_000
+// Off by default: bun runs every test file in one process, so unconditional
+// sharing leaks watch state across tests (165 failures on record). Prod opts
+// in to sharing — sequential setups in one server process must inherit stall
+// memory, or every session attach restores amnesia (2026-10-09).
+const DEFAULT_SHARE_WATCH_STATE = false
+const DEFAULT_MIN_ACTIVITY_GAP_MS = 1_000
+const DEFAULT_TOOL_TEXT_CHECK_DELAY_MS = 3_000
+const DEFAULT_SUBAGENT_WAIT_MS = 15_000
+/** How long a busy subagent may go without producing anything before it counts
+ * as stuck. v1 used the same number, and a tool call still outstanding triples
+ * it, because a long tool is not a hung model. */
+const SUBAGENT_STUCK_MS = 60_000
+/** Outer bound: quiet past this with no error evidence reads as dead, not
+ * merely stuck. Between the stuck window and this bound a quiet child is
+ * waited on — a hung model must not sit forever, but a long-thinking one
+ * (coder blocks run many minutes on one shared GPU) must not read as
+ * crashed at 60s either. ses_ef1c822c 2026-10-06. */
+const DEFAULT_SUBAGENT_DEAD_MS = 60 * 60_000
+const SUBAGENT_RECOVERY_PROMPT =
+	"It looks like you may have stalled or timed out. Please retry the last operation or continue with the task."
+const DEFAULT_SILENT_DEAD_STREAM_MIN_TOKENS = 200
+const DEFAULT_CONTEXT_SATURATION_THRESHOLD = 0.85
+/** How long a fetched todo list is trusted before being re-read. */
+/** Cap on the remembered tool-part ids. Bounds a set that is otherwise fed one
+ * entry per tool part, on every idle, for the life of the session. */
+const CHECKED_TOOL_PART_IDS_MAX = 500
+
+/** Where the rate-limit ladder is mirrored so it survives a process restart
+ * (R1). A log file was the previous channel and is a bad one: a 2MB rotation
+ * cap plus a fixed 3000-line tail can drop a live arm. */
+const QUOTA_STATE_PREFIX = "resume-quota/"
+const COUNTER_STATE_PREFIX = "resume-counters/"
+const PAUSED_MARKER_FILE = `${process.env.HOME ?? ""}/.config/opencode/auto-resume.paused`
+/** Generous ceiling on a stored arm. The ladder horizon is minutes; this only
+ * exists so an abandoned record cannot haunt a session days later. */
+const QUOTA_STATE_MAX_AGE_MS = 48 * 3600_000
+
+const TODO_CACHE_TTL_MS = 3_000
+const DEFAULT_MAX_RECOVERY_RETRIES = 2
+// Referenced from FEATURE_GATED_OPTIONS docs; kept so the intended v1 default is
+// recorded next to the gate that explains why it is not applied yet.
+
+const DEFAULT_STREAMING_FAILURE_ERROR_NAMES = [
+	"ProviderError",
+	"APIError",
+	"StreamError",
+	"ConnectionError",
+	"TimeoutError",
+]
+
+const DEFAULT_STREAMING_FAILURE_MESSAGE_PATTERNS = [
+	"streaming response failed",
+	"stream.*fail",
+	"connection.*reset",
+	"connection.*closed",
+	"aborted due to timeout",
+]
+
+/**
+ * Canonical done-claim sources — single source of truth for the "task claims
+ * it is done" vocabulary. Two consumers build from this one list, which is
+ * why it exists: the string fallback below (compiled with flags "im" for the
+ * user-overridable `doneClaimPatterns` option) and the RegExp hard default
+ * (DONE_CLAIM_PATTERNS) drifted apart — the fallback lost its ^$ anchors and
+ * matched strictly more than the tested default. Both are now derived here,
+ * so the live path and the tested path can never disagree again.
+ */
+const DONE_CLAIM_PATTERN_SOURCES = [
+	"^task\\s+done[.!]*$",
+	"^done[.!]*$",
+	"^all\\s+done[.!]*$",
+	"^finished[.!]*$",
+	"^complete[.!]*$",
+	"^task\\s+complete[.!]*$",
+	"^task\\s+completed[.!]*$",
+	"^all\\s+tasks?\\s+complete[.!]*$",
+	"^all\\s+tasks?\\s+completed[.!]*$",
+	"^(?:i['’]?m\\s+)?done\\s+with\\s+task",
+	"\\bdone\\s+with\\s+(?:the\\s+)?(?:task|work|implementation)",
+	"\\bfinished\\s+(?:the\\s+)?(?:task|work|implementation)",
+	// ses_f2e3370c (2026-10-14): "All work complete." — a noun between
+	// all/everything and the verdict broke the match, and the stall ladder
+	// fired on a finished session. One optional word covers the shapes real
+	// deliveries take ("all work complete", "everything is finished");
+	// the verdict word is still required, so mid-work lines like "all tests
+	// pass so far, running integration next" still match nothing.
+	"\\b(?:all|everything)\\s+(?:[\\w-]+\\s+)?(?:is\\s+)?(?:complete|done|finished)",
+	"\\bnothing\\s+(?:else\\s+)?(?:left|remaining|to do)",
+]
+
+const DEFAULT_DONE_CLAIM_PATTERNS = [...DONE_CLAIM_PATTERN_SOURCES]
+
+const DEFAULT_READY_TO_CONTINUE_PATTERNS = [
+	"ready to continue with task",
+	"continuing with task",
+	"continue with task",
+	"proceeding with task",
+	"ready to proceed with task",
+	"will continue with task",
+	"moving on to task",
+]
+
+const THINKING_TOOL_RECOVERY_PROMPT =
+	"I noticed you have a tool call generated in your thinking/reasoning. " +
+	"Please execute it using the proper tool calling mechanism instead of keeping it in reasoning."
+
+const DONE_WITHOUT_DETAILS_PROMPT =
+	"Your last response claimed the task is complete but contained no work description. This is not acceptable. " +
+	"You MUST respond now with a full, detailed report of everything you did: " +
+	"for each file you modified, state the full path and the exact changes; " +
+	"list every command you ran to verify and its result; state the final outcome. " +
+	"Do NOT reply with 'done', 'task completed', or any short acknowledgment — " +
+	"your ONLY acceptable response right now is this detailed report. Write it now."
+
+/**
+ * Upper bound on how long a `shell.created` → `shell.exited` pair is trusted
+ * to mean "this session is busy". A shell that never reports an exit (session
+ * torn down, event dropped) would otherwise suppress recovery forever, so
+ * entries are pruned past this. Set well above any realistic long build.
+ */
+const SHELL_OPEN_MAX_MS = 30 * 60_000
+
+
+/** OOC (out-of-context) errors that `continue` can never clear — recovery is locked out on these. */
+const OOC_ERROR_RE = /exceeds the available context size|context size \(\d+\)|too large to compact|too many tokens|prompt is too long/i
+/** Exact `error.type` values a `continue` can never clear. These ARE opencode's
+ * own taxonomy (packages/llm/src/schema/errors.ts), read off the running binary's
+ * type->tag switch — not guesses. Each maps to a reason class whose
+ * `get retryable()` returns false there: Authentication:69, NoRoute:53,
+ * UnknownProvider:155, ContentPolicy:104. UnsupportedOperation and Unknown are NOT
+ * here — both proved broader than their names (transient aborts arrive as
+ * provider.unknown; ses_ee14d727 locked out 5+ min). They live in
+ * INDETERMINATE_ERROR_TYPES below: one retry, then latch.
+ *
+ * Exact strings, never a `provider.*` prefix: the same file marks RateLimit (:82)
+ * and ProviderInternal (:117) retryable, and Transport (:129) plus
+ * InvalidProviderOutput (:143) recover fine minutes later. A prefix match would
+ * gate all four.
+ *
+ * Not here on purpose: provider.rate-limit and provider.quota keep the cooldown
+ * ladder (15m -> 2h, ~12h total) — a 5h rolling quota needs more patience than a
+ * non-retryable verdict implies, and the ladder only retries behind a long gate.
+ */
+const PERMANENT_ERROR_TYPES = new Set([
+	"provider.auth",
+	"provider.no-route",
+	"provider.content-filter",
+])
+/** Types whose permanence is NOT established upstream, so they are not hard
+ * gates. `provider.unsupported-operation` is present in the shipped binary but
+ * absent from the dev union of packages/llm/src/schema/errors.ts, so no
+ * `get retryable()` was ever observable for it — unlike every other entry above,
+ * which can point at a line. Gating it on the first occurrence bets on a
+ * semantics nobody has read; never gating it would retry a wall forever. So: ONE
+ * recovery attempt, then latch. A genuinely transient condition survives the
+ * single retry, a permanent one costs one wasted turn instead of three, and the
+ * first occurrence is logged so a real `retryable` value can promote it to a hard
+ * gate. */
+const INDETERMINATE_ERROR_TYPES = new Set(["provider.unsupported-operation", "provider.unknown"])
+/** Occurrences of an indeterminate failure tolerated before latching. */
+const INDETERMINATE_STRIKES = 2
+/** HTTP statuses that are permanent whatever type is reported. 401/403 only:
+ * opencode's own text for them is "your authentication token may be missing or
+ * expired — try running `opencode auth login`" (provider/error.ts:61,64).
+ * Deliberately NOT 404 — provider/error.ts:26 says "openai sometimes returns 404
+ * for models that are actually available", and opencode treats an openai 404 as
+ * retryable. Nor 429/5xx, which are the transient rungs. */
+const PERMANENT_STATUS_CODES = new Set([401, 403])
+/** Permanent messages that are about the session's own HISTORY, so every retry
+ * re-sends the same broken payload. Measured on the live log: "Referenced
+ * reasoning item" recurred in one session ~17.6 minutes apart over ~4 episodes —
+ * the continues did not clear it. Both arrive as InvalidRequest upstream, which
+ * that source marks non-retryable. */
+const PERMANENT_HISTORY_RE =
+	/referenced (reasoning )?item [^\n]{0,80}not found|no tool output found for (function )?call/i
+/** Model-shape permanent failures, message-keyed, split in two because a 404
+ * splits them. opencode funnels a gone model through InvalidRequest ->
+ * `provider.invalid-request`, whose type is far too broad to gate on — the same
+ * type also carries provider state errors a retry survives. Neither literal
+ * string is in the opencode binary (both are provider passthroughs), which is
+ * exactly why these stay message-keyed. */
+/** The model itself is gone: permanent whatever the status, including 404. */
+const PERMANENT_GONE_RE =
+	/model\b.{0,80}\b(deprecat\w*|discontinued|retired|removed|no longer (available|supported|offered))\b|\bno llm route for\b/i
+/** "This model is not in the catalog" — permanent per source, EXCEPT behind a
+ * 404: provider/error.ts:26 says "openai sometimes returns 404 for models that
+ * are actually available" and opencode treats an openai 404 as retryable, so a
+ * 404 keeps recovering. Without the status (opencode's own ProviderModelNotFound
+ * catalog miss) it gates. */
+const PERMANENT_UNKNOWN_MODEL_RE =
+	/\b(model[_ ]?not[_ ]?found|model_not_found|unknown model|no such model|invalid model|unsupported model)\b/i
+/** Quota/rate-limit errors (observed: `{type:"provider.quota", message:"Rate
+ * limit exceeded. Please try again later."}`). An immediate continue retries
+ * straight into the ban, so these stand down on a gate ladder instead of the
+ * normal backoff. Gates, not timers: armed timeouts do not survive a reload.
+ * Throttle phrasing also matches (issue #46: "sent too many tokens ... in a
+ * short period, please wait before retrying") so it never reaches the OOC
+ * latch — maybeLockOoc defers to isRateLimitError first. */
+const RATE_LIMIT_RE = /rate.?limit|too many requests|\b429\b|quota exceeded|provider\.quota|provider\.free|insufficient.?quota|resource.?exhausted|overloaded|throttl|slow down|please wait|try again later|too many tokens.{0,120}(short period|wait|retr|throttl|slow|per (second|minute|hour|day)|rate|limit|quota)|free[ -]?limit|free usage limit reached|usage limit reached|connect a provider or subscribe/i
+/** Per-attempt cooldowns before a rate-limited session may be retried: 15m,
+ * 30m, 1h, then 2h out to ~12h of unattended coverage. Past the ladder the
+ * session stays silent until a genuine user turn. */
+const DEFAULT_RATE_LIMIT_COOLDOWNS_MS = [15, 30, 60, 120, 120, 120, 120, 120].map((m) => m * 60_000)
+/** Bound on any single recovery send (prompt/synthetic). A transport
+ * await that never settles stacks cascades that flush together as twins
+ * (ses_ee7dade1, 2026-10-07: two texts 5ms apart, one wedged minutes).
+ * Expiry flows into the normal throw path (log verify + fallback). */
+const DEFAULT_SEND_TIMEOUT_MS = 30_000
+/** Above this, a completed send logs a latency warning for forensics. */
+const SEND_SLOW_MS = 10_000
+
+
+/**
+ * Window after `session.interrupt()` during which any abort-shaped event is
+ * attributed to us rather than to the user. The runtime delivers
+ * `session.execution.interrupted` asynchronously, so a boolean `aborting` flag
+ * cleared on a fixed timer is not a reliable "this abort was mine" marker.
+ */
+const SELF_ABORT_TTL_MS = 30_000
+/** Interrupt-shaped failure signatures. v2 reports an interrupt as
+ * `{type:"aborted", message:"Step interrupted"}`, which the older
+ * `("interrupted by user" | type contains "cancel")` filter never matched. */
+const ABORT_ERROR_TYPE_RE = /^(abort|aborted|cancel|cancelled|canceled|interrupted)$/i
+const ABORT_ERROR_MSG_RE = /step interrupted|interrupted by user|request cancelled|request canceled|execution interrupted/i
+/** Hard cap on plugin-initiated interrupts. An interrupt persists an errored
+ * assistant message that the UI surfaces as a send failure, so it is a last
+ * resort, not a routine recovery step. */
+const MAX_INTERRUPTS_PER_WINDOW = 2
+const INTERRUPT_WINDOW_MS = 10 * 60_000
+/**
+ * Minimum gap between two recovery injections for the same session.
+ * Synthetic turns are not free: sending one to a session that is already
+ * running supersedes its in-flight step, which the runtime reports as
+ * "Step interrupted". Debouncing collapses the several independent recovery
+ * paths (stall watchdog, intent nudge, tool-loop nudge) into at most one
+ * injection per interval.
+ */
+const DEFAULT_INJECT_INTERVAL_MS = 15_000
+/** A user message landing within this of our last inject is treated as our
+ * own prompt for budget re-arm purposes (see noteInboundUserMessage). Same
+ * box, same clock; our prompt lands in about a second. A genuine user message
+ * coincidentally inside the window costs one request's worth of stale
+ * budgets — no loop — versus the recount loop this prevents. */
+const OWN_PROMPT_TIME_MS = 30_000
+
+const MAX_IDLE_SESSIONS = 50
+const IDLE_CLEANUP_MS = 10 * 60_000
+/** A compaction silent for this long without an ended/failed event is wedged — stale-clear the flag. */
+const COMPACTION_STALE_TTL_MS = 30 * 60_000
+/** A `permission.asked` unanswered this long is treated as abandoned — stale-clear the flag. */
+const PERMISSION_STALE_TTL_MS = 30 * 60_000
+/** An exempt tool (see `neverInterruptTools`) with no result after this long is
+ * wedged, not working — the exemption expires and the stall answers normally. */
+const NEVER_INTERRUPT_STALE_TTL_MS = 30 * 60_000
+const TEXT_BUFFER_TRIM_LEN = 20_000
+
+/**
+ * Tool-part states as reported by the v2 message projection.
+ *
+ * v2 never writes "pending": an in-flight tool part reads "running", and it
+ * settles to "completed" or "error". "pending" was the v1 spelling, so a guard
+ * that tested for it literally could never fire on v2.
+ */
+const TOOL_STATE_RUNNING = "running"
+/** Error text that must never be retried: policy guardrails, not failures. The
+ * safety net's own verdict ("Do not retry this operation or attempt any
+ * workaround") is authoritative — reissuing the call teaches circumvention
+ * (ses_edf403f5 15:59: shell blocked on secret.home, turn ended on it). */
+const NEVER_RETRY_RE = /blocked by cc safety net|do not retry|access to a sensitive path/i
+/** Readable text out of a tool part error/result payload, which arrives as a
+ * string or as `{type, message}` depending on the producer. "" when absent. */
+function toolErrorText(state: { error?: unknown; output?: unknown } | undefined): string {
+	const e = state?.error ?? state?.output
+	if (typeof e === "string") return e
+	if (e && typeof e === "object") {
+		const t = e as { type?: unknown; message?: unknown }
+		const parts = [t.type, t.message].filter((x): x is string => typeof x === "string" && x.length > 0)
+		if (parts.length > 0) return parts.join(" ")
+	}
+	return ""
+}
+/** Kept for v1-shaped payloads; harmless on v2. */
+const TOOL_STATE_PENDING = "pending"
+const TOOL_STATE_COMPLETED = "completed"
+
+/**
+ * Tools whose only real completion is the user answering. A `question` that
+ * comes back "error" was interrupted, not answered, so it must still hold the
+ * turn open.
+ */
+const AWAITING_USER_TOOLS = new Set(["question", "permission", "ask", "confirm"])
+
+/** The literal bare continue. Kept for `richContinuePrompt: false` (an explicit
+ * opt-out) and for v1 parity. Not the default — see SAFE_CONTINUE_PROMPT. */
+const CONTINUE_PROMPT = "continue"
+
+/**
+ * The default for every synthetic continue that has no richer prompt of its own.
+ *
+ * A bare "continue" is an unbounded instruction: it tells the model to keep
+ * going without saying what "going" means. Every liveness signal in this plugin
+ * is fallible — on 2026-10-11 a subagent that had been dead for 2.5 hours was
+ * still tracked, and the orphan watch aborted and re-continued the parent 8 times
+ * across 3 hours, twice on top of a live user message. When the signal is wrong
+ * the message is the last line of defence, and "continue" alone has none: a
+ * model that decides the next step on its own has nothing telling it to stop at
+ * the edge of the work it was given.
+ *
+ * So the guardrails ride along with the instruction, in the same words the stall
+ * path already uses (recover()'s rich prompt), which keeps every continue this
+ * plugin emits consistent:
+ *
+ *   Only continue work already in progress. Do not start anything new, and do
+ *   not take destructive or irreversible actions without explicit user approval.
+ *
+ * This bounds the blast radius of a false positive without changing WHEN the
+ * plugin intervenes — the detection logic is untouched. A configured
+ * `continuePrompt` still wins verbatim: an operator who sets it has said what
+ * they want.
+ */
+const SAFE_CONTINUE_PROMPT =
+	"continue\nOnly continue work already in progress. Do not start anything new, " +
+	"and do not take destructive or irreversible actions without explicit user approval."
+
+/**
+ * The empty-idle nudge has nothing in progress to continue — that is precisely
+ * what fired it — so the same sentence would be incoherent ("continue work
+ * already in progress" with no such work). Same guardrail, phrased for the case:
+ * if work WAS in flight, carry it; otherwise go back to the user rather than
+ * inventing a task.
+ */
+const SAFE_EMPTY_IDLE_PROMPT =
+	"continue\nIf work was already in progress, continue it and finish nothing else. " +
+	"Otherwise ask the user what to do next rather than starting something new. " +
+	"Do not take destructive or irreversible actions without explicit user approval."
+
+/**
+ * The `task_complete` acknowledgement texts.
+ *
+ * The ack is fed straight back into the model's turn, so a stuck model re-emits
+ * `task_complete` instead of ending with text. That is not hypothetical: v1
+ * recorded 27 consecutive acked calls with zero new user input. The first ack
+ * therefore carries an explicit stop instruction, the second warns, and the third
+ * throws so the turn is forced to end.
+ */
+const TASK_COMPLETE_ACK =
+	"Task completion acknowledged. No further continuation will be sent. " +
+	"End your turn now with a brief text reply — do not call task_complete or any other tool again " +
+	"unless the user sends a new message."
+
+const TASK_COMPLETE_REPEAT_WARNING =
+	"Task completion acknowledged already on your previous call — completion is recorded. " +
+	"End your turn now with a brief text reply. Do not call task_complete again; " +
+	"further repeat calls are rejected as errors."
+
+const TASK_COMPLETE_REPEAT_ERROR =
+	"task_complete already acknowledged twice with no new user message or tool work since — " +
+	"completion is recorded. End your turn with text and make no further tool calls."
+
+/** How many times a model must call a tool that does not exist before we name a
+ * replacement. One is a typo; two is a model that will not correct itself. */
+const UNKNOWN_TOOL_THRESHOLD = 2
+/** The tool list changes only when a plugin reloads, so a short cache is enough
+ * and it keeps the check off the registry on every idle. */
+const TOOL_IDS_CACHE_MS = 5 * 60_000
+/** Cap on the tool list quoted back to the model. A full dump of every tool on
+ * the box is itself a way to fill the context. */
+const UNKNOWN_TOOL_LIST_LIMIT = 20
+
+/** v1's wording, kept verbatim — the model has already seen this description. */
+const TASK_COMPLETE_DESCRIPTION =
+	"Signal that all work is complete and stop automatic continuation prompts. Call this ONLY after finishing everything requested. Call exactly once per completed round of work — repeat calls with no new user message in between are rejected."
+
+const TOOL_TEXT_RECOVERY_PROMPT =
+	"Your last message contained a raw tool call printed as text instead of being executed. " +
+	"Please use the proper tool calling mechanism to execute it."
+
+const DONE_WITHOUT_WORK_PROMPT =
+	"I need you to verify more carefully that you have actually completed all the required tasks. " +
+	"Your response indicated you're done, but no work was detected. Please check your todo list " +
+	"and complete any remaining work."
+
+const TOOL_LOOP_RECOVERY_PROMPT =
+	"I notice you've been calling the same tool multiple times in a row without making progress. " +
+	"Please step back and reassess your approach. Consider: " +
+	"1) Are you stuck in a loop? 2) Do you need different information first? " +
+	"3) Should you try a different tool or break the task into smaller steps? " +
+	"Take a moment to think about what's blocking you and propose a different strategy."
+
+const TASK_TOOL_HINTS = ["task", "agent", "subagent", "dispatch"]
+
+// ---------------------------------------------------------------------------
+// Pattern lists (ported verbatim from upstream where pure)
+// ---------------------------------------------------------------------------
+
+const TOOL_TEXT_PATTERNS = [
+	/<function\s*=/i,
+	/<function>/i,
+	/<\/function>/i,
+	/<parameter\s*=/i,
+	/<parameter>/i,
+	/<\/parameter>/i,
+	/<tool_call[\s>]/i,
+	/<\/tool_call>/i,
+	/<tool[\s_]name\s*=/i,
+	/<invoke\s+/i,
+	/<func(?:t|ti|tio|tion)?$/im,
+	/<par(?:a|am|ame|amet|amete|ameter)?$/im,
+	/<(?:edit|write|read|bash|grep|glob|search|replace|execute|run)\s*(?:\s[^>]*)?\s*(?:\/>|>)/i,
+	/{"type":\s*"function"/i,
+	/{"name":\s*"[a-zA-Z_]/i,
+	/\{\s*"type"\s*:?$/im,
+	/\{\s*"name"\s*:?$/im,
+]
+
+const TRUNCATED_XML_PATTERNS = [
+	{ open: /<function[^>]*>/i, close: /<\/function>/i },
+	{ open: /<parameter[^>]*>/i, close: /<\/parameter>/i },
+	{ open: /<tool_call[^>]*>/i, close: /<\/tool_call>/i },
+	{ open: /\{\s*"type"\s*:/i, close: /}/ },
+	{ open: /\{\s*"name"\s*:/i, close: /}/ },
+]
+
+const READY_TO_CONTINUE_PATTERNS = [
+	/ready to continue with task/i,
+	/continuing with task/i,
+	/continue with task/i,
+	/proceeding with task/i,
+	/ready to proceed with task/i,
+	/will continue with task/i,
+	/moving on to task/i,
+]
+
+const DONE_CLAIM_PATTERNS = DONE_CLAIM_PATTERN_SOURCES.map((s) => new RegExp(s, "im"))
+
+// Error signatures that indicate a transient streaming/provider failure worth retrying
+const STREAMING_FAILURE_MESSAGE_PATTERNS = [
+	"stream.*fail",
+	"stream.*timeout",
+	"connection.*reset",
+	"connection.*closed",
+	"connection.*error",
+	"socket.*hang",
+	"econnreset",
+	"etimedout",
+	"rate.?limit",
+	"overloaded",
+	"server error",
+	"internal error",
+]
+
+// ---------------------------------------------------------------------------
+// Pure helpers
+// ---------------------------------------------------------------------------
+
+function stripCodeBlocks(text: string): string {
+	return text.replace(/```[\s\S]*?```/g, "").replace(/`[^`\n]+`/g, "")
+}
+
+/**
+ * Trailing environment boundary markers (`@12@`-style ids the harness
+ * appends to stored message text) are metadata, not model prose. Left in
+ * place they defeat every end-anchored completion test: ses_ecca0ad6
+ * (2026-10-13) ended nine "TASK COMPLETE" deliveries with a marker and the
+ * stall ladder fired on every one despite the latch code being live and
+ * latching clean tails the same day. Strip trailing runs only — a mid-text
+ * mention is model prose and keeps its meaning.
+ */
+function stripBoundaryMarkers(text: string): string {
+	return text.replace(/(?:\s*@\d+@)+\s*$/, "")
+}
+
+function containsToolCallAsText(text: string): boolean {
+	if (text.length <= 10) return false
+	const stripped = stripCodeBlocks(text)
+	if (TOOL_TEXT_PATTERNS.some((pat) => pat.test(stripped))) return true
+	for (const { open, close } of TRUNCATED_XML_PATTERNS) {
+		if (open.test(stripped) && !close.test(stripped)) return true
+	}
+	return false
+}
+
+function containsReadyToContinuePattern(text: string, patterns: RegExp[] = READY_TO_CONTINUE_PATTERNS): boolean {
+	const lines = text.split("\n")
+	const lastLines = lines.slice(-3).join("\n")
+	return patterns.some((pat) => pat.test(lastLines))
+}
+
+function containsDoneClaimPattern(text: string, patterns: RegExp[] = DONE_CLAIM_PATTERNS): boolean {
+	const lines = text.split("\n")
+	const lastLines = lines.slice(-5).join("\n")
+	return patterns.some((pat) => pat.test(lastLines))
+}
+
+/**
+ * Explicit stop statements: the model stating it is stopping, distinct from
+ * claiming completion. Like celebrations these latch completion when no
+ * todos are open (ses_eec5ba74, 2026-10-07 — "No action needed … Stopping
+ * here" kept collecting nudges after the work was finished). Unlike the
+ * done-claim patterns these carry no completion assertion to challenge,
+ * so an explicit stop wins over the challenge below (ordered before it
+ * 2026-10-07: challenging a stopped true completion nags exactly the
+ * sessions this latch exists to quiet).
+ */
+const STOP_STATEMENT_PATTERNS: RegExp[] = [
+	/no action needed/i,
+	/\bstop(ping|ped)?\s+(here|there|now)\b[.!]*$/i,
+	// ses_ed726872 (2026-10-11): told to stop, answered "Stopping as instructed
+	// — no further runs ... Nothing launched, nothing pending from me", and the
+	// stall ladder fired two bare `continue`s anyway (latch never set). The
+	// branch listed only `to do|left|remaining|needed`, and a model saying
+	// "nothing pending from me" matched NONE of them. Same class as the stuck
+	// -tool gap — a narrow vocabulary deciding liveness — so the branch is
+	// widened to the shapes these messages actually take, rather than adding a
+	// pattern per wording.
+	//
+	// Clause discipline (this is the part that matters): a stop is only a stop
+	// if it is the LAST clause. The tail is split on any clause terminator —
+	// sentence punctuation, semicolon, or em/en dash — and each pattern must
+	// match the FINAL clause (allowing only short closing filler like "from me"
+	// / "for now"). Without that, "Stopping here for a moment, then continuing"
+	// or "No further action is needed for the sync; next I will run the audit"
+	// both read as completed stops and wrongly latch. Semicolon and dash are
+	// the terminators real stop-acks lean on.
+	/\bnothing\b[^.;:!?—–\n]*\b(further|else|pending|left|remaining|outstanding|launched|queued|scheduled|to do)\b[^.;:!?—–\n]*[.!]*$/i,
+	/\bno (further|additional|more) (action|work|steps?|runs?|anything)\b[^.;:!?—–\n]*[.!]*$/i,
+	/\bnone (pending|left|remaining|outstanding)\b[^.;:!?—–\n]*[.!]*$/i,
+	/\b(stopping|halt|halted|standing down|pausing|paused)\b[^.;:!?—–\n]*[.!]*$/i,
+	/\b(that'?s|thats|this is) (all|it|everything)\b[^.;:!?—–\n]*[.!]*$/i,
+	/\b(parked|not started|unstarted)\b[^.;:!?—–\n]*[.!]*$/i,
+	// ses_edd1eb51 (2026-10-09): the model ended two deliveries with a bare
+	// trailing "TASK COMPLETE" and the stall ladder fired 186s later — the
+	// system's own completion vocabulary written as text latched nothing.
+	// End-anchored like the stop patterns so mid-text mentions don't fire.
+	//
+	// Case discipline (2026-10-15): every completion pattern in this file is
+	// case-insensitive EXCEPT the system's own literal — bare "TASK COMPLETE"
+	// must read byte-exact, per the operator contract in docs/AGENTS-snippet.md
+	// ("The line must read exactly `TASK COMPLETE`"). A lowercase "task
+	// complete" is model prose, not the signal, and does not latch. The past
+	// tense ("task completed", any case) stays insensitive — it was never
+	// the literal.
+	/\bTASK COMPLETE\s*[.!]*\s*$/,
+	/\btask completed\s*[.!]*\s*$/i,
+	// Mined from live session tails (2026-10-15 review of the last model
+	// message of all 16 live sessions + 6 archived transcripts): standby
+	// phrasing is completion, not a pause. ses_f2ea7b7a "All done. Standing
+	// by for next instructions." latched only on the "All done" half — a bare
+	// "Standing by …" with no done-claim beside it matched nothing.
+	/\bstanding by\b[^.;:!?—–\n]*[.!]*$/i,
+	// ses_f2ea7797 "Ready when you have the next task." — the model is out of
+	// work and waiting on the user, which is done, not ready-to-continue
+	// (that family auto-sends `continue`; this one latches quiet). Deliberately
+	// NOT in READY_TO_CONTINUE_PATTERNS. The tail class excludes "?" — a
+	// question ("Ready for the next task?") is still-working, never a stop.
+	/\bready (?:when you have the|for your|for the) (?:next\s+)?(?:task|instruction)s?\b[^.;:!?—–\n]*[.!]*$/i,
+	// Waiting-for-user-input stop states (2026-10-17): when the model is
+	// blocked on user input (VM details, IP, SSH confirmation, etc.) it is
+	// out of work, not ready-to-continue. None of the patterns above match
+	// "nothing in progress" / "waiting on you" / "blocked on you", so the
+	// stall ladder kept firing `continue` into a parked session.
+	// Broadened 2026-10-17 per completion-phrases research (see
+	// completion-phrases-research.md): Aider, OpenHands, Continue, Cline,
+	// SWE-agent completion/blocked vocabulary.
+	/\bnothing in progress\b/i,
+	// P0: "waiting for/on X" where X is any user-referent.
+	/\bwaiting\s+(?:on|for)\s+(?:you|the user|your|my|the next|further)\b[^.;:!?—–\n]*[.!]*$/i,
+	// P0: "awaiting X" — formal verb form.
+	/\bawaiting\s+(?:you|the user|your|further|the next)\b[^.;:!?—–\n]*[.!]*$/i,
+	// P1: "blocked" + need/awaiting/on, including comma-separated "blocked, need your input".
+	/\bblocked\b[^.;:!?—–\n]*(?:\bneed\b|\bawaiting\b|\bon\b)[^.;:!?—–\n]*[.!]*$/i,
+	// P1: "on hold" / "holding off" blocked states.
+	/\b(?:on hold|holding off)\s+(?:pending|awaiting|waiting for)\s+(?:your|the user|further|the next)\b[^.;:!?—–\n]*[.!]*$/i,
+	// P1: "can't proceed without your input".
+	/\b(?:can'?t|cannot|unable to)\s+proceed\s+without\s+(?:your|the user)'?\s*(?:input|guidance|decision|approval|confirmation|direction)s?\b[^.;:!?—–\n]*[.!]*$/i,
+	// P2: "I need your input to continue" / "need clarification before I can continue".
+	/\b(?:i\s+)?need\s+(?:your|the user)'?\s*(?:input|guidance|decision|approval|confirmation|direction|clarification)s?\b[^.;:!?—–\n]*(?:\bto\s+continue\b|\bbefore\b)?[^.;:!?—–\n]*[.!]*$/i,
+	// P2: Aider literal blocked phrases.
+	/\bstop\s+and\s+wait\s+for\s+your\s+approval\b[^.;:!?—–\n]*[.!]*$/i,
+	/\bask\s+me\s+to\s+add\s+them\s+to\s+the\s+chat\b[^.;:!?—–\n]*[.!]*$/i,
+	// P2: SWE-agent bare FINISHED token (case-sensitive like TASK COMPLETE).
+	/\bFINISHED\s*[.!]*\s*$/,
+	// P3: passive complete forms.
+	/\bi\s+have\s+completed\s+(?:the\s+)?(?:task|work|implementation)\b[^.;:!?—–\n]*[.!]*$/i,
+	/\bthe\s+(?:task|work)\s+is\s+(?:finished|complete|done)\b[^.;:!?—–\n]*[.!]*$/i,
+	// P3: standing-by variants.
+	/\bready\s+when\s+you'?re\s+ready\b[^.;:!?—–\n]*[.!]*$/i,
+	/\bready\s+and\s+waiting\b[^.;:!?—–\n]*[.!]*$/i,
+]
+function containsStopStatement(text: string): boolean {
+	const lines = stripBoundaryMarkers(text).split("\n")
+	const lastLines = lines.slice(-3).join("\n")
+	// A stop claim that is immediately followed by a comma and a CONTINUING
+	// connective is not the end of the turn — the model kept going. Two shapes
+	// kept fooling the clause terminators above, because they separate with a
+	// bare comma and no semicolon/dash/period:
+	//   "Stopping here for a moment, then continuing with the migration."
+	//   "There is nothing pending on the first repo, so I moved to the second."
+	// A genuine stop may contain commas ("Nothing launched, nothing pending from
+	// me"), but never a comma followed by then/so/next/afterwards/and then.
+	//
+	// SCOPE: the final CLAUSE, not the whole window (2026-10-11). Both examples
+	// above put the connective in the SAME clause as the stop, which is the only
+	// thing this guard is about. Scanning all three lines vetoed on connective
+	// prose from unrelated COMPLETED sentences: a turn ending in a bare
+	// "TASK COMPLETE" drew a stall injection 186s later because an earlier line
+	// read "...a config fix, SO it changes what I do next time." The stop
+	// pattern matched and the guard discarded it — a safety vetoing the very
+	// signal it exists to protect, on text it was never written about. Same
+	// clause discipline the pattern block above already enforces; the guard was
+	// the one place it was missing. Sentence-ending punctuation is stripped
+	// first so a terminal "." cannot yield an empty final clause.
+	const trimmedTail = lastLines.trim().replace(/[.!?…]+$/, "")
+	const finalClause = trimmedTail.split(/[.;:!?—–]/).pop() ?? trimmedTail
+	if (/,\s*(then|so|next|now|afterwards?|and then)\b/i.test(finalClause)) return false
+	return STOP_STATEMENT_PATTERNS.some((pat) => pat.test(lastLines))
+}
+
+/**
+ * One predicate for "this turn declares itself finished", shared by the idle
+ * inspection and the busy-stall watchdog. ses_edd1eb51 (2026-10-09): a
+ * "TASK COMPLETE" delivery went quiet with no session.idle event, so the
+ * idle latch never ran and the stall ladder fired 186s later. The busy path
+ * must judge the same tail from history before firing.
+ */
+function turnEndsWithCompletionClaim(text: string): boolean {
+	return endsWithCelebration(text) || containsStopStatement(text)
+}
+
+/**
+ * True when a done-claim already carries a concrete work report.
+ *
+ * v1 asks for details once per done-claim and then trusts the answer. A length
+ * check cannot tell the difference between "Task done." (nothing was done) and
+ * a two-line summary, so v2 replaces the 400-char threshold with the same
+ * structural test v1 uses. Prompting again after a real report would loop
+ * forever (#26).
+ *
+ * Three signals, in order of specificity:
+ *   - a backticked span naming a dotted file: `src/index.ts`
+ *   - a bare path with a slash and a dotted extension: /a/b.py
+ *   - a report header: changed / verification / results / commands run
+ */
+function containsWorkDescription(text: string): boolean {
+	// Backticked span mentioning a dotted filename.
+	if (/`[^`\n]*\.[a-zA-Z0-9]{1,8}[^`\n]*`/.test(text)) return true
+	// Bare path with a slash and a dotted extension.
+	if (/[\w\-~.][\w\-.~\/]*\/[\w\-.~]*\.[a-zA-Z]{1,8}\b/.test(text)) return true
+	// Report section headers.
+	if (
+		/^(changed|modified|deleted|created|updated|renamed|moved|files?\s+changed|verification|verified|tests?(?:\s+run|\s+passing|\s+pass)?|results?|outcome|commands?\s+(?:run|executed))/im.test(
+			text,
+		)
+	)
+		return true
+	return false
+}
+
+/**
+ * True when the last assistant turn closes with a celebration emoji.
+ *
+ * A 🎉 is the model's own "I finished" signal, used to latch completion rather
+ * than keep nudging. Deliberately end-anchored: boundary markers come in
+ * beginning/end pairs, so an anywhere-in-tail check would latch on a closing
+ * marker that signifies structure, not completion. Only the last line counts.
+ * The emoji alone is not trustworthy: a model that finishes early celebrates
+ * early, and latching on that turns a false positive into silence. The todo
+ * cross-check that catches it lives at the call site, where the fetched list
+ * is in hand.
+ */
+function endsWithCelebration(text: string): boolean {
+	const lastLine = stripBoundaryMarkers(text).split("\n").filter((l) => l.trim().length > 0).pop() ?? ""
+	return lastLine.trim().replace(/[.!?]+$/, "").endsWith("🎉")
+}
+
+/**
+ * One entry of a session's todo list.
+ *
+ * Read from the todo tool that is already installed, not from a list this
+ * plugin keeps. The record shape is the one `todowrite` writes —
+ * `storage.set("todos/<sessionID>", {todos, updatedAt})` — so whatever todo
+ * tool the session uses is what this sees, and auto-resume never has to own a
+ * second copy that can drift.
+ */
+interface Todo {
+	content: string
+	status: "pending" | "in_progress" | "completed" | "cancelled"
+	priority: "high" | "medium" | "low"
+}
+
+function isOpenTodo(t: Todo): boolean {
+	return t.status === "pending" || t.status === "in_progress"
+}
+
+function getOpenTodos(todos: Todo[]): Todo[] {
+	if (!Array.isArray(todos)) return []
+	return todos.filter(isOpenTodo)
+}
+
+/**
+ * The prompt for a turn that claims to be finished with work still listed.
+ *
+ * Names the open items rather than saying "continue", because the model has
+ * already decided it is done — a bare continuation prompt gets answered with
+ * another done-claim. Falls back to a plain "continue" when the list is
+ * unusable, which is strictly better than sending an empty reminder.
+ */
+function buildOpenTodosReminder(todos: Todo[]): string {
+	if (!Array.isArray(todos)) return "continue"
+	const open = todos.filter(isOpenTodo)
+	if (open.length === 0) return "continue"
+	const list = open.map((t, i) => `${i + 1}. [${t.status}] ${t.content}`).join("\n")
+	const plural = open.length > 1 ? "s" : ""
+	const taskWord = open.length > 1 ? "tasks" : "task"
+	const thisWord = open.length > 1 ? "these" : "this"
+	return `You have ${open.length} unfinished task${plural}:\n${list}\n\nPlease continue working on ${thisWord} ${taskWord}.`
+}
+
+
+/** Candidate local server base URLs: env vars first, then /proc/self/cmdline.
+ *  `cmdline` is injectable so the port parsing is unit-testable without spawning
+ *  a process whose argv looks like a server invocation.
+ *
+ *  The /proc read is not belt-and-braces: under OpenChamber the server is spawned
+ *  as `opencode serve --hostname 127.0.0.1 --port <n>` and exports NO port env
+ *  var, so an env-only list comes back EMPTY and the HTTP source is never
+ *  attempted at all. Same mechanism the prompt-polisher uses, which is why its
+ *  HTTP DELETE reaches this same server.
+ */
+function serverBaseUrls(cmdline?: string): string[] {
+	const out: string[] = []
+	const push = (v: string | undefined) => {
+	if (typeof v !== "string" || !v) return
+	const url = v.startsWith("http") ? v : `http://127.0.0.1:${v.replace(/^:/, "")}`
+	if (!out.includes(url)) out.push(url.replace(/\/$/, ""))
+	}
+	const env = process.env
+	push(env.OPENCODE_SERVER_URL)
+	push(env.OPENCODE_URL)
+	push(env.OPENCODE_SERVER_PORT)
+	push(env.OPENCODE_PORT)
+	push(env.PORT)
+	try {
+		const raw = cmdline ?? readFileSync("/proc/self/cmdline", "utf8")
+		const argv = raw.split("\0")
+		const portFlag = argv.indexOf("--port")
+		if (portFlag !== -1 && argv[portFlag + 1]) {
+			const hostFlag = argv.indexOf("--hostname")
+			const host = hostFlag !== -1 && argv[hostFlag + 1] ? argv[hostFlag + 1] : "127.0.0.1"
+			push(`http://${host}:${argv[portFlag + 1]}`)
+		}
+	} catch {
+	// /proc unavailable (non-Linux): env vars only
+	}
+	return out
+}
+/** HTTP Basic for the local server, same derivation the prompt-polisher uses. */
+function serverHeaders(): Record<string, string> {
+	const pw = process.env.OPENCODE_SERVER_PASSWORD || process.env.OPENCODE_PASSWORD
+	if (!pw) return {}
+	return { Authorization: `Basic ${Buffer.from(`opencode:${pw}`).toString("base64")}` }
+}
+/**
+ * Normalize a `todowrite` tool input into a todo list, or `undefined` when it is
+ * not a usable list.
+ *
+ * An entry with an unrecognized status is KEPT (cast, not dropped): `isOpenTodo`
+ * treats only `pending`/`in_progress` as open, so an unknown status reads as
+ * closed. Dropping it would shrink the list, and a shrunken list is the
+ * dangerous direction - it makes real open work look finished.
+ */
+function normalizeTodoList(input: unknown): Todo[] | undefined {
+	if (input === null || typeof input !== "object") return undefined
+	const todos = (input as { todos?: unknown }).todos
+	if (!Array.isArray(todos)) return undefined
+	const out: Todo[] = []
+	for (const entry of todos) {
+	if (entry === null || typeof entry !== "object") continue
+	const e = entry as { content?: unknown; status?: unknown; priority?: unknown }
+	if (typeof e.content !== "string" || typeof e.status !== "string") continue
+	const todo: Todo = { content: e.content, status: e.status as Todo["status"], priority: "medium" }
+	if (typeof e.priority === "string") todo.priority = e.priority as Todo["priority"]
+	out.push(todo)
+	}
+	return out.length > 0 ? out : undefined
+}
+/**
+ * Canonical parser, mirroring opencode-todo-fork's `todosFromMessages` (the same
+ * routine is called `latestTodosFromMessages` in that repo's `src/tui-data.ts`):
+ * walk the messages, and for every COMPLETED `todowrite` tool part keep its
+ * normalized input. `todowrite` REPLACES the whole list, so the newest such call
+ * IS the current list.
+ *
+ * This is a deliberate copy rather than an import, and the reason is worth
+ * stating because it looks like an oversight otherwise. Plugins are loaded
+ * independently and there is no cross-plugin import contract: reaching into a
+ * sibling plugin's directory would tie auto-resume's ability to read a todo
+ * list to that plugin being installed at that exact path, and auto-resume has to
+ * work without it. The cost is that a fix to one copy is not automatically a fix
+ * to the other - so both copies carry the ordering note below, and both repos
+ * test the ranking rather than trusting it to stay in step.
+ *
+ * Order note: `/api/session/{id}/message` returns NEWEST FIRST, so a
+ * last-match-wins loop selects the OLDEST list - that bug shipped in two places
+ * before it was caught. Rank by timestamp instead, falling back to encounter
+ * order, and skip a malformed historical call while keeping the previous valid
+ * list.
+ *
+ * Returns `undefined`, never `[]`, so "no todos exist" stays distinguishable from
+ * "we could not look" - that distinction is what keeps this diagnosable instead of
+ * silently degrading.
+ */
+function todosFromMessages(messages: unknown): Todo[] | undefined {
+	if (!Array.isArray(messages)) return undefined
+	const candidates: { list: Todo[]; at: number | null; order: number }[] = []
+	let order = 0
+	for (const message of messages) {
+	if (message === null || typeof message !== "object") continue
+	const content = (message as { content?: unknown }).content
+	if (!Array.isArray(content)) continue
+	for (const part of content) {
+	if (part === null || typeof part !== "object") continue
+	const p = part as { type?: unknown; name?: unknown; state?: Record<string, any>; time?: any }
+	if (p.type !== "tool" || p.name !== "todowrite") continue
+	if (p.state?.status !== "completed") continue
+	const list = normalizeTodoList(p.state.input)
+	if (!list) continue
+	const t = p.state?.time ?? p.time ?? (message as { time?: any }).time ?? {}
+	const at = [t?.end, t?.start, t?.created].find((v: unknown) => typeof v === "number")
+	candidates.push({ list, at: typeof at === "number" ? at : null, order: order++ })
+	}
+	}
+	if (candidates.length === 0) return undefined
+	candidates.sort((a, b) => {
+	if (a.at !== null && b.at !== null && a.at !== b.at) return b.at - a.at
+	if ((a.at === null) !== (b.at === null)) return a.at === null ? 1 : -1
+	return a.order - b.order
+	})
+	return candidates[0]?.list
+}
+
+/** Model ends with ":" announcing intent without executing. */
+function containsActionIntent(text: string): boolean {
+	if (text.length <= 15) return false
+	const cleaned = text.replace(/<[a-zA-Z/?][^>]*>/g, "").trim()
+	const lines = cleaned.split("\n")
+	let lastLine = ""
+	for (let i = lines.length - 1; i >= 0; i--) {
+		if (lines[i].trim().length > 0) {
+			lastLine = lines[i].trim()
+			break
+		}
+	}
+	return lastLine.endsWith(":") && lastLine.length > 5 && lastLine.length < 500
+}
+
+/**
+ * True when a turn cleanly ends by handing control back to the user — a
+ * question, or an explicit prompt for their input. Nudging such a turn
+ * injects a synthetic `continue` that starts an in-flight step, and when the
+ * user's real reply then arrives it interrupts that step → "Step interrupted"
+ * (the execution.interrupted event). A hand-off turn is, by design, awaiting
+ * the user, so it must never be nudged.
+ */
+function isUserHandoff(text: string): boolean {
+	const lines = text.split("\n")
+	let last = ""
+	for (let i = lines.length - 1; i >= 0; i--) {
+		const t = lines[i].trim()
+		if (t.length > 0) {
+			last = t
+			break
+		}
+	}
+	if (!last) return false
+	if (last.endsWith("?") || last.endsWith("？")) return true
+	const patterns = [/let\s+me\s+know/i, /your\s+call/i, /up\s+to\s+you/i, /which\s+(would|do\s+you|option)/i, /should\s+I/i, /want\s+me\s+to/i, /would\s+you\s+like/i,
+		// ses_ed9e2ef9 (2026-10-10): an offer awaiting approval reads as a
+		// go-ahead once a bare continue lands behind it ("I can delete all
+		// the stopped containers…" + continue = deletion). Bare capability
+		// statements with no ask are deliberately NOT covered — "I can X."
+		// with nothing after it is ambiguous, and the scoped continue text
+		// above is what protects those.
+		/say\s+the\s+word/i, /give\s+the\s+go-?ahead/i, /if\s+you'?d\s+like/i]
+	return patterns.some((p) => p.test(last))
+}
+
+function backoffMs(attempt: number, base: number, max: number): number {
+	return Math.min(base * Math.pow(2, attempt - 1), max)
+}
+
+/** Silence-watchdog recover reasons look like "no activity for 186s". Shared
+ * by the stall-text builder (idle-field dedup) and recover (episode reset):
+ * only a silence stall can forgive tool progress, never a failure one. */
+function isSilenceReason(reason: string): boolean {
+	return /^no activity for \d+s/i.test(reason)
+}
+
+/** True while the provider has told us it is retrying this session's turn (see
+ * the `session.retry.scheduled` handler). Inside that window a stall belongs to
+ * the transport, not the model: the ladder holds its rung and never gives up on
+ * it (ses_eae46bb9, 2026-10-19). */
+function isProviderRetryFresh(w: SessionWatch, now = Date.now()): boolean {
+	return w.providerRetryAt > 0 && now - w.providerRetryAt < PROVIDER_RETRY_GRACE_MS
+}
+
+function isStreamingFailure(message: string, patterns: string[] = STREAMING_FAILURE_MESSAGE_PATTERNS): boolean {
+	const lower = message.toLowerCase()
+	if (!lower) return false
+	return patterns.some((pattern) => {
+		try {
+			return new RegExp(pattern, "i").test(lower)
+		} catch {
+			return lower.includes(pattern.toLowerCase())
+		}
+	})
+}
+
+/** True when an error `name` is one of the configured streaming-failure names. */
+function isStreamingFailureName(name: string, names: string[]): boolean {
+	return names.some((candidate) => candidate.toLowerCase() === name.toLowerCase())
+}
+
+/** Repeating tool-call patterns: A-A-A or A-B-A-B-A-B etc. */
+function detectPatternLoop(recentTools: string[]): boolean {
+	if (recentTools.length < 6) return false
+	for (const patternLen of [1, 2, 3]) {
+		if (recentTools.length < patternLen * 3) continue
+		const pattern = recentTools.slice(-patternLen)
+		let matches = 0
+		for (let i = recentTools.length - patternLen * 2; i >= 0; i -= patternLen) {
+			const slice = recentTools.slice(i, i + patternLen)
+			if (slice.length !== patternLen) break
+			if (!slice.every((t, idx) => t === pattern[idx])) break
+			matches++
+		}
+		if (matches >= 2) return true
+	}
+	return false
+}
+
+/** Edit distance, v1's implementation. Kept byte-for-byte in behaviour: the
+ * suggestion is only useful if it picks the same tool v1 would have. */
+function levenshtein(a: string, b: string): number {
+	const m = a.length
+	const n = b.length
+	if (m === 0) return n
+	if (n === 0) return m
+	let prev = new Array<number>(n + 1)
+	let curr = new Array<number>(n + 1)
+	for (let j = 0; j <= n; j++) prev[j] = j
+	for (let i = 1; i <= m; i++) {
+		curr[0] = i
+		for (let j = 1; j <= n; j++) {
+			const cost = a[i - 1] === b[j - 1] ? 0 : 1
+			curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
+		}
+		const tmp = prev
+		prev = curr
+		curr = tmp
+	}
+	return prev[n]
+}
+
+/**
+ * The closest registered tool name to one the model invented, or null.
+ *
+ * The threshold scales with the length of the wrong name — `max(2, len/2)` — so a
+ * short name is held to a near-exact match while a long one is allowed to be
+ * sloppy. Without that, a two-letter name would match almost anything and the
+ * suggestion would be noise.
+ */
+/**
+ * Names models invent for tools that exist under another name. Edit distance
+ * cannot bridge these ("bash"→"shell" is 4 against a threshold of 2), so the
+ * map is consulted before the fuzzy matcher. The target must be registered —
+ * an unguarded guess names a second nonexistent tool and teaches the model
+ * the registry lies.
+ */
+const TOOL_NAME_ALIASES: Record<string, string> = {
+	bash: "shell",
+}
+
+function resolveToolSuggestion(wrongName: string, available: string[]): string | null {
+	const alias = TOOL_NAME_ALIASES[wrongName.toLowerCase()]
+	if (alias && available.includes(alias)) return alias
+	return suggestClosestTool(wrongName, available)
+}
+
+function suggestClosestTool(wrongName: string, available: string[]): string | null {
+	const lower = wrongName.toLowerCase()
+	let best: string | null = null
+	let bestDist = Infinity
+	for (const id of available) {
+		const dist = levenshtein(lower, id.toLowerCase())
+		const threshold = Math.max(2, Math.floor(lower.length / 2))
+		if (dist < bestDist && dist <= threshold) {
+			bestDist = dist
+			best = id
+		}
+	}
+	return best
+}
+
+function trackToolCall(w: SessionWatch, toolName: string): boolean {
+	const now = Date.now()
+	w.recentToolCalls = w.recentToolCalls.filter((c) => now - c.at < 120_000)
+	w.recentToolCalls.push({ toolName, at: now })
+	const recentTools = w.recentToolCalls.slice(-12).map((c) => c.toolName)
+	if (recentTools.length < 6) return false
+	const lastTool = recentTools[recentTools.length - 1]
+	const consecutiveSame = recentTools.slice(-4).filter((t) => t === lastTool).length
+	if (consecutiveSame >= 4) return true
+	return detectPatternLoop(recentTools)
+}
+
+function short(sid: string): string {
+	return sid.length > 12 ? `…${sid.slice(-8)}` : sid
+}
+
+function sidOf(ev: V2Event): string | undefined {
+	const sid = ev.data?.sessionID
+	return typeof sid === "string" ? sid : undefined
+}
+
+/**
+ * Role of a history record, tolerant of every shape the transcript API uses.
+ *
+ * Audit 2026-10-10: production stores `{"role":"user","time":{"created":...}}`
+ * (verified in opencode.db), while the harness fed `{type:"user"}`. Six readers
+ * compared `.type` only and went blind in prod — the quota-restore guard failed
+ * OPEN, re-arming a ladder for a session the user had already continued, and the
+ * stuck-tool / silent-reasoning / subagent-crash detectors silently never fired.
+ * 938 tests passed because every fixture used `type`. Read the role HERE.
+ */
+function msgRole(m: unknown): string {
+	const mm = m as { role?: unknown; type?: unknown; info?: { role?: unknown } } | null | undefined
+	if (!mm || typeof mm !== "object") return ""
+	const v = mm.role ?? mm.type ?? mm.info?.role
+	return typeof v === "string" ? v : ""
+}
+
+/** Creation time of a history record; 0 when absent. Same tolerance as msgRole. */
+function msgAt(m: unknown): number {
+	const mm = m as { time?: { created?: unknown }; info?: { time?: { created?: unknown } } } | null | undefined
+	const t = mm?.time?.created ?? mm?.info?.time?.created
+	return typeof t === "number" ? t : 0
+}
+
+/**
+ * Readable body of a history record. The live projection is not uniform: some
+ * records carry a `content` array of parts, others a plain `text` string. The
+ * own-prompt check below needs the body in either shape - a miss here reads our
+ * own injection as a genuine user message.
+ */
+function messageTextOf(m: unknown): string | undefined {
+	const mm = m as
+		| { content?: Array<{ type?: string; text?: string }>; text?: unknown; info?: { content?: unknown } }
+		| null
+		| undefined
+	if (!mm || typeof mm !== "object") return undefined
+	if (Array.isArray(mm.content)) {
+		const parts = mm.content
+			.filter((p) => p?.type === "text" && typeof p.text === "string")
+			.map((p) => p.text as string)
+		if (parts.length > 0) return parts.join("\n")
+	}
+	if (typeof mm.text === "string" && mm.text.length > 0) return mm.text
+	if (typeof mm.info?.content === "string" && mm.info.content.length > 0) return mm.info.content
+	return undefined
+}
+
+/**
+ * Signatures of the prompts this plugin injects as visible user messages.
+ *
+ * Exact-text and recency matching are not enough on their own: the in-memory
+ * record of our own injections (ownPromptTexts / lastInjectAt) dies with the
+ * plugin instance, and a reload re-adopts a session whose newest user message
+ * is our OWN stall prompt. That prompt then reads as a genuine user message
+ * and resets the stall ladder AND the visible progress counter to 1/3 - the
+ * endless "attempt 1/3 (retry #1)" loop (ses_ea0141a1bffeX189yxDLHl1QDU,
+ * 2026-10-21: five consecutive stalls, every one of them "1/3 (retry #1)").
+ *
+ * The prompt body carries its own signature, so the message itself is the
+ * durable record of who wrote it.
+ */
+const OWN_PROMPT_SHAPES: RegExp[] = [
+	/^continue\s*\u2014\s*stalled\s*\(/,
+	/^continue\s*\nOnly continue work already in progress\./,
+	/^continue\s*\nIf work was already in progress,/,
+]
+
+function looksLikeOwnPrompt(text: string | undefined): boolean {
+	if (typeof text !== "string" || text.length === 0) return false
+	return OWN_PROMPT_SHAPES.some((re) => re.test(text))
+}
+
+function isTaskToolCall(ev: V2Event): boolean {
+	const tool = ev.data?.tool ?? ev.data?.toolName
+	if (typeof tool === "string") {
+		const lower = tool.toLowerCase()
+		if (TASK_TOOL_HINTS.some((h) => lower.includes(h))) return true
+	}
+	// Also inspect input for agent-ish payloads
+	const desc = ev.data?.input?.description ?? ev.data?.input?.subagent_type ?? ev.data?.input?.agent
+	return typeof desc === "string"
+}
+// ---------------------------------------------------------------------------
+// Plugin
+// ---------------------------------------------------------------------------
+
+/**
+ * The one live instance of this plugin in this process, if any.
+ *
+ * `setup()` is re-run by the loader on every config reload — the live log shows
+ * 2523 loads of this ONE entrypoint against a single server process, and bursts
+ * of SIX `ready` lines with no `stopped` between them. Every setup call builds
+ * its own `sessions` map, its own watchdog interval and its own event pump, so
+ * six live instances meant six private `resumeAttempts` counters: one stall
+ * produced six `resume attempt 1/3` lines in the same millisecond and six
+ * identical continues with no wait between them (2026-10-03, session
+ * ses_efcc2ade…kJmjQR3o). The counter was never broken — each copy had its own.
+ *
+ * Last-wins: a fresh setup disposes the previous instance before arming its own,
+ * so exactly one watchdog and one counter exist no matter how often the loader
+ * re-runs setup. Disposal is deliberately not left to the host, because the
+ * storms prove it does not always happen.
+ */
+/**
+ * The one live instance of this plugin in this PROCESS, shared across every
+ * evaluation of this bundle.
+ *
+ * It lives on `globalThis`, not in module scope, and that is the whole fix. The
+ * loader re-EVALUATES the plugin file on every config reload: the live log shows
+ * one entrypoint URL, one pid, and a fresh module identity each time
+ * (`mod=1812055.c6d4mu`, `.72a9tl`, `.dt27x7`, … six distinct copies inside one
+ * server process). Module scope cannot help, because each copy gets its own
+ * `activeInstance` — a singleton fix shipped that way and the storms continued
+ * (19:54:19, eight identical `resume attempt 1/3` lines in 5ms).
+ *
+ * `globalThis` is shared by all module instances in a process (verified on both
+ * node and bun), so a key here is the one channel that survives re-evaluation.
+ * Each setup finds its predecessor through the registry and disposes it before
+ * arming itself: last wins, so exactly one watchdog and one `resumeAttempts`
+ * counter exist however often the loader reloads us. Disposal cannot be left to
+ * the host, because the storms prove it does not always happen.
+ *
+ * Keyed by pid alone, and that was the claim to be wrong about: this comment
+ * read "Keyed by pid + plugin id ... two config trees (v1 and v2) ... must not
+ * dispose each other", but the key carried no plugin id, so two builds sharing
+ * a pid DID dispose each other. Nothing above ever needed a plugin id because
+ * a process hosts one build; `registryScope` is what makes the split real, for
+ * the test process that hosts many instances at once (see registryKeyFor).
+ */
+const REGISTRY_KEY = `__auto_resume_singleton__:${process.pid}`
+
+/**
+ * The registry slot this build instance owns.
+ *
+ * `registryScope` splits the slot. Without it the key is pid-wide, which is
+ * right for production (one config tree, one build: a fresh setup disposes
+ * its predecessor and the reload storm cannot stack instances) but WRONG for
+ * any process that holds two unrelated instances at once — a test suite most
+ * plainly. `bun test` runs all 79 files in ONE process, so file A's setup
+ * disposed file B's in-flight instance: `running = false`, event pump
+ * aborted, watchdog cleared. B's plugin was dead, and its assertions could
+ * never pass — they waited 10s for an event no longer being delivered, and
+ * every one of those tests passed in isolation (2026-10-10/11).
+ *
+ * The same hazard is real outside tests: two builds (v1 and v2) sharing a pid
+ * would silence each other, since only one can hold the pid-wide slot.
+ */
+function registryKeyFor(scope?: string): string {
+	return scope ? `${REGISTRY_KEY}:${scope}` : REGISTRY_KEY
+}
+
+type SingletonRegistry = {
+	live?: { dispose: () => void; mod: string; startedAt: number }
+	// Watch state shared across setup re-runs in one process. The loader
+	// re-evaluates this bundle on session attach/restore (bursts of several
+	// setups/second plus singles every ~25-40min on record 2026-10-09), and
+	// every setup used to start with a blank sessions map, making
+	// multi-minute stalls unobservable. Successors inherit the map instead;
+	// see the adoption below and the no-clear in dispose.
+	sessions?: Map<string, SessionWatch>
+}
+
+function singletonRegistry(scope?: string): SingletonRegistry {
+	const g = globalThis as unknown as Record<string, SingletonRegistry | undefined>
+	const key = registryKeyFor(scope)
+	let reg = g[key]
+	if (!reg) {
+		reg = {}
+		g[key] = reg
+	}
+	return reg
+}
+
+/**
+ * Identity of THIS module evaluation, stamped into the ready line.
+ *
+ * `pid` separates processes; `eval` separates module evaluations inside one
+ * process. Six distinct values under one pid is what exposed the real cause —
+ * keep this until the storms are gone, because it is the only way to tell a
+ * re-evaluation apart from a genuine second server.
+ */
+const MODULE_INSTANCE = `${process.pid}.${Math.random().toString(36).slice(2, 8)}`
+
+/**
+ * Host identity, for the reload forensics.
+ *
+ * `mod=` alone cannot tell a plugin reload from a host restart: every reload
+ * mints a new `eval` suffix, and a restart changes `pid` too. Uptime separates
+ * them — a plugin re-evaluated inside a long-lived host keeps a growing uptime
+ * and a constant `boot`, so a storm of mod ids under ONE boot is the plugin
+ * being re-imported, and a changing boot is opencode itself restarting.
+ * Measured 2026-10-08: 22 lifecycle lines in ten minutes, all pid 3686667 —
+ * re-evaluations inside one host, not host restarts.
+ */
+const HOST_UPTIME_S = Math.round(process.uptime())
+const HOST_BOOT = new Date(Date.now() - process.uptime() * 1000).toISOString()
+
+export default define({
+	id: "auto-resume.v2",
+
+	setup: async (ctx: AutoResumePluginInput) => {
+		const opts = (ctx.options ?? {}) as AutoResumeOptions
+		// Supersede any instance the loader left running — found through the
+		// process-wide registry, so it also catches instances belonging to OTHER
+		// evaluations of this bundle. Wrapped: a throwing predecessor must not
+		// block the new one from arming.
+		//
+		// Read before the registry: `registryScope` selects WHICH slot this
+		// instance owns, and instances in different slots never dispose each
+		// other (see registryKeyFor).
+		const registry = singletonRegistry(opts.registryScope)
+		// A second live instance means the host re-evaluated this bundle without
+		// disposing the first — the reload-storm signature. The predecessor's
+		// identity and age are captured HERE and logged later, because `log`
+		// closes over `logFile`, which is not initialised until well below this
+		// point: calling it from this block is a TDZ ReferenceError, and it only
+		// fires when a predecessor exists — i.e. never in a single-test process.
+		const superseded = registry.live
+		if (superseded) {
+			try {
+				superseded.dispose()
+			} catch {
+				/* predecessor already torn down */
+			}
+			registry.live = undefined
+		}
+		const registryScope = opts.registryScope
+
+		const chunkTimeoutMs = opts.chunkTimeoutMs ?? DEFAULT_CHUNK_TIMEOUT_MS
+		const checkIntervalMs = opts.checkIntervalMs ?? DEFAULT_CHECK_INTERVAL_MS
+		const gracePeriodMs = opts.gracePeriodMs ?? DEFAULT_GRACE_PERIOD_MS
+		const stuckToolAgeMs = opts.stuckToolAgeMs ?? DEFAULT_STUCK_TOOL_AGE_MS
+		const neverInterruptTools = (opts.neverInterruptTools ?? ["compress"]).map((n) => String(n).toLowerCase())
+		// `maxRecoveryRetries` is v1's name for the same knob. Prefer the v2 name,
+		// fall back to the v1 alias so an existing v1 config ports unchanged.
+		const maxRetries = opts.maxRetries ?? opts.maxRecoveryRetries ?? DEFAULT_MAX_RETRIES
+		const baseBackoff = opts.baseBackoffMs ?? DEFAULT_BASE_BACKOFF_MS
+		const maxBackoff = opts.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS
+		const loopMaxContinues = opts.loopMaxContinues ?? DEFAULT_LOOP_MAX_CONTINUES
+		const baseLoopMaxContinues = loopMaxContinues
+		const loopWindowMs = opts.loopWindowMs ?? DEFAULT_LOOP_WINDOW_MS
+		const lifetimeMaxContinues = opts.lifetimeMaxContinues ?? DEFAULT_LIFETIME_MAX_CONTINUES
+		const debug = opts.debug ?? DEFAULT_DEBUG
+		const activeUserWindowMs = opts.activeUserWindowMs ?? DEFAULT_ACTIVE_USER_WINDOW_MS
+		const injectIntervalMs = opts.injectIntervalMs ?? DEFAULT_INJECT_INTERVAL_MS
+		const envVisible = process.env.AUTO_RESUME_VISIBLE_CONTINUE
+		const visibleContinue =
+			opts.visibleContinue ??
+			(envVisible === undefined || envVisible === ""
+				? true
+				: /^(1|true|yes)$/i.test(envVisible))
+		const quietCorrections = opts.quietCorrections ?? true
+		const richContinuePrompt = opts.richContinuePrompt ?? true
+		const logFile = opts.logFile ?? process.env.AUTO_RESUME_LOG_FILE ?? defaultLogFile()
+		const rateLimitCooldownsMs =
+			Array.isArray(opts.rateLimitCooldownsMs) && opts.rateLimitCooldownsMs.length > 0 &&
+			opts.rateLimitCooldownsMs.every((n) => typeof n === "number" && n > 0)
+				? (opts.rateLimitCooldownsMs as number[])
+				: DEFAULT_RATE_LIMIT_COOLDOWNS_MS
+		const sendTimeoutMs = opts.sendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS
+		// Inert probe: proves `plugins[].options` reaches `ctx.options` without
+		// touching a live knob. Echoed in the `ready` line only.
+		const configProbe = opts.configProbe ?? null
+		// How long a parent may sit busy after its last subagent went idle before
+		// the orphan watch acts. v1 default, honoured for the first time here.
+		const subagentWaitMs = opts.subagentWaitMs ?? DEFAULT_SUBAGENT_WAIT_MS
+		const subagentDeadMs = opts.subagentDeadMs ?? DEFAULT_SUBAGENT_DEAD_MS
+		// How long to let a finished turn's text settle before judging it against the
+		// done/tool patterns. v1's default, and the reason v1 does not judge on idle
+		// at all — see inspectOnIdle.
+		const toolTextCheckDelayMs = opts.toolTextCheckDelayMs ?? DEFAULT_TOOL_TEXT_CHECK_DELAY_MS
+
+		// ---- Ported from v1 (Mte90/opencode-auto-resume#33) ----
+		const rawBusyStallStrategy = opts.busyStallStrategy ?? "continue"
+		const busyStallStrategy: "continue" | "abort" | "off" =
+			rawBusyStallStrategy === "abort" || rawBusyStallStrategy === "off" ? rawBusyStallStrategy : "continue"
+		// Feature-gated on v2 (see FEATURE_GATED_OPTIONS): accepted for config
+		// compatibility, not yet acted on. Not bound to locals so they cannot be
+		// mistaken for live behaviour.
+		const resumeOnActionIntent = opts.resumeOnActionIntent !== false
+		const warmupMs = opts.warmupMs ?? DEFAULT_WARMUP_MS
+		// Successor setups inherit the watch map instead of starting blank.
+		// Off unless prod opts in: test files share one process, so sharing
+		// by default leaks state across tests.
+		const shareWatchState = opts.shareWatchState ?? DEFAULT_SHARE_WATCH_STATE
+		// Live since the v2 discovery sweep landed (see discoverSessions).
+		const discoveryDelayMs = opts.discoveryDelayMs ?? DEFAULT_DISCOVERY_DELAY_MS
+		const minActivityGapMs = opts.minActivityGapMs ?? DEFAULT_MIN_ACTIVITY_GAP_MS
+		// Live since the v2 token read landed (see tokenTotalOf / checkContextSaturation).
+		const contextSaturationThreshold = opts.contextSaturationThreshold ?? DEFAULT_CONTEXT_SATURATION_THRESHOLD
+		const subagentNativeCompactionEnabled = opts.subagentNativeCompactionEnabled ?? false
+		// Live since the silent-dead-stream detector landed (lastSilentDeadStream).
+		const silentDeadStreamMinTokens = opts.silentDeadStreamMinTokens ?? DEFAULT_SILENT_DEAD_STREAM_MIN_TOKENS
+		const streamingFailureErrorNames = opts.streamingFailureErrorNames ?? DEFAULT_STREAMING_FAILURE_ERROR_NAMES
+		const streamingFailureMessagePatterns = opts.streamingFailureMessagePatterns ?? DEFAULT_STREAMING_FAILURE_MESSAGE_PATTERNS
+		const doneWithoutDetailsPrompt = opts.doneWithoutDetailsPrompt ?? DONE_WITHOUT_DETAILS_PROMPT
+		// Live since the todo read landed (see readTodos): a done-claim with items still
+		// listed gets this prompt instead of the details prompt.
+		const doneWithoutWorkPrompt = opts.doneWithoutWorkPrompt ?? DONE_WITHOUT_WORK_PROMPT
+		const thinkingToolRecoveryPrompt = opts.thinkingToolRecoveryPrompt ?? THINKING_TOOL_RECOVERY_PROMPT
+
+		/** Compile a user-supplied regex-source list, skipping anything invalid. */
+		function compilePatterns(
+			raw: string[] | undefined,
+			fallback: string[],
+			flags: string,
+		): RegExp[] {
+			const sources = Array.isArray(raw) && raw.length > 0 ? raw : fallback
+			const out: RegExp[] = []
+			for (const source of sources) {
+				try {
+					out.push(new RegExp(source, flags))
+				} catch {
+					// An invalid pattern is dropped rather than failing startup.
+				}
+			}
+			return out
+		}
+
+		const doneClaimPatterns = compilePatterns(opts.doneClaimPatterns, DEFAULT_DONE_CLAIM_PATTERNS, "im")
+		const readyToContinuePatterns = compilePatterns(
+			opts.readyToContinuePatterns,
+			DEFAULT_READY_TO_CONTINUE_PATTERNS,
+			"i",
+		)
+		const streamingFailureMessageRegexes = compilePatterns(
+			streamingFailureMessagePatterns,
+			DEFAULT_STREAMING_FAILURE_MESSAGE_PATTERNS,
+			"i",
+		)
+
+		// Options accepted but not yet acted on, because the v2 feature they tune
+		// is not ported. Listed (not warned) so an existing v1 config stays valid
+		// and the gap is documented rather than surprising. See
+		// docs/known-issues-v2.md.
+		//
+		// Empty: every v1 option this build understands is now applied. Kept as a
+		// list rather than deleted because the reporting below, and the
+		// accepted-but-inert= note in the startup line, are the only things a user
+		// has to go on when an option is quietly ignored — so the next one that
+		// arrives has somewhere to be listed.
+		const FEATURE_GATED_OPTIONS = [] as const
+
+		// Options this build understands. Anything else in the user's config is
+		// reported once at startup so a silent fallback is visible rather than
+		// looking like a bug. (Mte90/opencode-auto-resume#33)
+		const RECOGNISED_OPTIONS = new Set<string>([
+			"chunkTimeoutMs",
+			"checkIntervalMs",
+			"gracePeriodMs",
+			"maxRetries",
+			"maxRecoveryRetries",
+			"baseBackoffMs",
+			"maxBackoffMs",
+			"loopMaxContinues",
+			"loopWindowMs",
+			"lifetimeMaxContinues",
+			"debug",
+			"activeUserWindowMs",
+			"injectIntervalMs",
+			"visibleContinue",
+			"quietCorrections",
+			"richContinuePrompt",
+			"continuePrompt",
+			"toolTextRecoveryPrompt",
+			"actionIntentPrompt",
+			"doneWithoutWorkPrompt",
+			"busyStallStrategy",
+			"contextSaturationThreshold",
+			"subagentNativeCompactionEnabled",
+			"resumeOnActionIntent",
+			"discoveryDelayMs",
+			"warmupMs",
+			"minActivityGapMs",
+			"toolTextCheckDelayMs",
+			"subagentWaitMs",
+			"shareWatchState",
+			"registryScope",
+			"neverInterruptTools",
+			"subagentDeadMs",
+			"silentDeadStreamMinTokens",
+			"streamingFailureErrorNames",
+			"streamingFailureMessagePatterns",
+			"doneClaimPatterns",
+			"readyToContinuePatterns",
+			"doneWithoutDetailsPrompt",
+			"thinkingToolRecoveryPrompt",
+			"doneWithoutWorkPrompt",
+			"logFile",
+			"rateLimitCooldownsMs",
+			"sendTimeoutMs",
+			"stuckToolAgeMs",
+			"configProbe",
+			"modelProfiles",
+			"defaultFast",
+			"defaultSlow",
+		])
+		const unknownOptions = Object.keys(opts).filter((key) => !RECOGNISED_OPTIONS.has(key))
+		if (unknownOptions.length > 0) {
+			log(
+				"warn",
+				`ignoring unrecognised option(s): ${unknownOptions.join(", ")} — ` +
+					`this v2 build does not read them. See docs/known-issues-v2.md.`,
+			)
+		}
+		// Feature-gated options are valid but inert on v2. Reported in the startup
+		// line rather than as a warning — the user cannot act on it, so a per-start
+		// warn would be pure noise. See docs/known-issues-v2.md.
+		const gatedInUse = Object.keys(opts).filter((key) =>
+			(FEATURE_GATED_OPTIONS as readonly string[]).includes(key),
+		)
+
+		// Debug output goes to the same file as everything else. Console-only debug
+		// is invisible in v2 for the same reason the rest of the logging was, and
+		// debug is exactly when you are trying to work out what the plugin did.
+		const dbg = (...args: unknown[]) => {
+			if (!debug) return
+			appendLogFile(logFile, "debug", `[auto-resume:debug] ${args.map((a) => String(a)).join(" ")}`)
+			console.log("[auto-resume:debug]", ...args)
+		}
+
+		function log(level: "info" | "warn" | "error", msg: string) {
+			const line = `[auto-resume] ${msg}`
+			// v2 exposes no server log sink to plugins (ctx.app is
+			// {name,version,channel}), so the file is the only retrievable record.
+			appendLogFile(logFile, level, line)
+			// Console too: harmless when nobody captures it, and the reason the
+			// startup line is visible at all when running under `opencode serve`.
+			if (level === "error") console.error(line)
+			else if (level === "warn") console.warn(line)
+			else console.log(line)
+		}
+
+		// ---------------------------------------------------------------------
+		// State
+		// ---------------------------------------------------------------------
+
+		// Adopted, not fresh: see SingletonRegistry.sessions. A successor setup
+		// inherits the predecessor's watch map (stall clocks, ladders, latches)
+		// instead of starting blank. openShells stays per-instance: shells are
+		// transient and a stale entry would wrongly block nudges.
+		// Gated on shareWatchState: test files share one process, and
+		// unconditional sharing leaks watch state across tests.
+		const registryForState = singletonRegistry(registryScope)
+		let adoptedSessions = 0
+		let sessions: Map<string, SessionWatch>
+		if (shareWatchState) {
+			if (!(registryForState.sessions instanceof Map)) {
+				registryForState.sessions = new Map<string, SessionWatch>()
+			}
+			sessions = registryForState.sessions
+			adoptedSessions = sessions.size
+		} else {
+			sessions = new Map<string, SessionWatch>()
+		}
+
+		/**
+		 * Open shells from the process-registry event family, keyed by shell id
+		 * → `{ sessionID, startedAt }`. Populated by `shell.created`, cleared by
+		 * `shell.exited`. A session with an entry here is running a command and
+		 * must not be treated as a stalled parent.
+		 *
+		 * `shell.created` is the only shell event that carries its session, and it
+		 * nests it at `data.info.metadata.sessionID`; the exit events carry only
+		 * the shell id, so the reverse lookup has to be recorded here.
+		 */
+		const openShells = new Map<string, { sessionID: string; startedAt: number }>()
+
+		/** Number of shells currently open for `sid`, pruning stale entries. */
+		function openShellCount(sid: string, now = Date.now()): number {
+			let n = 0
+			for (const [id, s] of openShells) {
+				if (now - s.startedAt > SHELL_OPEN_MAX_MS) {
+					openShells.delete(id)
+					continue
+				}
+				if (s.sessionID === sid) n++
+			}
+			return n
+		}
+
+		/** Drop every shell entry owned by a session that no longer exists. */
+		function forgetShells(sid: string): void {
+			for (const [id, s] of openShells) {
+				if (s.sessionID === sid) openShells.delete(id)
+			}
+		}
+
+		function ensureWatch(sid: string): SessionWatch {
+			let w = sessions.get(sid)
+			// Migrate watches adopted from older builds. The sessions map is shared
+			// across setup re-runs (and the loader re-evaluates this bundle on every
+			// config reload), so a watch created before a field existed reads it as
+			// undefined: `undefined++` is NaN (shipped as "retry #NaN", 2026-10-12)
+			// and `for..of undefined` throws. Every field added after registry
+			// sharing began needs a default here, not just in the constructor below.
+			if (w) {
+				w.emptyIdleNudged ??= false
+				w.workRetries ??= 0
+				w.recoverGeneration ??= 0
+				w.lifetimeContinues ??= 0
+				w.inflightTools ??= new Map()
+				w.lastStuckToolCheck ??= 0
+				return w
+			}
+			if (!w) {
+				w = {
+					createdAt: Date.now(),
+					lastActivityAt: Date.now(),
+					status: "unknown",
+					userCancelled: false,
+					userCancelledAt: 0,
+					resumeAttempts: 0,
+					episodeRefires: 0,
+					workRetries: 0,
+				workSinceNudge: false,
+					lifetimeContinues: 0,
+					lastRetryAt: 0,
+					providerRetryAt: 0,
+					quotaNoticedAt: 0,
+					gaveUp: false,
+					lastQuotaNoticeAt: 0,
+					paused: false,
+					lastGenuineUserAt: 0,
+					consecFailureRecovers: 0,
+					failureLoopLatched: false,
+					aborting: false,
+					selfAbortAt: 0,
+					interruptsThisWindow: 0,
+					interruptWindowStart: 0,
+					lastInjectAt: 0,
+					lastProdText: "",
+					prodAssistantSnapshot: "",
+					completedSinceProd: 0,
+					succeededSinceProd: 0,
+					ownPromptTexts: [],
+					recovering: false,
+					oocLocked: false,
+					oocLockReason: null,
+					permLocked: false,
+					permLockReason: null,
+					indeterminateStrikes: 0,
+					selfRecovery: false,
+					textParts: new Map(),
+					lastAssistantText: "",
+					lastAssistantMessageID: null,
+					toolTextAttempts: 0,
+					stuckToolAttempts: 0,
+					continueTimestamps: [],
+					doneClaimAttempts: 0,
+					doneClaimOpenTodosAttempts: 0,
+					todoNudgeAttempts: 0,
+					intentNudgeAttempts: 0,
+					completionSignaled: false,
+					completionSignaledAt: 0,
+					emptyIdleNudged: false,
+					todos: [],
+					todosFetchedAt: 0,
+					taskCompleteSignals: 0,
+					taskCompleteOverrides: 0,
+					orphanWatchStartAt: null,
+					orphanWatchArmedAt: null,
+					orphanRecoveryTried: false,
+					toolTextTimer: null,
+					recoverTimer: null,
+					recoverGeneration: 0,
+					lastSubagentCheckAt: 0,
+					pendingTools: 0,
+					toolsInFlightAtIdle: 0,
+					inflightTools: new Map(),
+					rateLimitedAt: 0,
+					rateLimitAttempts: 0,
+					awaitingQuotaRetry: false,
+					unknownToolErrors: new Map(),
+					unknownToolSuggestionSent: false,
+					checkedToolPartIDs: new Set(),
+					lastUserMessageSeenAt: 0,
+					lastSilentReasoningCheck: 0,
+					lastStuckToolCheck: 0,
+					lastTokenTotal: 0,
+					contextWrapupAttempts: 0,
+					pendingRecoveryArmed: false,
+					permissionPending: false,
+					permissionPendingAt: null,
+					lastWasTaskTool: false,
+					idleSince: null,
+					compacting: false,
+					compactionStartedAt: null,
+					recentToolCalls: [],
+				}
+				sessions.set(sid, w)
+			}
+			return w
+		}
+
+		/** Resolve the stall profile for a session based on its model provider.
+		 * Reads w.model at call time to handle mid-session model switches.
+		 * Applies opts.modelProfiles (per-provider) and opts.defaultFast/defaultSlow. */
+		function resolveProfile(sid: string): StallProfile {
+			const w = sessions.get(sid)
+			const model = w?.model ?? ""
+			const provider = model.split("/")[0]?.trim().toLowerCase() ?? ""
+			const isLocal = LOCAL_PROVIDERS.has(provider)
+			let base: StallProfile = isLocal ? { ...SLOW_PROFILE } : { ...FAST_PROFILE }
+			const defaultOverride = isLocal ? opts.defaultSlow : opts.defaultFast
+			if (defaultOverride) base = { ...base, ...defaultOverride }
+			const providerOverride = opts.modelProfiles?.[provider] ?? opts.modelProfiles?.[model.split("/")[0]?.trim() ?? ""]
+			if (providerOverride) base = { ...base, ...providerOverride }
+			// opts values (when explicitly provided) override the profile defaults,
+			// so tests/configs that set chunkTimeoutMs etc. keep working.
+			const chunkTimeoutMs = opts.chunkTimeoutMs ?? base.chunkTimeoutMs
+			const gracePeriodMs = opts.gracePeriodMs ?? base.gracePeriodMs
+			const maxRetries = opts.maxRetries ?? opts.maxRecoveryRetries ?? base.maxRetries
+			const lifetimeMaxContinues = opts.lifetimeMaxContinues ?? base.lifetimeMaxContinues
+			return { ...base, chunkTimeoutMs, gracePeriodMs, maxRetries, lifetimeMaxContinues }
+		}
+
+		// ---- Pause / resume (user-controlled) ---------------------------------
+		// Source of truth: a marker file listing paused session ids (one per line)
+		// or "*" for all. Written by the CLI helper and the /auto-resume command.
+		let pausedCacheMtime = 0
+		let pausedCacheSet: Set<string> = new Set()
+		function readPausedSet(): Set<string> {
+			try {
+				const st = statSync(PAUSED_MARKER_FILE)
+				if (st.mtimeMs === pausedCacheMtime) return pausedCacheSet
+				pausedCacheMtime = st.mtimeMs
+				const raw = readFileSync(PAUSED_MARKER_FILE, "utf8")
+				const s = new Set<string>()
+				for (const line of raw.split(/\r?\n/)) {
+					const t = line.trim()
+					if (t) s.add(t)
+				}
+				pausedCacheSet = s
+				return s
+			} catch {
+				pausedCacheMtime = 0
+				pausedCacheSet = new Set()
+				return pausedCacheSet
+			}
+		}
+		function isPaused(sid: string): boolean {
+			const s = readPausedSet()
+			return s.has("*") || s.has(sid)
+		}
+		function setPaused(sid: string, on: boolean): void {
+			const s = readPausedSet()
+			if (on) s.add(sid)
+			else s.delete(sid)
+			try {
+				mkdirSync(dirname(PAUSED_MARKER_FILE), { recursive: true })
+			} catch {}
+			try {
+				writeFileSync(PAUSED_MARKER_FILE, [...s].join("\n") + (s.size ? "\n" : ""), "utf8")
+				pausedCacheMtime = 0
+			} catch (e) {
+				dbg(`${short(sid)} pause write failed: ${e instanceof Error ? e.message : String(e)}`)
+			}
+		}
+
+		function touch(sid: string) {
+			const w = ensureWatch(sid)
+			// `minActivityGapMs` debounces activity: without it, a burst of events
+			// inside one tool call keeps resetting the stall clock and a genuinely
+			// wedged step never trips the watchdog.
+			const now = Date.now()
+			if (now - w.lastActivityAt < minActivityGapMs) return
+			w.lastActivityAt = now
+		}
+
+		function markBusy(sid: string) {
+			const w = ensureWatch(sid)
+			if (w.status !== "busy") {
+				dbg(`${short(sid)} idle/unknown -> busy`)
+				// Fresh busy cycle: reset per-turn budgets.
+				// NOTE: continueTimestamps is intentionally preserved — the
+				// hallucination-loop detector counts across busy cycles by design.
+				// NOTE 2: resumeAttempts is deliberately NOT reset here. Lifecycle
+				// transitions are plumbing, and an interleaving idle event between
+				// our send and the model's start made every other stall read 1/3
+				// forever (ses_ee14d727). Episode boundaries live where they can
+				// be observed: a genuine user message (execution.started,
+				// noteInboundUserMessage), model text growth (recover), and the
+				// abort+resume escalation. Nowhere else.
+				w.toolTextAttempts = 0
+				w.stuckToolAttempts = 0
+				// A fresh turn means the age gate is judged against a new call, so
+				// the watchdog's stuck-tool throttle re-arms with the attempt budget.
+				w.lastStuckToolCheck = 0
+				// Deliberately NOT resetting doneClaimAttempts / doneClaimOpenTodosAttempts.
+				// v1 moved both out of the busy-cycle reset for a reason (#26): a model
+				// that keeps re-announcing completion would get a fresh budget on every
+				// turn it announced, so the nudge never stopped. They re-arm only on a
+				// genuine new work cycle — an inbound user message, via
+				// noteInboundUserMessage().
+				// The open-todos nudge is the opposite case and does reset here: an open
+				// list is new information each turn, not a model that keeps saying the
+				// same thing.
+				w.todoNudgeAttempts = 0
+				w.intentNudgeAttempts = 0
+				// NOTE: emptyIdleNudged is deliberately NOT reset here. The
+				// flag is single-shot per observable episode, and markBusy runs
+				// on our own recovery injections too: resetting it here would
+				// re-arm on the very inject it just sent, and an idle-empty
+				// session would cycle nudge-inject-idle-nudge forever. It
+				// re-arms only where a new episode is observable: a genuine
+				// user message, a genuine execution.started, or abort+resume.
+				// A new turn means the text a pending pattern pass was going to judge is
+				// superseded, and markBusy has just emptied the buffer it would have read.
+				if (w.toolTextTimer) {
+					clearTimeout(w.toolTextTimer)
+					w.toolTextTimer = null
+				}
+				// A new turn re-opens the question of whether the work is finished —
+				// BUT only a genuine one. markBusy also runs for plumbing transitions
+				// (watchdog re-mark from server truth, discovery adopt, step events,
+				// our own injections' turns), none of which is new work. Clearing the
+				// latch here wiped freshly-set completions within seconds: ses_ed33c0da
+				// (2026-10-11) would have latched TASK COMPLETE at idle and lost it at
+				// the re-mark 1s later, stalling at +197s anyway. The latch now clears
+				// only on a genuine new user message (noteInboundUserMessage, which
+				// already distinguishes own prompts), timestamped against
+				// completionSignaledAt; the busy-path skip below re-opens it there.
+				// NOTE 3: gaveUp is deliberately NOT cleared here either. It is
+				// an episode latch, not per-turn bookkeeping: a stood-down
+				// session the watchdog re-adopts from server truth (or
+				// discovery seeds) must stay stood down, or the stand-down
+				// guarantee cycles. It clears only on observable new episodes:
+				// a genuine user message (noteInboundUserMessage), a genuine
+				// execution.started, or the abort+resume escalation.
+				// A new turn means the parent moved on, so whatever the previous orphan
+				// watch was about is no longer the question. Left armed, it would fire
+				// mid-turn and abort a session that is doing exactly what it should.
+				w.orphanWatchStartAt = null
+				w.orphanWatchArmedAt = null
+				// orphanEscalatedChildSid deliberately SURVIVES here. It records that
+				// a specific dead child has already cost this parent one abort, not a
+				// retry budget — and a parent that recovers and does real work between
+				// aborts is exactly the loop that produced 8 escalations in 3 hours
+				// (ses_ed726872). Clearing it on every genuine turn reinstates the bug
+				// the moment the parent does anything useful. It is cleared when the
+				// watch is disarmed as void (an idle session's own watch) and when the
+				// session is torn down.
+				w.recentToolCalls = []
+				w.textParts.clear()
+				w.lastAssistantText = ""
+			}
+			w.status = "busy"
+			w.idleSince = null
+			w.lastActivityAt = Date.now()
+		}
+
+		function markIdle(sid: string) {
+			const w = ensureWatch(sid)
+			if (w.status !== "idle") {
+				dbg(`${short(sid)} ${w.status} -> idle`)
+				w.status = "idle"
+				w.idleSince = Date.now()
+				// Idle means nothing is in flight. Any slot still held belongs to a tool
+				// that will never report — a subagent killed mid-call, for instance —
+				// and keeping it would make the orphan watch defer on this session
+				// forever.
+				w.pendingTools = 0
+				// This session is not the parent the watch is about: the watch is armed on
+				// the session that *stays* busy, so an idle session's own watch is void.
+				w.orphanWatchStartAt = null
+				w.orphanWatchArmedAt = null
+				// orphanEscalatedChildSid survives, same reason as in markBusy: a
+				// parent that idles between aborts and then works again is the exact
+				// shape that cycled 8 times. An idle transition voids the ARMED
+				// watch, not the record of what a dead child already cost.
+			}
+			// NOTE: this used to clear `permissionPending`. The `session.idle` handler
+			// calls markIdle() and then inspectOnIdle(), so the flag was always false by
+			// the time the guard that honours it ran — the permission guard was dead on
+			// exactly the transition it exists for. `permission.replied` is now the only
+			// thing that clears it, plus a stale-clear for a `permission.asked` whose
+			// reply never arrives.
+			clearStalePermissionFlag(sid, w)
+		}
+
+		/**
+		 * A `permission.asked` with no matching `permission.replied` would otherwise
+		 * stand the session down forever. Mirrors the compaction stale-guard.
+		 */
+		function clearStalePermissionFlag(sid: string, w: SessionWatch) {
+			if (!w.permissionPending) return
+			if (w.permissionPendingAt && Date.now() - w.permissionPendingAt > PERMISSION_STALE_TTL_MS) {
+				dbg(`${short(sid)} permission prompt silent >${PERMISSION_STALE_TTL_MS / 60000}m — clearing flag`)
+				w.permissionPending = false
+				w.permissionPendingAt = null
+			}
+		}
+
+		function recordContinue(sid: string) {
+			const w = sessions.get(sid)
+			if (!w) return
+			const now = Date.now()
+			w.continueTimestamps.push(now)
+			w.lifetimeContinues = (w.lifetimeContinues ?? 0) + 1
+			const cutoff = now - loopWindowMs
+			while (w.continueTimestamps.length > 0 && w.continueTimestamps[0] < cutoff) {
+				w.continueTimestamps.shift()
+			}
+		}
+
+		function continuesInWindow(w: SessionWatch): number {
+			const cutoff = Date.now() - loopWindowMs
+			while (w.continueTimestamps.length > 0 && w.continueTimestamps[0] < cutoff) {
+				w.continueTimestamps.shift()
+			}
+			return w.continueTimestamps.length
+		}
+
+		/** Lifetime cap: total stall continues this genuine user episode.
+		 * The per-stall ladder restarts on model text, so without this a
+		 * model that keeps replying "done" reads 1/3 forever. Only a
+		 * genuine user message clears it — never model output. */
+		function lifetimeExhausted(sid: string, w: SessionWatch): boolean {
+			const profile = resolveProfile(sid)
+			const profileLifetimeMaxContinues = profile.lifetimeMaxContinues
+			if ((w.lifetimeContinues ?? 0) >= profileLifetimeMaxContinues) {
+				if (!w.gaveUp) {
+					log("warn", `${short(sid)} lifetime cap (${profileLifetimeMaxContinues} continues, no genuine user message) — standing down`)
+					w.gaveUp = true
+				}
+				return true
+			}
+			return false
+		}
+
+		/**
+		 * True while a plugin-initiated abort is still in flight. The runtime delivers
+		 * `session.execution.interrupted` asynchronously after `interrupt()` returns, so
+		 * the transient `w.aborting` boolean is not a reliable discriminator.
+		 */
+		function selfAbortActive(w: SessionWatch): boolean {
+			return w.selfAbortAt > 0 && Date.now() - w.selfAbortAt < SELF_ABORT_TTL_MS
+		}
+
+		/** Does this failure signature mean "the turn was interrupted"? */
+		function isAbortError(errType: string, errMsg: string): boolean {
+			return ABORT_ERROR_TYPE_RE.test(errType.trim()) || ABORT_ERROR_MSG_RE.test(errMsg)
+		}
+
+		function isRateLimitError(errType: string, errMsg: string): boolean {
+			return RATE_LIMIT_RE.test(`${errType} ${errMsg}`)
+		}
+
+
+		/**
+		 * Stand down on quota/rate-limit failures instead of retrying into the
+		 * ban. Gates, not timers: the decision is re-evaluated on each failure
+		 * and each watchdog tick against `rateLimitedAt`, so nothing is lost
+		 * to a reload. Served cooldowns flow into the normal `recover()` path
+		 * (budgets, loop guard and inject guards all apply); past the ladder
+		 * the session stays silent until a genuine user turn.
+		 */
+		/**
+		 * User-visible quota notice. The stand-down itself is silent by design
+		 * (retrying into a ban helps nothing), but an unexplained silent
+		 * session reads as dead. resume:false shows it in the timeline without
+		 * kicking a turn, re-arming budgets, or tripping own-prompt guards
+		 * (text never matches an injected continue). Best-effort: a failed
+		 * notice must never block recovery.
+		 */
+		async function sendQuotaNotice(sid: string, text: string): Promise<void> {
+			try {
+				await sendBound("quota-notice", sid, () =>
+					ctx.session.synthetic({ sessionID: sid, text, description: "auto-resume: quota notice", resume: false }),
+				)
+			} catch (e) {
+				log("warn", `${short(sid)} quota notice failed: ${e instanceof Error ? e.message : String(e)}`)
+			}
+		}
+
+		/**
+		 * Serve one rung of the rate-limit cooldown ladder: advance the rung,
+		 * re-arm recovery, and reset the notice flag so the next arm (or
+		 * exhaustion) announces itself afresh. Shared by the failure handler
+		 * (cooldown already served when the failure arrives) and the watchdog
+		 * gate (cooldown served while stood down) — one shape, one place, so
+		 * the two can never drift apart again.
+		 */
+		function serveQuotaRung(sid: string, w: SessionWatch, rung: number, ladder: number[]): void {
+			w.rateLimitAttempts = rung + 1
+			w.rateLimitedAt = Date.now()
+			w.awaitingQuotaRetry = false
+			w.pendingRecoveryArmed = true
+			// A served rung ends the quiet spell: clear the notice flag
+			// so the next arm (or exhaustion) announces itself afresh.
+			// Each rung then carries at most one notice.
+			w.quotaNoticedAt = 0
+			log("info", `${short(sid)} rate-limit cooldown served — retrying (attempt ${rung + 1}/${ladder.length}) mod=${MODULE_INSTANCE}`)
+			void syncQuotaState(sid, w)
+			const cooldownMin = Math.max(1, Math.round(ladder[rung] / 60000))
+			void recover(sid, `rate-limit cooldown served (rung ${rung + 1}/${ladder.length}, ${cooldownMin}m)`)
+		}
+
+		function handleRateLimitFailure(sid: string, w: SessionWatch, errType: string, errMsg: string): void {
+			if (isPaused(sid)) {
+				dbg(`${short(sid)} paused — not arming quota ladder`)
+				return
+			}
+			const ladder = rateLimitCooldownsMs
+			const tag = "rate-limit"
+			const n = w.rateLimitAttempts
+			markIdle(sid)
+			if (n >= ladder.length) {
+				w.awaitingQuotaRetry = false
+				log("warn", `${short(sid)} ${tag} budget exhausted (${ladder.length} attempts) — standing down until user turn`)
+				if (!w.quotaNoticedAt && Date.now() - w.lastQuotaNoticeAt > 100) {
+					w.quotaNoticedAt = Date.now()
+					w.lastQuotaNoticeAt = Date.now()
+					void sendQuotaNotice(sid, `Rate limited — standing down until you return (budget exhausted after ${ladder.length} attempts).`)
+				}
+				return
+			}
+			const now = Date.now()
+			if (w.rateLimitedAt > 0 && now - w.rateLimitedAt >= ladder[n]) {
+				serveQuotaRung(sid, w, n, ladder)
+				return
+			}
+			// Already armed and cooldown not elapsed — skip re-arming to prevent
+			// duplicate quota-armed log entries and duplicate syncQuotaState calls.
+			if (w.rateLimitedAt > 0 && now - w.rateLimitedAt < ladder[n]) {
+				return
+			}
+			if (w.rateLimitedAt === 0) w.rateLimitedAt = now
+			w.awaitingQuotaRetry = true
+			const waitMs = Math.max(0, ladder[n] - (now - w.rateLimitedAt))
+			log("warn", `${short(sid)} rate limited (${errType || "error"}) — standing down, next attempt in ${Math.ceil(waitMs / 1000)}s (${n + 1}/${ladder.length})`)
+			// User-visible twin of the stand-down: silence reads as dead
+			// (ses_edd3d940). One notice per episode (first arm only);
+			// resume:false so it never kicks a turn or re-arms budgets.
+			if (!w.quotaNoticedAt && Date.now() - w.lastQuotaNoticeAt > 100) {
+				w.quotaNoticedAt = Date.now()
+				w.lastQuotaNoticeAt = Date.now()
+				const mins = Math.max(1, Math.round(waitMs / 60000))
+				const when = mins >= 60 ? `~${Math.floor(mins / 60)}h ${mins % 60}m` : `~${mins}m`
+				void sendQuotaNotice(sid, `Rate limited, retrying in ${when} (attempt ${n + 1}/${ladder.length}).`)
+			}
+			// Machine-readable arm record so a later evaluation can re-arm after a
+			// reload wipes this in-memory gate (ses_ef72c5f3, 2026-10-09: armed at
+			// 14:31:49, plugin reloaded 14:37:28, gate due 14:46:49 never fired).
+			// Full sid: short() truncates and suffixes can collide across sessions.
+			log("warn", `quota-armed sid=${sid} at=${now} rung=${n} ladder=${ladder.length}`)
+			// Mirror into storage so the arm survives a real process restart (R1).
+			void syncQuotaState(sid, w)
+		}
+
+		/** Remaining plugin-initiated interrupts allowed in the current window. */
+		function interruptBudget(w: SessionWatch): number {
+			if (w.interruptWindowStart === 0 || Date.now() - w.interruptWindowStart > INTERRUPT_WINDOW_MS) {
+				w.interruptWindowStart = Date.now()
+				w.interruptsThisWindow = 0
+			}
+			return MAX_INTERRUPTS_PER_WINDOW - w.interruptsThisWindow
+		}
+
+		/**
+		 * Fallback source of truth for "which sessions are running". v2's plugin
+		 * SessionDomain does not expose `session.active()` (see Mte90/opencode-auto-resume#33),
+		 * so when it is missing we derive the set from our own event-derived busy flags.
+		 * Without this the subagent-wait guard below can never fire.
+		 */
+		function busySessions(): string[] {
+			const out: string[] = []
+			for (const [sid, w] of sessions) {
+				if (w.status === "busy" && !w.userCancelled) out.push(sid)
+			}
+			return out
+		}
+
+		/**
+		 * Loopback session list with parentID rows. `ctx` offers no list/get/
+		 * active surface and no client in production (verified 2026-10-06:
+		 * every subagent check silently degraded to false, zero refusals in
+		 * log history) — but `GET /api/session` answers with parentID rows
+		 * under the same auth as the message reads. Short-TTL cache: verdicts
+		 * and guards call this several times per watchdog pass. Fail-open
+		 * toward the pre-guard behavior (empty) on any fetch problem.
+		 */
+		type SessionRow = { id?: unknown; parentID?: unknown }
+		let sessionRowsCache: { at: number; rows: SessionRow[] } | null = null
+		const SESSION_ROWS_TTL_MS = 10_000
+		async function listSessionsHttp(): Promise<SessionRow[]> {
+			const now = Date.now()
+			if (sessionRowsCache && now - sessionRowsCache.at < SESSION_ROWS_TTL_MS) return sessionRowsCache.rows
+			for (const base of serverBaseUrls()) {
+				try {
+					const res = await fetch(`${base}/api/session?limit=500`, { headers: serverHeaders() })
+					if (!res.ok) continue
+					const body = (await res.json()) as unknown
+					const data = (body as { data?: unknown } | undefined)?.data ?? body
+					if (Array.isArray(data)) {
+						const rows = (data as SessionRow[]).filter((r) => r !== null && typeof r === "object")
+						sessionRowsCache = { at: now, rows }
+						return rows
+					}
+				} catch {
+					// Next base; exhaustion degrades to stale/empty below.
+				}
+			}
+			return sessionRowsCache?.rows ?? []
+		}
+
+		/**
+		 * Is this session itself a subagent? Definitive test: ask the server for
+		 * our own record and look at `parentID`.
+		 *
+		 * This plugin is parent-scoped — it exists to recover sessions a human is
+		 * waiting on. A child is not that: it never reads the parent's AGENTS.md,
+		 * so a prompt-level "ignore injected continues" rule in the child agent
+		 * loses to an injection that arrives as a real task turn. Observed in the
+		 * wild: a worker answered an invisible prompt mid-task and never returned.
+		 *
+		 * Deliberately independent of the `lastWasTaskTool` heuristic used for
+		 * parents in `checkActiveSessions` — that one asks "did this session just
+		 * dispatch a child?", this one asks "is this session a child?". A silent
+		 * child gets no protection from the parent-side heuristic, which is
+		 * exactly the gap this closes.
+		 *
+		 * Cached on the watch record. `ctx.client` is optional and any failure
+		 * degrades to `false` — i.e. precisely the pre-guard behavior — so a host
+		 * without a client can neither break recovery nor fail to boot.
+		 */
+		async function isSubAgentSession(sid: string): Promise<boolean> {
+			const w = ensureWatch(sid)
+			if (typeof w.isSubAgent === "boolean") return w.isSubAgent
+			let sub = false
+			try {
+				const res = await ctx.client?.session.get({ path: { id: sid } })
+				sub = !!res?.data?.parentID
+			} catch {
+				sub = false
+			}
+			if (!sub) {
+				// HTTP fallback: prod ctx has no client (verified 2026-10-06),
+				// so the lookup above always misses there. Same degraded-false
+				// contract on any fetch problem.
+				try {
+					const rows = await listSessionsHttp()
+					sub = rows.some((r) => r?.id === sid && typeof r?.parentID === "string")
+				} catch {
+					sub = false
+				}
+			}
+			w.isSubAgent = sub
+			return sub
+		}
+
+		/**
+		 * Single choke point for every recovery injection. Guarantees at most one
+		 * synthetic per `injectIntervalMs` and refuses to talk to a live session,
+		 * because a turn sent to a busy session supersedes its in-flight step
+		 * ("Step interrupted").
+		 *
+		 * `allowDuringSelfAbort` is for the abort+resume escalation, which by
+		 * construction runs inside the plugin's own abort window: it is the one
+		 * injection that is *supposed* to follow `interrupt()`. That path skips
+		 * both the abort-window check and the busy guard, because:
+		 *  - we just killed the step ourselves, so "this session is working" is
+		 *    false, and the runtime may not have delivered the idle transition
+		 *    yet; and
+		 *  - swallowing the continue there leaves a session interrupted with
+		 *    nothing to restart it, which is the failure this whole fix targets.
+		 * It stays rate-limited by `w.aborting` and `MAX_INTERRUPTS_PER_WINDOW`.
+		 */
+		/**
+		 * Cross-instance duplicate check: is our exact text already the latest
+		 * user message in the session log, posted within RECENT_PROD_WINDOW_MS?
+		 * Stacked watchdogs (reload churn) each hold private counters, so the
+		 * in-memory soft skip cannot see a sibling's prod — the log can.
+		 * Fail-open: any fetch problem means "no info", never "duplicate".
+		 */
+		const RECENT_PROD_WINDOW_MS = 60_000
+		async function recentOwnProdInLog(sid: string, text: string): Promise<boolean> {
+			const pages: unknown[] = []
+			try {
+				const message = (ctx.client as any)?.session?.message
+				if (typeof message?.list === "function") {
+					const res = await message.list.call(message, { path: { id: sid } })
+					const data = (res as { data?: unknown } | undefined)?.data ?? res
+					if (Array.isArray(data)) pages.push(...data)
+				}
+			} catch {
+				// Fall through to HTTP below.
+			}
+			if (pages.length === 0) {
+				for (const base of serverBaseUrls()) {
+					try {
+						const res = await fetch(
+							`${base}/api/session/${encodeURIComponent(sid)}/message?limit=20`,
+							{ headers: serverHeaders() },
+						)
+						if (!res.ok) continue
+						const body = ((await res.json()) as { data?: unknown } | undefined)?.data
+						if (Array.isArray(body)) {
+							pages.push(...body)
+							break
+						}
+					} catch {
+						// Next candidate base.
+					}
+				}
+			}
+			if (pages.length === 0) return false
+			const now = Date.now()
+			for (const m of pages) {
+				if (m === null || typeof m !== "object") continue
+				const msg = m as { role?: unknown; text?: unknown; content?: unknown; time?: unknown }
+				if (msg.role !== "user") continue
+				let t = ""
+				if (typeof msg.text === "string") {
+					t = msg.text
+				} else if (Array.isArray(msg.content)) {
+					t = (msg.content as unknown[])
+						.filter(
+							(p): p is { type: string; text: string } =>
+								!!p &&
+								typeof p === "object" &&
+								(p as { type?: unknown }).type === "text" &&
+								typeof (p as { text?: unknown }).text === "string",
+						)
+						.map((p) => p.text)
+						.join("")
+				}
+				// Newest-first: the first user message decides. Anything newer
+				// than our prod (user typed after it) is progress, not a dupe.
+				if (t !== text) return false
+				const created = (msg.time as { created?: unknown } | undefined)?.created
+				if (typeof created === "number" && now - created > RECENT_PROD_WINDOW_MS) return false
+				return true
+			}
+			return false
+		}
+
+		/**
+		 * Per-session async mutex around the whole injection. Bun is
+		 * single-threaded, so a promise chain serializes overlapping callers:
+		 * stacked watchdogs interleave at every await, and without this the
+		 * log check below runs six-wide against the same empty log before any
+		 * send lands. First holder checks-then-sends; the rest re-check after
+		 * and stand down on sight of the first prod.
+		 */
+		const injectLocks = new Map<string, Promise<void>>()
+		async function withInjectLock<T>(sid: string, fn: () => Promise<T>): Promise<T> {
+			const prev = injectLocks.get(sid) ?? Promise.resolve()
+			let release!: () => void
+			const current = new Promise<void>((resolve) => {
+				release = resolve
+			})
+			// The chain tail is what the NEXT caller waits on, so it must resolve only
+			// after this holder's work finishes — hence `prev.then(() => current)`.
+			const tail = prev.then(() => current)
+			injectLocks.set(sid, tail)
+			await prev
+			try {
+				return await fn()
+			} finally {
+				release()
+				// Drop the key once we are the last holder, so a long-lived process
+				// does not accumulate one entry per session it ever watched.
+				if (injectLocks.get(sid) === tail) injectLocks.delete(sid)
+			}
+		}
+
+		/**
+		 * The injection body. Split out of `injectOnce` so the per-session mutex
+		 * wraps the WHOLE check-then-act: every guard above (subagent, self-abort,
+		 * busy, debounce, duplicate) is a read, and the send is the write. Stacked
+		 * callers interleave at every `await`, so six watchdogs could each pass all
+		 * six reads against pre-send state and then all six send. Serialized here,
+		 * the first caller to finish sends and the rest re-read its result.
+		 */
+		async function injectOnceLocked(
+			sid: string,
+			text: string,
+			notification: string,
+			allowDuringSelfAbort: boolean,
+			checkDuplicate: boolean,
+			forceSynthetic = false,
+		): Promise<boolean> {
+			// Dead instances stay silent across every injection path, not
+			// just the stall timer that schedules most of them. Checked
+			// before ensureWatch so a dead copy cannot resurrect watch state.
+			if (!running) return false
+			const w = ensureWatch(sid)
+			// A subagent is not ours to recover. Checked first, before every other
+			// guard, so no code path below can reach a child.
+			if (await isSubAgentSession(sid)) {
+				dbg(`${short(sid)} subagent session — injection refused (parent owns recovery)`)
+				return false
+			}
+			// The permanent and OOC locks are enforced HERE rather than in each
+			// caller. There are five injection paths (stall, abort+resume, unknown-tool,
+			// task_complete-blocked, targetedRecovery) and a permanently failed or
+			// out-of-context session still goes idle with its history intact — so the
+			// feature passes read that history and injected into a model that cannot
+			// answer at all (observed: the unknown-tool suggestion landing on a session
+			// whose provider had just latched). The stall callers already checked; this
+			// closes the other three and every future path.
+			{
+				const kind = lockKind(w)
+				if (kind) {
+					dbg(`${short(sid)} locked (${kind}) — injection refused on every path`)
+					return false
+				}
+			}
+			if (!allowDuringSelfAbort && selfAbortActive(w)) {
+				dbg(`${short(sid)} injection refused — inside our own abort window`)
+				return false
+			}
+			if (!allowDuringSelfAbort && w.status === "busy" && Date.now() - w.lastActivityAt < chunkTimeoutMs) {
+				dbg(`${short(sid)} injection refused — session busy and live (${Math.round((Date.now() - w.lastActivityAt) / 1000)}s since last event)`)
+				return false
+			}
+			const since = Date.now() - w.lastInjectAt
+			if (!allowDuringSelfAbort && w.lastInjectAt > 0 && since < injectIntervalMs) {
+				dbg(`${short(sid)} injection debounced — ${Math.round(since / 1000)}s since last (min ${injectIntervalMs / 1000}s)`)
+				return false
+			}
+			// Exact-duplicate anti-repeat (cattleprod-style soft skip, opt-in per
+			// caller): an immediate re-fire with identical text and zero model
+			// progress since the last successful prod means the previous nudge
+			// changed nothing — skip it and let the sliding-window counter /
+			// escalation own the loop. No message fetch needed: progress is
+			// assistant-text growth plus tool completions. Scoped to the stall
+			// path by default: the targeted nudges below own per-kind budgets
+			// with re-arm semantics this must not second-guess.
+			if (
+				checkDuplicate &&
+				!allowDuringSelfAbort &&
+				w.lastProdText !== "" &&
+				text === w.lastProdText &&
+				w.pendingTools <= 0 &&
+				w.completedSinceProd === 0 &&
+				w.lastAssistantText === w.prodAssistantSnapshot
+			) {
+				dbg(`${short(sid)} duplicate continue suppressed — identical text, no progress since last prod`)
+				return false
+			}
+			w.lastInjectAt = Date.now()
+			// Cross-instance backstop for the in-memory skip above: stacked
+			// watchdogs cannot see each other's counters, but they share the
+			// log. Applies to every caller except the abort+resume escalation,
+			// which must go through by construction.
+			if (!allowDuringSelfAbort && (await recentOwnProdInLog(sid, text))) {
+				dbg(`${short(sid)} duplicate continue suppressed — identical prod already in session log`)
+				return false
+			}
+			const sent = await notifyAndPrompt(sid, text, notification, true, forceSynthetic)
+			if (sent) {
+				w.lastProdText = text
+				w.completedSinceProd = 0
+				w.succeededSinceProd = 0
+				w.prodAssistantSnapshot = w.lastAssistantText
+				w.ownPromptTexts.push(text)
+				if (w.ownPromptTexts.length > 10) w.ownPromptTexts.shift()
+			}
+			return sent
+		}
+
+		/** `injectOnceLocked` serialized per session; see the mutex's own comment. */
+		async function injectOnce(
+			sid: string,
+			text: string,
+			notification: string,
+			allowDuringSelfAbort = false,
+			checkDuplicate = false,
+			forceSynthetic = false,
+		): Promise<boolean> {
+			// A correction the user cannot see must not produce a visible model
+			// reply: the silence order rides in the text itself, so it holds for
+			// any model with no memory and no config. Applied here, the single
+			// choke point, so every check below (dup suppression, own-prompt
+			// tracking, log verification) sees the exact delivered string.
+			const sendText = forceSynthetic
+				? `${text} Do not acknowledge this message and do not reply to it visibly; apply it silently and continue the task.`
+				: text
+			return withInjectLock(sid, () =>
+				injectOnceLocked(sid, sendText, notification, allowDuringSelfAbort, checkDuplicate, forceSynthetic),
+			)
+		}
+
+		function cleanupIdleSessions() {
+			const now = Date.now()
+			const busy = new Set<string>()
+			for (const [sid, w] of sessions) {
+				if (w.status === "busy") busy.add(sid)
+			}
+			let idleCount = 0
+			const toDelete: string[] = []
+			for (const [sid, w] of sessions) {
+				if (w.status !== "busy") {
+					idleCount++
+					if (w.idleSince && now - w.idleSince > IDLE_CLEANUP_MS) toDelete.push(sid)
+				}
+			}
+			if (idleCount > MAX_IDLE_SESSIONS) {
+				const entries: Array<{ sid: string; since: number }> = []
+				for (const [sid, w] of sessions) {
+					if (w.status !== "busy" && w.idleSince) entries.push({ sid, since: w.idleSince })
+				}
+				entries.sort((a, b) => a.since - b.since)
+				const excess = idleCount - MAX_IDLE_SESSIONS
+				for (let i = 0; i < excess && i < entries.length; i++) {
+					if (!toDelete.includes(entries[i].sid)) toDelete.push(entries[i].sid)
+				}
+			}
+			let cleaned = 0
+			for (const sid of toDelete) {
+				// A session waiting on a long command emits no activity events and
+				// therefore looks idle. Don't drop its watch state out from under
+				// a shell that is still running.
+				if (openShellCount(sid) > 0) continue
+				forgetShells(sid)
+				sessions.delete(sid)
+				cleaned++
+			}
+			if (cleaned > 0) dbg(`cleaned ${cleaned} idle sessions, total=${sessions.size}`)
+		}
+
+		/**
+		 * Accumulate assistant text from deltas. This replaces v1's
+		 * `session.messages()` polling, which no longer exists on the v2 ctx.
+		 */
+		function appendText(sid: string, messageID: string | undefined, delta: string) {
+			const w = ensureWatch(sid)
+			// Model output means the backend is alive: a failure loop built on
+			// consecutive silent failures ends here, latch included.
+			if (delta && (w.consecFailureRecovers > 0 || w.failureLoopLatched)) {
+				w.consecFailureRecovers = 0
+				if (w.failureLoopLatched) {
+					w.failureLoopLatched = false
+					log("info", `${short(sid)} model output after failure loop — latch cleared`)
+				}
+			}
+			const mid = messageID ?? "_anon"
+			w.textParts.set(mid, (w.textParts.get(mid) ?? "") + delta)
+			w.lastAssistantMessageID = mid
+			w.lastAssistantText = w.textParts.get(mid) ?? ""
+			// Keep memory bounded: keep only the two most recent messages' text
+			if (w.textParts.size > 2) {
+				const oldest = w.textParts.keys().next().value
+				if (oldest !== undefined && oldest !== mid) w.textParts.delete(oldest)
+			}
+			if (w.lastAssistantText.length > TEXT_BUFFER_TRIM_LEN) {
+				w.textParts.set(mid, w.lastAssistantText.slice(-TEXT_BUFFER_TRIM_LEN))
+				w.lastAssistantText = w.textParts.get(mid) ?? ""
+			}
+		}
+
+		// ---------------------------------------------------------------------
+		// Recovery actions
+		// ---------------------------------------------------------------------
+
+		/**
+		 * Show a visible notification in the session timeline and optionally
+		 * resume it.  Uses `session.synthetic()` which is exposed on the v2
+		 * promise-plugin context — the synthetic message appears in the TUI
+		 * so the user knows the plugin intervened.
+		 *
+		 * When `resume` is true the synthetic also acts as a user turn that
+		 * kicks the session back to life, replacing the separate `prompt()`.
+		 */
+		/**
+		 * Bound a recovery send. Transport awaits with no deadline stack
+		 * cascades that flush together as twin prods (ses_ee7dade1) — bound
+		 * them so expiry flows into the normal throw path instead. Slow
+		 * completions log a latency warning; that timing is the forensics
+		 * the twins lacked.
+		 */
+		async function sendBound(label: string, sid: string, send: () => Promise<unknown>): Promise<void> {
+			const started = Date.now()
+			let timer: ReturnType<typeof setTimeout> | undefined
+			try {
+				await Promise.race([
+					send(),
+					new Promise<never>((_, reject) => {
+						timer = setTimeout(() => reject(new Error(`${label} timed out after ${sendTimeoutMs}ms`)), sendTimeoutMs)
+					}),
+				])
+			} finally {
+				if (timer !== undefined) clearTimeout(timer)
+			}
+			const elapsed = Date.now() - started
+			if (elapsed > SEND_SLOW_MS) {
+				log("warn", `${short(sid)} ${label} took ${Math.round(elapsed / 1000)}s (over ${SEND_SLOW_MS / 1000}s slow threshold)`)
+			}
+		}
+
+		async function notifyAndPrompt(sid: string, text: string, notification: string, resume = true, forceSynthetic = false): Promise<boolean> {
+			ensureWatch(sid).selfRecovery = true
+			if (visibleContinue && !forceSynthetic) {
+				// Cattleprod-style: a real user message in session history, so the
+				// intervention — and any loop — is self-evident in the transcript.
+				// Falls back to synthetic only if the prompt call throws.
+				try {
+					await sendBound("prompt", sid, () => ctx.session.prompt({ sessionID: sid, text }))
+					return true
+				} catch (err) {
+					const msg = err instanceof Error ? err.message : String(err)
+					log("warn", `${short(sid)} visible prompt failed: ${msg}`)
+				// A transport error can land AFTER the message was delivered
+				// (observed: twin identical prods 5ms apart). The delivered
+				// prompt is a user message in the log, so verify before
+				// falling back — a second send of the same text is the dupe.
+				if (await recentOwnProdInLog(sid, text)) {
+					dbg(`${short(sid)} prompt threw but the text is already the newest user message — treating as delivered`)
+					return true
+				}
+				// Dead instances stay silent: a superseded setup's in-flight
+				// send may reject after disposal — the live instance owns the
+				// session now, and any fallback from here would double-send.
+				if (!running) return false
+				}
+			}
+			try {
+				await sendBound("synthetic", sid, () =>
+					ctx.session.synthetic({
+					sessionID: sid,
+					text,
+					description: `auto-resume: ${notification}`,
+					resume,
+					}),
+				)
+				return true
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err)
+				log("warn", `${short(sid)} synthetic failed: ${msg}`)
+				if (!running) return false
+				// Same verify-before-retry: a delivered synthetic also acts as
+				// a user turn, so it reads back through the same log check.
+				if (await recentOwnProdInLog(sid, text)) {
+					dbg(`${short(sid)} synthetic threw but the text is already the newest user message — treating as delivered`)
+					return true
+				}
+				// Last resort: a plain prompt still resumes the session (just
+				// without the visible synthetic notification in the TUI).
+				try {
+					await sendBound("prompt", sid, () => ctx.session.prompt({ sessionID: sid, text }))
+					return true
+				} catch {
+					log("error", `${short(sid)} all recovery attempts failed: ${msg}`)
+					return false
+				}
+			}
+		}
+
+		async function tryAbortAndResume(sid: string, w: SessionWatch, force = false): Promise<boolean> {
+			// Guarded separately because this path calls `interrupt()` *before*
+			// delegating to injectOnce — guarding only the injection would still
+			// let us interrupt a running child.
+			if (await isSubAgentSession(sid)) {
+				dbg(`${short(sid)} subagent session — abort+resume refused`)
+				return false
+			}
+			// A user-initiated interrupt is a takeover, not a hang: the plugin
+			// must not follow it with an automatic "continue" (or interrupt the
+			// session again). Only our own abort+resume escalation is allowed to
+			// escalate. (ses_e9c4d8de7ffe5DC0yedTw7Cvk7, 2026-10-22.)
+			if (w.userCancelled) {
+				dbg(`${short(sid)} user cancelled — refusing abort+resume escalation`)
+				return false
+			}
+			// Do not interrupt a session that is still working (busy) unless the
+			// caller is the orphan-abort path (force), which exists precisely to
+			// recover a parent whose subagent died. Other callers (the stall
+			// ladder, the loop guard) must not produce "Step interrupted".
+			// (ses_e9c4d8de7ffe5DC0yedTw7Cvk7, 2026-10-22.)
+			if (!force && w.status === "busy") {
+				dbg(`${short(sid)} busy — refusing abort+resume escalation`)
+				return false
+			}
+			if (w.aborting || selfAbortActive(w)) return false
+			{
+				const kind = lockKind(w)
+				if (kind) {
+					dbg(`${short(sid)} ${kind} locked — refusing abort+resume escalation`)
+					return false
+				}
+			}
+			if (w.compacting) {
+				dbg(`${short(sid)} mid-compaction — refusing abort+resume escalation`)
+				return false
+			}
+			if (interruptBudget(w) <= 0) {
+				w.continueTimestamps = []
+				log("warn", `${short(sid)} interrupt budget exhausted (${MAX_INTERRUPTS_PER_WINDOW}/${INTERRUPT_WINDOW_MS / 60000}m) — skipping interrupt, loop guard reset`)
+				return false
+			}
+			w.aborting = true
+			w.selfAbortAt = Date.now()
+			w.interruptsThisWindow++
+			log("warn", `${short(sid)} escalating: interrupt + fresh continue (${w.interruptsThisWindow}/${MAX_INTERRUPTS_PER_WINDOW} per ${INTERRUPT_WINDOW_MS / 60000}m)`)
+			try {
+				await ctx.session.interrupt({ sessionID: sid })
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err)
+				log("warn", `${short(sid)} interrupt failed: ${msg}`)
+			}
+			// Give the runtime a beat to settle the interrupted turn.
+			// A superseded setup must not resume after this gap: liveness is
+			// re-checked because disposal can land mid-sleep.
+			await new Promise((r) => setTimeout(r, 2_000))
+			if (!running) return false
+			w.aborting = false
+			w.resumeAttempts = 0
+			void syncCounters(sid, w)
+			// The escalation is an observable new episode, so it also re-opens
+			// a stood-down session. Unreachable with gaveUp set today (every
+			// caller is gaveUp-guarded), but the rule belongs here so a future
+			// caller cannot escalate into a latch that blocks follow-up.
+			w.gaveUp = false
+			// Same observable-episode rule for the empty-idle single-shot.
+			w.emptyIdleNudged = false
+			// Deliberately does not recordContinue(): our own escalation must not feed
+			// the loop guard that triggered it, or the guard trips on its own output.
+			// Through the same choke point as every other path. The runtime
+			// delivers session.execution.interrupted asynchronously, so an
+			// escalation that lands on top of a concurrent recovery injection is
+			// exactly the case that produced the simultaneous bursts of synthetic
+			// continues (and the "Step interrupted" they caused).
+			const ok = await injectOnce(sid, opts.continuePrompt ?? SAFE_CONTINUE_PROMPT, "abort+resume escalation", true)
+			if (ok) {
+				w.lastRetryAt = Date.now()
+				log("info", `${short(sid)} resumed after abort`)
+			}
+			return ok
+		}
+
+		/** Classify one failure as permanent or not. Type first (opencode's own
+		 * taxonomy), then status, then message — the type is the strongest signal
+		 * and the message the weakest, so an unknown type carrying a known message
+		 * still gates. Returns the reason for the log line, or null. */
+		function permanentFailureReason(errMsg: string, errType?: string, status?: unknown): string | null {
+			if (errType && PERMANENT_ERROR_TYPES.has(errType)) return `type ${errType}`
+			if (typeof status === "number" && PERMANENT_STATUS_CODES.has(status)) return `http ${status}`
+			if (PERMANENT_GONE_RE.test(errMsg)) return errMsg.slice(0, 160)
+			if (PERMANENT_HISTORY_RE.test(errMsg)) return errMsg.slice(0, 160)
+			if (PERMANENT_UNKNOWN_MODEL_RE.test(errMsg)) {
+				if (status === 404) return null // openai 404s can be live models; keep recovering
+				return errMsg.slice(0, 160)
+			}
+			return null
+		}
+
+		/** Latch the permanent-failure lock when the error names something a continue
+		 * can never clear. Returns true when recovery must be skipped this time. */
+		function maybeLockPermanent(sid: string, errMsg: string, errType?: string, status?: unknown): boolean {
+			const w = ensureWatch(sid)
+			if (w.permLocked) return true
+			let why = permanentFailureReason(errMsg, errType, status)
+			if (why === null && errType && INDETERMINATE_ERROR_TYPES.has(errType)) {
+				// Deliberately AFTER the message patterns: an unsupported-operation
+				// type carrying a permanent message (a deprecated model, a dead
+				// session id) still hard-gates on the message.
+				w.indeterminateStrikes++
+				if (w.indeterminateStrikes < INDETERMINATE_STRIKES) {
+					log(
+						"info",
+						`${short(sid)} indeterminate failure (${errType}) ${w.indeterminateStrikes}/${INDETERMINATE_STRIKES} — one recovery attempt before latching mod=${MODULE_INSTANCE}`,
+					)
+					return false
+				}
+				why = `type ${errType} (${INDETERMINATE_STRIKES} strikes)`
+			}
+			if (why === null) return false
+			w.permLocked = true
+			w.permLockReason = why
+			log(
+				"warn",
+				`${short(sid)} permanent failure latched (${why}) — recovery locked out until a genuine turn: ${errMsg.slice(0, 120)} mod=${MODULE_INSTANCE}`,
+			)
+			return true
+		}
+
+		/** Central lock query: which lock (if any) holds this watch.
+		 * Every injection-path guard calls this instead of testing the two flags
+		 * inline, so a third lock class means editing here, not N call sites. */
+		function lockKind(w: SessionWatch): "permanent" | "ooc" | null {
+			if (w.permLocked) return "permanent"
+			if (w.oocLocked) return "ooc"
+			return null
+		}
+
+		/** Human-readable lock reason for log lines. */
+		function lockReason(w: SessionWatch): string {
+			const kind = lockKind(w)
+			if (kind === "permanent") return w.permLockReason?.slice(0, 80) ?? "n/a"
+			if (kind === "ooc") return w.oocLockReason?.slice(0, 80) ?? "n/a"
+			return "n/a"
+		}
+
+		/** Central lock release, called on a genuine turn. */
+		function clearLocks(w: SessionWatch, sid: string): void {
+			if (w.oocLocked) {
+				w.oocLocked = false
+				w.oocLockReason = null
+				log("info", `${short(sid)} genuine execution — clearing OOC lock mod=${MODULE_INSTANCE}`)
+			}
+			w.indeterminateStrikes = 0
+			if (w.permLocked) {
+				w.permLocked = false
+				w.permLockReason = null
+				log("info", `${short(sid)} genuine execution — clearing permanent-failure lock mod=${MODULE_INSTANCE}`)
+			}
+			w.consecFailureRecovers = 0
+			if (w.failureLoopLatched) {
+				w.failureLoopLatched = false
+				log("info", `${short(sid)} genuine execution — clearing failure-loop latch mod=${MODULE_INSTANCE}`)
+			}
+		}
+
+		function maybeLockOoc(sid: string, errMsg: string, errType = "") {
+			const w = ensureWatch(sid)
+			if (w.oocLocked) return
+			// Transient throttles are not context overflow (issue #46) — the
+			// rate-limit ladder owns them. Checked here (not just at the
+			// execution.failed call site) so session.retry.scheduled is covered too.
+			if (isRateLimitError(errType, errMsg)) return
+			if (!OOC_ERROR_RE.test(errMsg)) return
+			w.oocLocked = true
+			w.oocLockReason = errMsg.slice(0, 200)
+			log("warn", `${short(sid)} OOC error latched — recovery locked out until a genuine turn: ${errMsg.slice(0, 120)} mod=${MODULE_INSTANCE}`)
+		}
+
+		/**
+		 * Build the stall-continue text. A custom `continuePrompt` always wins
+		 * verbatim; otherwise, when `richContinuePrompt` is on (default), the
+		 * text names the stall reason, attempt count, and remaining todos
+		 * (cattleprod-style) instead of bare "continue". Same channel and
+		 * guards either way — only the content changes.
+		 */
+		async function buildStallContinueText(
+			sid: string,
+			reason: string,
+			attempt: number,
+			providerFault = false,
+			prospectiveRetries?: number,
+		): Promise<string> {
+			const w = ensureWatch(sid)
+			if (opts.continuePrompt !== undefined && opts.continuePrompt !== "") return opts.continuePrompt
+			if (!richContinuePrompt) return CONTINUE_PROMPT
+			let suffix = "Todo list unavailable."
+			try {
+				const todos = await readTodos(sid)
+				const open = todos.filter((t) => t.status !== "completed" && t.status !== "cancelled")
+				if (open.length > 0) {
+					const lines = open
+						.slice(0, 5)
+						.map((t) => `• [${t.status}] ${String(t.content).slice(0, 120)}`)
+					if (open.length > 5) lines.push(`• …and ${open.length - 5} more`)
+					suffix = `Remaining todos:\n${lines.join("\n")}`
+				} else {
+					suffix = "No open todos recorded."
+				}
+			} catch {
+				// Best effort: a todo-read failure must never block recovery.
+			}
+			// User-facing timestamp in the operator's own timezone (system
+			// local), not UTC: "2026-10-10T09:12Z" reads as wrong o'clock next
+			// to a 05:12 EDT wall clock (ses_ed9e2ef9, 2026-10-10). Log lines
+			// and boot markers stay ISO — machines read those, people read this.
+			const now = new Date().toLocaleString("en-US", {
+				month: "short",
+				day: "numeric",
+				hour: "numeric",
+				minute: "2-digit",
+				timeZoneName: "short",
+			})
+			const elapsed = w.lastActivityAt ? Math.round((Date.now() - w.lastActivityAt) / 1000) : 0
+			const hms = (n: number) =>
+				n < 60 ? `${n}s` : n < 3600 ? `${Math.floor(n / 60)}m ${n % 60}s` : `${Math.floor(n / 3600)}h ${Math.floor((n % 3600) / 60)}m`
+			const isRateLimitReason = /rate-limit/i.test(reason)
+			// Each fact exactly once: a "no activity for Ns" reason already states
+			// the silence, so adding "idle M:SS" repeats it (188s vs 3m 9s). And
+			// idle is only news for silence stalls: a dead stream is seconds old
+			// by construction and a failure just happened, so in both cases the
+			// field reads as noise next to the reason. Timestamp always stays.
+			// (Predicate hoisted to module scope: recover reuses it for the
+			// success-progress episode reset.)
+			const isSilence = isSilenceReason(reason)
+			// TWO COUNTERS, TWO MEANINGS - they never move together.
+			//
+			// `attempt N/M` - consecutive nudges the model did NOT answer. It
+			// climbs 1/3, 2/3, 3/3 and a nudge the model answered resets it to
+			// 1. That is the give-up ladder (w.resumeAttempts), which already
+			// carried exactly this rule.
+			//
+			// `retry #K` - how many times the model DID work after a nudge. It
+			// moves when the attempts reset, so the two numbers never climb
+			// together: a stalled session reads 1/3, 2/3, 3/3 (retry #K
+			// unchanged), a session that keeps working reads 1/3 (retry #K
+			// climbing).
+			//
+			// A provider fault is opencode's own retry, not a model failure: the
+			// ladder holds there, so the visible number holds with it.
+			const shown = providerFault ? attempt : attempt
+			const retries = prospectiveRetries ?? w.workRetries
+			const head = [
+				isSilence ? null : reason,
+				isRateLimitReason ? null : `attempt ${Math.min(shown, maxRetries)}/${maxRetries} (retry #${retries})`,
+				isSilence ? `idle ${hms(elapsed)}` : null,
+				now,
+			]
+				.filter((x): x is string => typeof x === "string" && x.length > 0)
+				.join("; ")
+			return (`continue — stalled (${head}).\nOnly continue work already in progress. ` +
+				`Do not start anything new, and do not take destructive or irreversible actions without explicit user approval.\n${suffix}`).slice(0, 2000)
+		}
+
+		/**
+		 * Core recovery ladder for a stuck/failed session.
+		 * plain continue with backoff -> more attempts -> abort+resume escalation.
+		 */
+		async function recover(sid: string, reason: string): Promise<void> {
+			const w = ensureWatch(sid)
+			if (isPaused(sid)) {
+				dbg(`${short(sid)} paused — skipping recover (${reason})`)
+				return
+			}
+			if (w.recovering || w.aborting || w.gaveUp || w.userCancelled || w.permissionPending) return
+			if (w.failureLoopLatched) {
+				dbg(`${short(sid)} failure loop latched — standing down until a genuine turn or fresh model output`)
+				return
+			}
+			// Failure-driven recoveries with no model output between them mean the
+			// backend is down, not the session stalled: each injected continue
+			// manufactures the next failure. Count them; past the max, latch
+			// instead of cycling the ladder forever.
+			if (reason.startsWith("session.step.failed") || reason.startsWith("session.execution.failed")) {
+				w.consecFailureRecovers++
+				if (w.consecFailureRecovers > FAILURE_LOOP_MAX) {
+					w.failureLoopLatched = true
+					log(
+						"warn",
+						`${short(sid)} ${w.consecFailureRecovers} consecutive failure recoveries with no model output — backend likely down, standing down until a genuine turn mod=${MODULE_INSTANCE}`,
+					)
+					return
+				}
+			}
+			{
+				const kind = lockKind(w)
+				if (kind) {
+					dbg(`${short(sid)} ${kind} locked — refusing recovery (reason: ${lockReason(w)})`)
+					return
+				}
+			}
+			if (w.compacting) {
+				dbg(`${short(sid)} mid-compaction — refusing recovery (reason: ${reason})`)
+				return
+			}
+			if (selfAbortActive(w)) {
+				dbg(`${short(sid)} self-abort in flight — refusing recovery (reason: ${reason})`)
+				return
+			}
+			// Evaluate the loop guard BEFORE recording this continue, so the plugin
+			// never escalates on continues it injected itself.
+			if (continuesInWindow(w) >= baseLoopMaxContinues) {
+				log("warn", `${short(sid)} hallucination loop (${baseLoopMaxContinues} continues/${loopWindowMs / 1000}s) — abort+resume`)
+				await tryAbortAndResume(sid, w)
+				w.continueTimestamps = []
+				return
+			}
+			// A stall after fresh model output is a NEW episode, not a deeper
+			// one: restart the ladder so it reads attempt 1/3 again
+			// (ses_ee7dade1 — 2/3 landed after real work). Assistant TEXT growth
+			// always counts. Successful tool/shell work counts only for
+			// silence-triggered stalls (ses_ede9b725 — 1/3 woke the model, it
+			// read a file, then went quiet): a wake-up that produced work is a
+			// new episode. Failure/dead-stream triggers never reset on tool
+			// progress (ses_edf403f5 — tool completion between dead-stream
+			// stalls must keep climbing toward gaveUp, else every cycle reads
+			// 1/3 forever). gaveUp itself is left alone: only a fresh turn
+			// (markBusy) clears that latch.
+			if (w.lastProdText !== "" && w.lastAssistantText !== w.prodAssistantSnapshot) {
+				// The model produced output since our last nudge: that is a WORK
+				// event, so the attempts reset below and the retry count moves -
+				// but only when a nudge actually lands (see the inject timer).
+				w.workSinceNudge = true
+				// Every reset logs: silent restarts hid the endless-1/3 loop
+				// for weeks (ses_ef3a2ba2 — resets visible only once in six
+				// fires). Observability before economy here.
+				log("info", `${short(sid)} text growth since last prod — restarting the stall ladder`)
+				// Only count mid-ladder restarts: a first fire after genuine
+				// work (attempts still 0) is a fresh episode, not a refire.
+				if (w.resumeAttempts > 0) w.episodeRefires++
+				w.resumeAttempts = 0
+				// New model output after TASK COMPLETE means there's more work:
+				// unlatch the completion so stall detection resumes.
+				if (w.completionSignaled) {
+					w.completionSignaled = false
+					w.completionSignaledAt = 0
+					dbg(`${short(sid)} model output after TASK COMPLETE — re-opening latched completion`)
+				}
+			} else if (isSilenceReason(reason) && w.succeededSinceProd > 0) {
+				// Work as well: a successful tool/shell since the last nudge.
+				w.workSinceNudge = true
+				log("info", `${short(sid)} progress since last prod — restarting the stall ladder`)
+				if (w.resumeAttempts > 0) w.episodeRefires++
+				w.resumeAttempts = 0
+			}
+			void syncCounters(sid, w)
+			if (lifetimeExhausted(sid, w)) return
+			// Per-session profile for maxRetries and lifetimeMaxContinues
+			const profile = resolveProfile(sid)
+			const profileMaxRetries = profile.maxRetries
+			const profileLifetimeMaxContinues = profile.lifetimeMaxContinues
+			// A failure the provider is already retrying is not model
+			// unresponsiveness: hold the rung, and never give up on it. Otherwise a
+			// transport fault climbs the ladder into gaveUp, which is terminal
+			// silence (the sweep is gated on !gaveUp and only a genuine user
+			// message clears it). ses_eae46bb9, 2026-10-19: 3x ECONNRESET, each
+			// answered by opencode's own `provider retry #2`, drove 1/3 -> 2/3 ->
+			// restart -> 1/3 and was one fire from standing the session down. The
+			// prod below still fires: a dead stream needs waking even when the
+			// provider is coming back.
+			const providerFault =
+				isProviderRetryFresh(w) &&
+				(reason.startsWith("session.step.failed") || reason.startsWith("session.execution.failed"))
+			// The rung is committed only when the prompt below actually lands (see
+			// the inject timer), because counting at detection burned rungs on the
+			// injections the busy/live guard declined (ses_eae46bb9, 2026-10-19).
+			if (!providerFault && w.resumeAttempts >= profileMaxRetries) {
+				log("warn", `${short(sid)} giving up after ${profileMaxRetries} attempts (${reason}) mod=${MODULE_INSTANCE}`)
+				w.gaveUp = true
+				return
+			}
+			w.recovering = true
+			const attempt = providerFault ? Math.max(1, w.resumeAttempts) : w.resumeAttempts + 1
+			const delay = backoffMs(attempt, baseBackoff, maxBackoff)
+			if (providerFault) {
+				log(
+					"info",
+					`${short(sid)} provider-fault stall (${reason}) — retry scheduled ${Math.round((Date.now() - w.providerRetryAt) / 1000)}s ago, holding the ladder at ${attempt}/${profileMaxRetries}`,
+				)
+			}
+			log(
+				"info",
+				`${short(sid)} stall detected (${reason}) — resume attempt ${attempt}/${profileMaxRetries} in ${delay}ms` +
+					` (work #${w.workRetries} this session)`,
+			)
+			if (w.recoverTimer) clearTimeout(w.recoverTimer)
+			// Increment generation so stale timer callbacks from a previous
+			// recover() call don't fire (prevents duplicate nudges).
+			const gen = ++w.recoverGeneration
+			// When this timer was armed: a genuine user message arriving after
+			// this point means the user took over mid-backoff, and firing into
+			// their live turn would interrupt it ("Step interrupted"). The
+			// freshness check below cannot see it — event-pump lag means their
+			// execution.started may not have been processed yet when we fire.
+			const armedAt = Date.now()
+			// Whether the prompt this timer sends actually lands. The ladder rung is
+			// committed only when it did — see the ok branch below.
+			let delivered = false
+			w.recoverTimer = setTimeout(async () => {
+				w.recoverTimer = null
+				// Stale timer guard: if a newer recover() call armed a different
+				// timer, this callback is stale and must not inject (prevents
+				// duplicate nudges from queued callbacks).
+				if (gen !== w.recoverGeneration) return
+				// F2 (2026-10-26): the w.workRetries value before this rung's claim - the
+				// release target if the rung is not consumed (declared here so the finally
+				// block below can see it).
+				let rungFloor = -1
+				// Disposed instances must stay silent: a superseded setup's
+				// backoff outlives its own dispose (which is exactly how twin
+				// identical prods landed milliseconds apart).
+				if (!running) return
+				try {
+					// Skip only if the session genuinely turned healthy again
+					// (a normal completion clears pendingRecoveryArmed) or the
+					// user took over.
+					if (w.userCancelled || w.gaveUp) return
+					// Refresh what we know about the user's messages from HISTORY
+					// before the park check below: w.lastGenuineUserAt only advances
+					// on the execution/step event handlers, so a genuine user message
+					// the watchdog has not noticed yet leaves it holding a pre-message
+					// value and the nudge fires into the user's live turn within the
+					// same minute (2026-10-21: comments at 10:55/10:57). The
+					// orphan-abort path already reads history for exactly this
+					// reason.
+					const history = await loadMessages(sid)
+					noteInboundUserMessage(sid, w, history)
+					// A genuine user message newer than the arm means the user took
+					// over during the backoff wait — park this recovery, do not fire
+					// into their turn. Own prompts never advance lastGenuineUserAt,
+					// so our own injections cannot trip this. (2026-10-11: continues
+					// landing right after user statements.)
+					// >=, not >: a message processed in the SAME sweep as the
+					// declaration carries the sweep's own timestamp, so strict >
+					// would let it through and fire into the user's live turn
+					// within the same minute (2026-10-12: comment 19:27, fire
+					// 19:28). Equal timestamps mean same-sweep causality.
+					if (w.lastGenuineUserAt >= armedAt) {
+						dbg(`${short(sid)} genuine user message after arm — parking recovery`)
+						return
+					}
+					if (w.status === "idle" && !w.pendingRecoveryArmed) return // recovered by itself meanwhile
+					// A turn sent to a busy session interrupts its in-flight step
+					// ("Step interrupted"). Never interrupt mid-compaction, and
+					// never interrupt a busy session that is still live (events
+					// within the chunk window): it is working, not stalled. The
+					// watchdog re-arms if it truly stalls.
+					if (w.compacting) {
+						dbg(`${short(sid)} mid-compaction at inject time — not interrupting`)
+						return
+					}
+					if (w.status === "busy" && Date.now() - w.lastActivityAt < chunkTimeoutMs) {
+						dbg(`${short(sid)} still busy and live at inject time (${Math.round((Date.now() - w.lastActivityAt) / 1000)}s since last event) — not interrupting`)
+						return
+					}
+					// Re-check the parent-wait guard: a child may have gone live
+					// between detection and this delayed inject. Interrupting a
+					// parent that is waiting on a subagent kills real work.
+					if (await parentWaitingOnSubagents(sid, new Set(await getActiveSessions()))) {
+						dbg(`${short(sid)} waiting on subagents at inject time — not interrupting`)
+						return
+					}
+					// Same re-check for user input: a question asked between
+					// detection and this delayed inject parks the turn. Reuse the
+					// history already loaded above.
+					if (isWaitingOnUser(sid, w, history)) {
+						dbg(`${short(sid)} waiting on user input at inject time — not interrupting`)
+						return
+					}
+					// Count this fire now: the text below reads the count, and every
+					// return past this point still decided to recover (declines all
+					// returned earlier), so the number matches injections decided.
+					// The retry count counts WORK, and work is counted where the
+					// attempts reset (the model produced output since the last nudge)
+					// - so it does NOT move per nudge. Seed it at 1 so the first
+					// nudge of a session never reads "retry #0".
+					//
+					// A provider fault is the exception: it IS a retry of the same
+					// attempt (the attempts hold, the model never answered), and the
+					// nudge must reach the session every time - two byte-identical
+					// prompts would be swallowed by the duplicate suppression and the
+					// prodding would stop.
+					// The PROSPECTIVE retry count for the text below: the count moves by
+					// one for this nudge when the model produced output since the last
+					// one, and it is seeded at 1 so the first nudge of a session never
+					// reads "retry #0". The count is COMMITTED only if the nudge lands
+					// (below) - counting at detection advanced it for nudges the user
+					// never saw, so the first VISIBLE message could read "retry #2"
+					// (ses_eaf2fe1f6ffemxjM5OL3kybdTx, 2026-10-22).
+					// F2 (2026-10-26): claim the rung count at rung START, before any
+					// await, so two rungs scheduled in the same pass carry distinct
+					// prospective counts (+1 each) instead of both reading the same
+					// stale w.workRetries; the commit below only ever moves forward.
+					rungFloor = w.workRetries
+					const prospectiveRetries = w.workRetries + 1
+					w.workRetries = prospectiveRetries
+					// At retry #7 (of 9 max for fast, 12 for slow), ask for a progress report
+					// so the model has a chance to report status before the hard limit
+					// stands it down. The prompt is a visible continue with explicit instructions.
+					const progressReportThreshold = Math.max(7, Math.floor(profileLifetimeMaxContinues * 0.7))
+					const isProgressReport = prospectiveRetries >= progressReportThreshold
+					const stallText = isProgressReport
+						? `PROGRESS REPORT REQUIRED (attempt ${Math.min(attempt, profileMaxRetries)}/${profileMaxRetries}, retry #${prospectiveRetries}/${profileLifetimeMaxContinues}): this session has been nudged multiple times. Please report exactly what you have completed and what remains. If work is done, call task_complete. If blocked, say what you need. If still working, say what step you are on. Do not start new work — only continue the current task.`
+						: await buildStallContinueText(sid, reason, attempt, providerFault, prospectiveRetries)
+					const ok = await injectOnce(sid, stallText, isProgressReport ? "stalled — progress report" : "stalled — retrying", false, true)
+					w.pendingRecoveryArmed = false
+					if (ok) {
+						delivered = true
+						// Commit the retry count now that the nudge landed (F2: forward-only —
+						// the rung was already claimed at rung start; a reordered landing must
+						// never clobber a newer rung's higher claim). (Claim already
+						// made at rung start; this line was a no-op and is removed.)
+						w.workSinceNudge = false
+						// Commit the rung only now that the prompt landed: the text
+						// above already carried `attempt`, and every decliner above
+						// returned before this point, so resumeAttempts counts
+						// delivered prods only (ses_eae46bb9, 2026-10-19: a declined
+						// inject burned rung 1, so the next fire read 2/3 with no
+						// 1/3 ever delivered). A provider-fault fire holds its rung
+						// instead: a transport fault is not the model failing to
+						// continue.
+						if (!providerFault && attempt > w.resumeAttempts) w.resumeAttempts = attempt
+						recordContinue(sid)
+						syncCounters(sid, w)
+						w.lastRetryAt = Date.now()
+						touch(sid)
+						markBusy(sid)
+					} else if (attempt >= maxRetries) {
+						await tryAbortAndResume(sid, w)
+					}
+				} finally {
+					// F2 release (2026-10-26): the rung above claimed one count, but the
+					// nudge was never consumed (dedup-suppressed, busy, declined, failed) -
+					// release the claim so an unconsumed rung cannot advance the ordinal or
+					// reach the progress-report threshold. Strict equality: a concurrent rung
+					// that claimed AFTER us keeps its higher count untouched.
+					if (!delivered && rungFloor >= 0 && w.workRetries === rungFloor + 1)
+						w.workRetries = rungFloor
+					void syncCounters(sid, w)
+					w.recovering = false
+					if (!delivered) {
+						dbg(`${short(sid)} attempt ${attempt}/${maxRetries} not delivered — rung not consumed (${reason})`)
+					}
+				}
+			}, delay)
+		}
+
+		/** Targeted recovery prompts (tool-as-text, done-claims, intent nudges). */
+
+		/**
+		 * Read the session's todo list.
+		 *
+		 * v1 tracked todos from a `todo.updated` event and a server API. v2 has neither:
+		 * nothing emits a todo event and no route reaches the todo table.
+		 *
+		 * What v2 DOES have is the session message log. Every `todowrite` call is
+		 * persisted as a tool part whose input carries the entire list, so the newest
+		 * completed call IS the current list. That is the real store, so it is read first
+		 * - reading anything else first is what made auto-resume conclude "no todos"
+		 * while the list was sitting in the log.
+		 *
+		 * `ctx.storage.get("todos/<sid>")` is kept LAST, and it is NOT a source of
+		 * another plugin's todos. `ctx.storage` is namespaced per plugin: the key
+		 * resolves to `storage/plugin/auto-resume.v2/todos/<sid>.json`, while a todo
+		 * plugin writing the same key lands in its OWN directory
+		 * (`storage/plugin/<its-id>/todos/<sid>.json`). Verified against the live
+		 * server: `/api/plugin/storage/<PLUGIN-ID>/<key>` carries the plugin id as a
+		 * path segment, and the on-disk tree is `storage/plugin/<PLUGIN-ID>/<key>.json`.
+		 * So no key auto-resume does not write itself can ever hold a todo list here.
+		 *
+		 * Do not promote it back to primary, and do not "fix" the mismatch by writing
+		 * the key: a reader cannot make another plugin's data appear in its namespace,
+		 * and duplicating that data would create a second writer racing the first. The
+		 * message log above is the only store both plugins can agree on.
+		 *
+		 * Cached for a short TTL: this is read on every idle inspection, and the list can
+		 * only change while the model is working, which is not when we ask. Returns `[]` on
+		 * any failure - every caller treats "no list" as "cannot conclude", never as
+		 * "nothing is open".
+		 */
+		async function readTodos(sid: string): Promise<Todo[]> {
+			const w = ensureWatch(sid)
+			const now = Date.now()
+			if (w.todosFetchedAt && now - w.todosFetchedAt < TODO_CACHE_TTL_MS) return w.todos
+			const fromMessages = await todosFromMessageSources(sid)
+			if (fromMessages) {
+			w.todos = fromMessages
+			w.todosFetchedAt = now
+			return w.todos
+			}
+			if (!ctx.storage) return w.todos
+			try {
+			const raw = await ctx.storage.get(`todos/${sid}`)
+			const record = raw as { todos?: unknown; updatedAt?: unknown } | null | undefined
+			const list = Array.isArray(record?.todos) ? record.todos : []
+			w.todos = list.filter(
+			(t): t is Todo =>
+			!!t && typeof t === "object" && typeof (t as Todo).content === "string" &&
+			typeof (t as Todo).status === "string",
+			)
+			w.todosFetchedAt = now
+			return w.todos
+			} catch (e) {
+			dbg(`${short(sid)} todo read failed:`, e instanceof Error ? e.message : String(e))
+			return w.todos
+			}
+		}
+		/**
+		 * Try every plausible source of a session's messages, in order, returning the
+		 * parsed todo list from the first that yields a `todowrite` tool part.
+		 *
+		 * Requires host access beyond the plugin ctx: `readFileSync` on
+		 * `/proc/self/cmdline`, and a loopback HTTP GET. Both are best-effort - a host
+		 * that refuses either degrades to the storage fallback rather than throwing.
+		 */
+		async function todosFromMessageSources(sid: string): Promise<Todo[] | undefined> {
+			// 1. The SDK client, if this plugin ctx was given one. Unwrap the `{data,cursor}`
+			// envelope: handing it straight to the parser trips its Array.isArray guard and
+			// silently resolves nothing.
+			try {
+			const message = (ctx.client as any)?.session?.message
+			if (typeof message?.list === "function") {
+			const res = await message.list.call(message, { path: { id: sid } })
+			const got = todosFromMessages(res?.data ?? res)
+			if (got) {
+			dbg(`${short(sid)} todos via ctx.client.session.message.list (${got.length})`)
+			return got
+			}
+			}
+			} catch (e) {
+			dbg(`${short(sid)} client message.list failed:`, e instanceof Error ? e.message : String(e))
+			}
+			// 2. The local HTTP server. Same shape the prompt-polisher already uses, so the
+			// auth and base-URL derivation are proven rather than guessed.
+			for (const base of serverBaseUrls()) {
+			try {
+			// `limit` matters: the default page is 50 messages and 200 is the server's
+			// ceiling (probed - 250 returns 400). Newest first, so a recent `todowrite` is
+			// always inside the page.
+			const res = await fetch(`${base}/api/session/${encodeURIComponent(sid)}/message?limit=200`, {
+			headers: serverHeaders(),
+			})
+			if (!res.ok) {
+			dbg(`${short(sid)} HTTP message read ${res.status} from ${base}`)
+			continue
+			}
+			// Same envelope trap as source 1: `{data, cursor}`, never a bare array.
+			const body = await res.json()
+			const got = todosFromMessages(body?.data ?? body)
+			if (got) {
+			dbg(`${short(sid)} todos via HTTP ${base} (${got.length})`)
+			return got
+			}
+			} catch (e) {
+			dbg(`${short(sid)} HTTP message read failed:`, e instanceof Error ? e.message : String(e))
+			}
+			}
+			return undefined
+		}
+
+
+		/**
+		 * Arm the deferred pattern pass, replacing any already pending.
+		 *
+		 * Replacement rather than stacking is the point: two idles inside one delay
+		 * window would otherwise judge the same turn twice, and a turn that matches
+		 * would spend two attempts of its budget on one piece of text.
+		 */
+		function schedulePatternPass(sid: string): void {
+			const w = ensureWatch(sid)
+			if (w.toolTextTimer) clearTimeout(w.toolTextTimer)
+			w.toolTextTimer = setTimeout(() => {
+				w.toolTextTimer = null
+				// v1's own guard, and it is doing real work here: a turn that started
+				// during the delay has its own idle, and its own armed pass. Judging
+				// this one now would read the live buffer, which markBusy has already
+				// emptied for the new turn.
+				if (w.status !== "idle") {
+					dbg(`${short(sid)} pattern pass skipped — session is ${w.status}, not idle`)
+					return
+				}
+				if (w.userCancelled) return
+				void inspectOnIdle(sid, "pattern")
+			}, toolTextCheckDelayMs)
+			dbg(`${short(sid)} pattern pass armed for +${toolTextCheckDelayMs}ms`)
+		}
+
+		async function targetedRecovery(
+			sid: string,
+			kind: string,
+			prompt: string,
+			budgetKey: "toolTextAttempts" | "doneClaimAttempts" | "doneClaimOpenTodosAttempts" | "todoNudgeAttempts" | "intentNudgeAttempts" | "stuckToolAttempts",
+		) {
+			const w = ensureWatch(sid)
+			if (w.recovering || w.userCancelled || w.permissionPending) return
+			// Locked sessions skip the work, not just the send. Checking only at the
+			// injection choke point (injectOnceLocked) still burns these budgets: the pass
+			// marks its parts examined and sets its one-shot flag BEFORE sending, so a
+			// refused nudge would leave the feature dead until the next user message.
+			// Bailing here keeps the budget intact for when the lock clears.
+			{
+				const locked = lockKind(w)
+				if (locked) {
+					dbg(`${short(sid)} locked (${locked}) — skipping ${kind} nudge`)
+					return
+				}
+			}
+			if (w.compacting) {
+				dbg(`${short(sid)} mid-compaction — skipping ${kind} nudge`)
+				return
+			}
+			// A session with a shell still running is working, not idle. A parent
+			// parked on a background job goes idle the moment the tool call returns
+			// — long before the process finishes — so without this it collects a
+			// nudge on the spot and the stall watchdog never even gets a look.
+			const busyShells = openShellCount(sid)
+			if (busyShells > 0) {
+				dbg(`${short(sid)} ${busyShells} shell(s) still running — skipping ${kind} nudge`)
+				return
+			}
+			if (selfAbortActive(w)) {
+				dbg(`${short(sid)} self-abort in flight — skipping ${kind} nudge`)
+				return
+			}
+			if (continuesInWindow(w) >= baseLoopMaxContinues) {
+				log("warn", `${short(sid)} loop guard before ${kind} nudge — abort+resume`)
+				await tryAbortAndResume(sid, w)
+				w.continueTimestamps = []
+				return
+			}
+			if (lifetimeExhausted(sid, w)) return
+			recordContinue(sid)
+			syncCounters(sid, w)
+			if (w[budgetKey] >= maxRetries) {
+				dbg(`${short(sid)} ${kind} budget exhausted`)
+				return
+			}
+			// Port of v1 e1b8374 ("Fix todoNudgeAttempts burning retries on failed
+			// sends"): only count an attempt once the prompt actually landed. A
+			// rejected send costs nothing, so a transient failure no longer eats a
+			// retry and silences the nudge for the rest of the session.
+			const attemptNum = w[budgetKey] + 1
+			log("info", `${short(sid)} ${kind} detected — sending targeted prompt (${attemptNum}/${maxRetries})`)
+			w.recovering = true
+			// injectOnce debounces: this nudge counts once, not alongside a
+			// concurrent stall-watchdog injection.
+			const ok = await injectOnce(sid, prompt, "recovering: " + kind, false, false, quietCorrections)
+			w.recovering = false
+			if (ok) {
+				w[budgetKey] = attemptNum
+				touch(sid)
+				markBusy(sid)
+			} else {
+				dbg(`${short(sid)} ${kind} nudge not delivered — attempt ${attemptNum} not counted`)
+			}
+		}
+
+		// ---------------------------------------------------------------------
+		// Idle-time forensics (runs once when a turn finishes)
+		// ---------------------------------------------------------------------
+
+		/**
+		 * Fetch a session's message history once per idle inspection.
+		 *
+		 * Four separate checks below want the same array — the dead-stream
+		 * detector, the text fallback, the pending-tool and active-user lookups —
+		 * and `ctx.session.context()` is the expensive call in all of them (it is
+		 * every message since the last compaction). v1 fetched once for the same
+		 * reason. The cache lives only for the duration of one inspection, so a
+		 * later idle always sees the freshest history.
+		 *
+		 * Returns `[]` on any failure: this is forensic, and every caller already
+		 * treats "no history" as "cannot conclude".
+		 */
+		async function loadMessages(sid: string): Promise<unknown[]> {
+			try {
+				const res = await ctx.session.context({ sessionID: sid })
+				const arr = Array.isArray(res) ? res : ((res as { messages?: unknown[] })?.messages ?? [])
+				// Canonical oldest-first order. Sources disagree: the message
+				// API returns newest-first (see the todosFromMessages order
+				// note), the harness feeds oldest-first, and every walk below
+				// reads the END as newest. Sort by timestamp so both shapes
+				// land the same way; stable sort keeps encounter order on ties
+				// and timeless messages sink to the front. ses_ed975114
+				// (2026-10-10): the busy latch read the wrong end in prod and
+				// never engaged while every test stayed green.
+				if (arr.length > 1) {
+					const at = (m: unknown): number => {
+						const mm = m as { time?: { created?: number }; info?: { time?: { created?: number } } }
+						const t = mm?.time?.created ?? mm?.info?.time?.created
+						return typeof t === "number" ? t : 0
+					}
+					return [...arr].sort((a, b) => at(a) - at(b))
+				}
+				return arr
+			} catch (e) {
+				dbg(`${short(sid)} session.context() failed:`, e instanceof Error ? e.message : String(e))
+				return []
+			}
+		}
+
+		/** The newest assistant message that delivered text, joined. "" when none. */
+		function lastAssistantTextFrom(messages: unknown[]): string {
+			for (let i = messages.length - 1; i >= 0; i--) {
+				const msg = messages[i] as {
+					type?: string
+					role?: string
+					text?: string
+					info?: { content?: string }
+					content?: Array<{ type?: string; text?: string }>
+				}
+				// Prod history carries role, the harness carries type — msgRole reads both.
+// ses_edbb4e67 (2026-10-10): type-only read returned "" in prod,
+// so a "TASK COMPLETE" delivery never latched and the stall fired.
+				if (!msg || msgRole(msg) !== "assistant") continue
+				// Prod shape carries flat text; harness shape carries parts.
+				// Mirror userTextsOf: check both, or history reads go blind.
+				// ses_ed93e258 (2026-10-10): parts-only read missed flat-text
+				// deliveries and the latch never engaged despite the fix live.
+				if (Array.isArray(msg.content)) {
+					const text = msg.content
+						.filter((part) => part?.type === "text" && typeof part.text === "string")
+						.map((part) => part.text as string)
+						.join("")
+					if (text) return text
+					continue
+				}
+				const flat =
+					(typeof msg.text === "string" && msg.text) ||
+					(typeof msg.info?.content === "string" && msg.info.content) ||
+					""
+				if (flat) return flat
+			}
+			return ""
+		}
+
+		/**
+		 * The newest assistant message's reasoning text, joined. "" when none.
+		 *
+		 * A reasoning block is the one place a model writes a tool call that never
+		 * becomes one: the raw markup lands in the reasoning and nothing executes.
+		 * v1 caught that on the same pass as the text variant and answered with a
+		 * different prompt, because the fix is different — the model is not
+		 * forgetting the mechanism, it is writing in the wrong channel.
+		 *
+		 * v2 separates the two cleanly, since `AssistantContent` tags reasoning and
+		 * text distinctly where v1 filtered them together into one string.
+		 */
+		function lastAssistantReasoning(messages: unknown[]): string {
+			for (let i = messages.length - 1; i >= 0; i--) {
+				const msg = messages[i] as {
+					type?: string
+					role?: string
+					content?: Array<{ type?: string; text?: string }>
+				}
+				// Same prod/harness split as lastAssistantTextFrom: role vs type.
+				if (!msg || msgRole(msg) !== "assistant" || !Array.isArray(msg.content)) continue
+				const reasoning = msg.content
+					.filter((part) => part?.type === "reasoning" && typeof part.text === "string")
+					.map((part) => part.text as string)
+					.join("")
+				if (reasoning) return reasoning
+			}
+			return ""
+		}
+
+		/**
+		 * v1's `getLastSilentDeadStream`, on the v2 message shape.
+		 *
+		 * The model can finish a turn having produced no text at all — reasoning
+		 * only, or a `finish=unknown` that the provider did not describe. The
+		 * turn looks complete, so nothing raises, and the session simply stops.
+		 * A `finish` with real text behind it means the session answered normally
+		 * and there is nothing to recover.
+		 *
+		 * Only the newest assistant message that *has* a finish is judged, and the
+		 * walk skips messages without one — an intermediate tool-call step has no
+		 * finish, and walking back past a delivered answer to one of those would
+		 * recover a session that just used a tool.
+		 *
+		 * Returns `null` when the newest finished message carried text — or when it
+		 * carried tool calls, which are delivered work, not silence. A thinking
+		 * model doing tool work ends turns with a finish reason, spent output
+		 * tokens, and no text parts; judging that "silent" fires a continue
+		 * into active work (ses_efaec2f99ffexosULGDJJ8i6sA, 2026-10-04).
+		 * Returns `null` as well when there is no finished message at all.
+		 */
+		function lastSilentDeadStream(messages: unknown[]): { finish: string; outputTokens: number } | null {
+			for (let i = messages.length - 1; i >= 0; i--) {
+				const msg = messages[i] as {
+					role?: string
+					content?: Array<{ type?: string; text?: string }>
+					finish?: string
+					tokens?: { output?: number }
+				}
+				if (msgRole(msg) !== "assistant") continue
+				const finish = typeof msg.finish === "string" ? msg.finish : undefined
+				if (!finish) continue
+				const parts = Array.isArray(msg.content) ? msg.content : []
+				const hasText = parts.some((p) => p?.type === "text" && typeof p.text === "string" && p.text.length > 0)
+				if (hasText) return null
+				// Same tool-part convention as hasPendingUserInput: a finished
+				// turn that issued tool calls did work, even with no chatter.
+				const hasToolCalls = parts.some((p) => {
+					const t = p?.type ?? ""
+					return t === "tool_use" || t === "tool" || t === "tool_call" || t.startsWith("tool")
+				})
+				if (hasToolCalls) return null
+				return { finish, outputTokens: posNum(msg.tokens?.output) }
+			}
+			return null
+		}
+
+		/**
+		 * Recover a stream that finished without ever delivering text.
+		 *
+		 * Ported from v1 including its guard: re-check the server's own status
+		 * first, because a provider that is quietly retrying looks identical from
+		 * the event stream, and interrupting that would turn a recovering session
+		 * into a stalled one. Then arm the pending-recovery latch — without it
+		 * `recover()`'s inject-time check reads an idle session as "recovered by
+		 * itself" and drops the injection.
+		 *
+		 * Returns true when it took action — or when the evidence positively says
+		 * hands off (tools still in flight, own flag back to busy) — so the
+		 * caller stops looking. Returns false when it declined on weak evidence
+		 * (server still lists an idle session): the session is NOT buried, the
+		 * remaining idle checks still run, and the next inspection re-evaluates.
+		 */
+		async function recoverSilentDeadStream(sid: string, messages: unknown[]): Promise<boolean> {
+			const dead = lastSilentDeadStream(messages)
+			if (!dead) return false
+			if (dead.outputTokens < silentDeadStreamMinTokens) {
+				dbg(
+					`${short(sid)} last finished message has no text, but only ${dead.outputTokens} output tokens (floor ${silentDeadStreamMinTokens}) — not treating it as a dead stream`,
+				)
+				return false
+			}
+			const w = ensureWatch(sid)
+			// Tools still awaiting results are working, not stalled — even when
+			// the finished message predates the tool events and looks dead.
+			// Reads the at-idle snapshot, not the live counter: markIdle zeroes
+			// it on the transition, and idle fires while tools run.
+			if (w.toolsInFlightAtIdle > 0) {
+				dbg(`${short(sid)} silent dead stream, but ${w.toolsInFlightAtIdle} tool(s) still in flight — working, not stalled`)
+				return true
+			}
+			// Ask the server before injecting, not just our own flag. A provider
+			// that is quietly retrying looks exactly like a dead stream from the
+			// event stream, and the event may not have arrived yet when the turn
+			// ends — which is v1's own reason for re-checking live status here.
+			//
+			// Our own flag flipping back to busy means a fresh execution.started
+			// arrived after the idle: the session genuinely restarted, so hands
+			// off. That is positive evidence, and it counts as handled.
+			if (w.status === "busy") {
+				dbg(`${short(sid)} silent dead stream, but the session is busy again — genuine restart, leaving it alone`)
+				return true
+			}
+			// The server still listing the session is weak evidence by comparison:
+			// its active map is known-stale (an idled session can linger there),
+			// while our own flag says idle. Declining here must NOT report
+			// handled — return true buries the session, and no later pass will
+			// ever reconsider it (2026-10-11: a real dead stream stood down this
+			// way while the job sat idle). Return false so the remaining idle
+			// checks run now and the next inspection re-reads the server fresh.
+			if ((await getActiveSessions()).includes(sid)) {
+				dbg(`${short(sid)} silent dead stream, but the server still lists the session — possibly a provider retry; deferring, not burying`)
+				return false
+			}
+			w.pendingRecoveryArmed = true
+			log(
+				"info",
+				`${short(sid)} silent dead stream: finish=${dead.finish}, ${dead.outputTokens} output tokens, no text parts; resuming`,
+			)
+			await recover(sid, `Silent dead stream (${dead.finish})`)
+			return true
+		}
+
+		/**
+		 * One instant nudge for a turn the model never answered at all.
+		 *
+		 * The caller only reaches here when there is no text — but "no text"
+		 * is not "nothing happened". A short answer below the token floor, a
+		 * turn that did tool work, or a retry the server still lists are all
+		 * deliberate silences the suite pins as leave-alone, so this fires
+		 * only when no assistant message exists after the newest user message
+		 * at all. Everything else belongs to the detectors above (dead stream,
+		 * stuck tool, silent reasoning) or the stall ladder.
+		 *
+		 * Without this, such a turn is invisible to every detector and the
+		 * session sits until the next event — which may never come. One quiet
+		 * continue, fired immediately (no stall-window wait), single-shot per
+		 * episode.
+		 *
+		 * The user's stop stays final: userCancelled, gaveUp, and every other
+		 * lock is checked here AND inside recover(), so an interrupted job can
+		 * never be restarted by this. A turn awaiting the user's reply is a
+		 * hand-off, not a death, and a latched completion is never re-nudged.
+		 */
+		async function nudgeEmptyIdleTurn(sid: string, w: SessionWatch, messages: unknown[]): Promise<boolean> {
+			if (w.emptyIdleNudged) return false
+			if (w.userCancelled || w.gaveUp || w.permissionPending) return false
+			if (w.completionSignaled) return false
+			if (w.failureLoopLatched) {
+				dbg(`${short(sid)} failure loop latched — standing down until a genuine turn`)
+				return false
+			}
+			// The stall ladder already owns this episode: a recovery is in
+			// flight (w.recovering) or has already fired (resumeAttempts > 0).
+			// Firing here would stack a second, unlabeled continue on top of
+			// the ladder's — the twin-injection shape the dedupe machinery
+			// exists to prevent (ses_ee14d727: an idle lands between our send
+			// and the model's start, and that idle must not restart OR duplicate
+			// the ladder). The empty-idle nudge is only for episodes where
+			// NOTHING has fired yet.
+			if (w.recovering || w.resumeAttempts > 0) return false
+			if (hasAssistantReplySinceUser(messages)) return false
+			if (isWaitingOnUser(sid, w, messages)) {
+				dbg(`${short(sid)} empty idle turn is waiting on the user — not nudging`)
+				return false
+			}
+			{
+				const kind = lockKind(w)
+				if (kind) {
+					dbg(`${short(sid)} ${kind} locked — refusing empty-idle nudge (reason: ${lockReason(w)})`)
+					return false
+				}
+			}
+			if (w.compacting) {
+				dbg(`${short(sid)} mid-compaction — refusing empty-idle nudge`)
+				return false
+			}
+			if (selfAbortActive(w)) {
+				dbg(`${short(sid)} self-abort in flight — refusing empty-idle nudge`)
+				return false
+			}
+			// Same loop guard as recover(): our continue counts toward the
+			// shared window, and past the max the answer is escalation, not
+			// another prompt.
+			if (continuesInWindow(w) >= baseLoopMaxContinues) {
+				log("warn", `${short(sid)} hallucination loop (${baseLoopMaxContinues} continues/${loopWindowMs / 1000}s) — abort+resume`)
+				await tryAbortAndResume(sid, w)
+				w.continueTimestamps = []
+				return true
+			}
+			w.emptyIdleNudged = true
+			if (lifetimeExhausted(sid, w)) return true
+			recordContinue(sid)
+			syncCounters(sid, w)
+			// Send DIRECTLY, not through recover(): recover() schedules on a
+			// backoff timer (the opposite of instant) and arms selfRecovery
+			// for a turn that may never start — a stale claim that would
+			// steal genuineness from the next real turn (a fresh turn must
+			// reset the quota ladder — pinned by the rate-limit suite).
+			// notifyAndPrompt is awaited here, so no timer gap can re-arm
+			// behind us; and a prompt this sends IS a fresh episode, which is
+			// exactly what the flag being clear means.
+			log("info", `${short(sid)} idle with no reply, no question, no completion claim — instant nudge (single-shot this episode)`)
+			// notifyAndPrompt arms selfRecovery for the turn this prompt starts.
+			// That turn IS a fresh episode by definition — nothing was happening
+			// — so genuine classification is correct for it. But if no turn
+			// follows, the claim would linger and steal genuineness from the next
+			// real turn (a fresh turn must reset the quota ladder — pinned by
+			// the rate-limit suite). Restore unless someone else armed
+			// concurrently, whose claim is not ours to clear.
+			const wasSelfRecovery = w.selfRecovery
+			const sent = await notifyAndPrompt(sid, opts.continuePrompt ?? SAFE_EMPTY_IDLE_PROMPT, "empty-idle nudge")
+			if (!wasSelfRecovery) w.selfRecovery = false
+			return sent
+		}
+
+		/**
+		 * True when any assistant message exists after the newest user message.
+		 * Anything the model said or did — text, reasoning, tool calls — counts:
+		 * the instant nudge is only for a turn with literally no reply.
+		 */
+		function hasAssistantReplySinceUser(messages: unknown[]): boolean {
+			for (let i = messages.length - 1; i >= 0; i--) {
+				const m = messages[i] as { role?: unknown; type?: unknown } | null | undefined
+				if (!m || typeof m !== "object") continue
+				const role = msgRole(m)
+				// The newest user message bounds the current turn: anything at
+				// or before it belongs to an earlier episode.
+				if (role === "user") return false
+				if (role === "assistant") return true
+			}
+			// No user message and no assistant message: no turn exists at all,
+			// so there is nothing to restart.
+			return false
+		}
+
+		/**
+		 * True when the session is holding the ball: a tool call whose result is
+		 * still outstanding.
+		 *
+		 * A synthetic nudge in that state starts a step the user's real reply then
+		 * interrupts ("Step interrupted"), so every idle recovery path stands down.
+		 *
+		 * This used to test `state.status === "pending"`, which v2 never emits, so
+		 * the branch was unreachable and the nudge fired with an unanswered
+		 * `question` on screen. See TOOL_STATE_* above.
+		 */
+		function hasPendingUserInput(messages: unknown[]): boolean {
+			const newest = messages[messages.length - 1] as {
+				type?: string
+				content?: { type?: string; name?: string; state?: { status?: string } }[]
+			}
+			if (newest?.type !== "assistant") return false
+			for (const part of newest.content ?? []) {
+				const t = part?.type ?? ""
+				if (!(t === "tool_use" || t === "tool" || t === "tool_call" || t.startsWith("tool"))) continue
+				const status = part?.state?.status
+				if (status === TOOL_STATE_RUNNING || status === TOOL_STATE_PENDING) return true
+				// An interactive tool only reaches a terminal state once the user has
+				// actually answered. "error" here means the question was interrupted,
+				// not that it was answered, so keep standing down.
+				if (status !== TOOL_STATE_COMPLETED && AWAITING_USER_TOOLS.has(part?.name ?? "")) return true
+			}
+			return false
+		}
+
+		/**
+		 * Narrow user-wait check for the busy-stall path. Unlike
+		 * `hasPendingUserInput` (any unfinished tool means the idle turn
+		 * isn't over), a busy session with a wedged bare tool and zero events
+		 * IS a stall — so only tools whose completion is the user answering
+		 * (`question`, `permission`, `ask`, `confirm`) count. A turn parked
+		 * on one of those is waiting, not stalled (ses_ef72c5f3 2026-10-05: a
+		 * stall continue fired into a session parked on a `question`).
+		 */
+		function isWaitingOnUser(sid: string, w: SessionWatch, messages: unknown[]): boolean {
+			// A genuine new user message re-arms here too (not just on the
+			// idle path): this is what clears a user-interrupt stand-down
+			// when the user hands the session back.
+			noteInboundUserMessage(sid, w, messages)
+			const newest = messages[messages.length - 1] as {
+				type?: string
+				content?: { type?: string; name?: string; state?: { status?: string } }[]
+			}
+			if (newest?.type !== "assistant") return false
+			for (const part of newest.content ?? []) {
+				const t = part?.type ?? ""
+				if (!(t === "tool_use" || t === "tool" || t === "tool_call" || t.startsWith("tool"))) continue
+				if (!AWAITING_USER_TOOLS.has(part?.name ?? "")) continue
+				// As in `hasPendingUserInput`: "error" means interrupted, not
+				// answered — only a completed user-awaiting tool ends the wait.
+				if (part?.state?.status !== TOOL_STATE_COMPLETED) return true
+			}
+			return false
+		}
+
+	/**
+	 * Newest inbound user message timestamp, or undefined. Shared by the
+	 * stand-down check and the stand-down recheck scheduler so both agree on
+	 * when the activity window expires.
+	 */
+	function lastUserMessageAt(messages: unknown[]): number | undefined {
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const m = messages[i] as {
+				type?: string
+				role?: string
+				time?: { created?: number }
+				info?: { time?: { created?: number }; role?: string }
+			}
+			const isUser = msgRole(m) === "user"
+			if (!isUser) continue
+			const ts = m.time?.created ?? m.info?.time?.created
+			return typeof ts === "number" ? ts : undefined
+		}
+		return undefined
+	}
+
+		async function shouldStandDownForUser(
+			sid: string,
+			messages: unknown[],
+			activeUserWindowMs: number,
+		): Promise<boolean> {
+	try {
+		if (messages.length === 0) return false
+		// (a) A tool call still awaiting its result — see hasPendingUserInput.
+		if (hasPendingUserInput(messages)) return true
+		// (b) The user was recently active — they are mid-conversation, not stuck.
+		//
+		// v1 stamps `lastUserMessageAt` on ANY inbound user message and asks
+		// "was there one inside activeUserWindowMs?". This used to ask "is the
+		// newest message a user message?", which at idle time is essentially never
+		// true — the newest message is the assistant turn that just finished — so
+		// the whole window was dead. Walk back for the most recent user message.
+		const lastUserAt = lastUserMessageAt(messages)
+		if (lastUserAt !== undefined && Date.now() - lastUserAt < activeUserWindowMs) return true
+		return false
+	} catch {
+		return false
+	}
+}
+
+/**
+		 * Re-arm the done-claim budgets when a genuinely new work cycle starts.
+		 *
+		 * The signal is an inbound user message, and what makes one genuine is that
+		 * it is a *different* message — identified by id, not by timestamp. A
+		 * re-delivered or replayed message has the same id and is not new work;
+		 * comparing clock times instead would treat any drift between two reads of
+		 * the history as a new request and hand the model a fresh budget every time
+		 * it repeated itself, which is exactly what #26 was. Timestamps are only the
+		 * fallback, for messages that carry no id.
+		 *
+		 * The history is already loaded, so this costs nothing extra.
+		 *
+		 * Doing this only here (and not on every busy cycle) is the #26 fix: a model
+		 * that re-announces completion each turn would otherwise be handed a fresh
+		 * budget each time it announced, and the nudge would never stop.
+		 */
+		/**
+		 * Rebuild what we know about our OWN injections from the session log.
+		 *
+		 * ownPromptTexts and lastInjectAt live in the watch record, which a plugin
+		 * reload starts empty. Without this, the newest user message of a session
+		 * we ourselves nudged looks like a genuine user message on the next sweep:
+		 * the stall ladder restarts at 1/3 and the visible progress counter resets,
+		 * so a long stall cycle reads "attempt 1/3 (retry #1)" over and over. The
+		 * session log is the durable record - rebuild from it.
+		 */
+		function rememberOwnPrompts(w: SessionWatch, messages: unknown[]): void {
+			const start = Math.max(0, messages.length - 40)
+			for (let i = start; i < messages.length; i++) {
+				const m = messages[i]
+				if (msgRole(m) !== "user") continue
+				const text = messageTextOf(m)
+				if (!looksLikeOwnPrompt(text)) continue
+				if (!w.ownPromptTexts.includes(text as string)) {
+					w.ownPromptTexts.push(text as string)
+					if (w.ownPromptTexts.length > 10) w.ownPromptTexts.shift()
+				}
+				const at = msgAt(m)
+				if (at > 0 && at > w.lastInjectAt) w.lastInjectAt = at
+			}
+		}
+
+		function noteInboundUserMessage(sid: string, w: SessionWatch, messages: unknown[]): void {
+			rememberOwnPrompts(w, messages)
+			let latest: { id?: string; at?: number; text?: string } | null = null
+			for (let i = messages.length - 1; i >= 0; i--) {
+				const m = messages[i] as {
+					id?: string
+					type?: string
+					role?: string
+					time?: { created?: number }
+					info?: { time?: { created?: number }; role?: string }
+					content?: Array<{ type?: string; text?: string }>
+					text?: string
+				}
+				const isUser = msgRole(m) === "user"
+				if (!isUser) continue
+				const text = messageTextOf(m)
+				latest = { id: typeof m.id === "string" ? m.id : undefined, at: m.time?.created ?? m.info?.time?.created, text }
+				break
+			}
+			if (!latest) return
+			const isNew = latest.id
+				? latest.id !== w.lastUserMessageID
+				: typeof latest.at === "number" && latest.at > w.lastUserMessageSeenAt
+			if (!isNew) return
+			w.lastUserMessageID = latest.id
+			if (typeof latest.at === "number") w.lastUserMessageSeenAt = latest.at
+			// Our own injections travel the visible channel as real user messages.
+			// They start a new turn but carry no new instructions: re-arming on
+			// them clears the budgets just spent and the same errors refire on
+			// the next idle (ses_ef81e8561ffeXyx3jAzKl5lltv, 2026-10-04 — four
+			// identical unknown-tool prompts, each "2x"). Tracking above stays
+			// truthful; only the clearing is skipped. Two signals: exact text
+			// match, and recency to our last inject — the live projection can
+			// carry user messages with no readable body (content null), which
+			// defeats text matching, but our prompt always lands within seconds
+			// of the inject on the same box clock.
+			const ownByText = typeof latest.text === "string" && latest.text.length > 0 && w.ownPromptTexts.includes(latest.text)
+			// The prompt body itself says who wrote it. This survives a plugin
+			// reload, where the in-memory own-prompt record starts empty.
+			const ownByShape = looksLikeOwnPrompt(latest.text)
+			const ownByTime =
+				typeof latest.at === "number" &&
+				w.lastInjectAt > 0 &&
+				latest.at >= w.lastInjectAt &&
+				latest.at - w.lastInjectAt < OWN_PROMPT_TIME_MS
+			// ownByTime alone is too permissive: a genuine user message arriving
+			// within OWN_PROMPT_TIME_MS of our injection would be misidentified as
+			// our own prompt, skipping the workRetries reset and breaking the
+			// retry counter (I1 audit, 2026-10-23). Only trust ownByTime when
+			// there is no readable body (content null projection) AND the message
+			// arrived on our inject clock.
+			const ownByTimeOnly = ownByTime && !(typeof latest.text === "string" && latest.text.length > 0)
+			if (ownByText || ownByShape || ownByTimeOnly) {
+				dbg(`${short(sid)} newest user message is our own prompt — not re-arming budgets`)
+				return
+			}
+			if (w.doneClaimAttempts > 0 || w.doneClaimOpenTodosAttempts > 0) {
+				dbg(`${short(sid)} new user message — re-arming the done-claim budgets`)
+			}
+			w.doneClaimAttempts = 0
+			w.doneClaimOpenTodosAttempts = 0
+			// A genuine new user message hands the session back: clear a
+			// user-interrupt stand-down (ses_eeb02d4b, 2026-10-07 — the latch
+			// otherwise holds until session cleanup and even an explicit
+			// "continue" is refused). Only a message newer than the latch
+			// itself re-arms: a pre-interrupt message the plugin simply
+			// hadn't observed yet must not clear it. Manual interrupts
+			// themselves are untouched; only future recovery re-arms.
+			if (w.userCancelled && typeof latest.at === "number" && latest.at >= w.userCancelledAt) {
+				dbg(`${short(sid)} new user message after interrupt — re-arming recovery`)
+				w.userCancelled = false
+			}
+			// A new request is new work: the ack self-loop counter starts clean,
+			// because the model re-announcing completion after the user asked for
+			// more is not the stuck case this counts.
+			w.taskCompleteSignals = 0
+			// The unknown-tool budget is scoped to one request for the same reason:
+			// a model told to do something new gets a fresh tool list, and one
+			// invented name in the previous round says nothing about this one.
+			if (w.unknownToolErrors.size > 0 || w.unknownToolSuggestionSent) {
+				dbg(`${short(sid)} new user message — re-arming the unknown-tool budget`)
+			}
+			w.unknownToolErrors.clear()
+			w.unknownToolSuggestionSent = false
+			w.stuckToolAttempts = 0
+			// A genuine user message is a new episode for the stall ladder too
+			// (the reset lives here, on genuine execution.started, and in the
+			// progress check — never on lifecycle transitions). Recorded
+			// separately from lastUserMessageSeenAt, which our own prompts also
+			// advance: only non-own messages mark a user takeover. Clamped to
+			// now: message timestamps come from the server clock, and a forged
+			// or skewed future timestamp would otherwise keep
+			// `lastGenuineUserAt > armedAt` true indefinitely, parking every
+			// later recovery (the fuse suite forges +35s deliberately; a skewed
+			// server clock does it by accident). Clamping only pulls futures
+			// back to the present — genuine past timestamps pass through.
+			w.lastGenuineUserAt =
+				typeof latest.at === "number" ? Math.min(latest.at, Date.now()) : Date.now()
+			// A genuine user message is activity: it resets the silence clock,
+			// not just the ladder count. Without this, a message the plugin
+			// only learns about via a history read leaves lastActivityAt stale,
+			// and the watchdog declares a stall on a session the user just
+			// spoke to. touch() itself debounces bursts (minActivityGapMs), and
+			// this runs only for genuinely-new, non-own messages.
+			touch(sid)
+			// A genuine new user message is also what re-opens a latched
+			// completion: new instructions mean the "done" being tracked is no
+			// longer the question. This is the ONLY place the latch clears besides
+			// a fresh latch overwriting it — deliberately not in markBusy, whose
+			// transitions include plumbing (watchdog re-marks, discovery adopts,
+			// step events, our own injections' turns) that wiped fresh latches
+			// within seconds (ses_ed33c0da, 2026-10-11). Own prompts return above
+			// before reaching here, so our injections never clear it.
+			if (w.completionSignaled) {
+				w.completionSignaled = false
+				w.completionSignaledAt = 0
+				dbg(`${short(sid)} genuine new user message — re-opening latched completion`)
+			}
+			// A genuine user message is a new episode for the stall ladder too
+			// (the reset lives here, on genuine execution.started, and in the
+			// progress check — never on lifecycle transitions).
+			if (w.resumeAttempts > 0) {
+				dbg(`${short(sid)} new user message — restarting the stall ladder`)
+			}
+			w.resumeAttempts = 0
+			// The user owns the turn now: a retry scheduled before their message
+			// no longer describes what a stall after it means.
+			w.providerRetryAt = 0
+			// A genuine user message also closes any refire episode: the next
+			// stall starts back at the base fuse.
+			w.episodeRefires = 0
+			// Lifetime cap is also per genuine user episode: new instructions
+			// mean a new task, so the total-fire count starts over here — and
+			// only here (plus genuine execution.started), never on model text.
+			w.lifetimeContinues = 0
+			// The retry count rides that budget: it counts the work done after a
+			// nudge, which can never outrun the continues of the episode, so the
+			// existing `lifetimeMaxContinues` setting (9) bounds it too.
+			w.workRetries = 0
+			if (ctx.storage?.remove) {
+				ctx.storage.remove(`${COUNTER_STATE_PREFIX}${sid}`).catch(() => {})
+			}
+			// And it re-opens a stood-down session: the stall gaveUp latch
+			// clears on genuine user takeovers, never on transitions.
+			w.gaveUp = false
+			// Same for the empty-idle single-shot: a genuine user message is
+			// a new episode, so the instant nudge re-arms here — and only at
+			// the observable-episode sites, never in markBusy (which also runs
+			// on our own recovery injections and would re-arm on its own send).
+			w.emptyIdleNudged = false
+			// Deliberately NOT clearing checkedToolPartIDs: already-reported
+			// errors must never be recounted. Clearing it made every genuine
+			// user message re-suggest the same stale errors (2026-10-04: one
+			// bash suggestion per message, long after the model moved to shell).
+			// New error parts still count fresh toward the threshold.
+		}
+
+		/** Registered tool names, cached briefly — the registry only changes when a
+		 * plugin reloads, and this runs on every idle. */
+		let cachedToolIds: string[] | null = null
+		let cachedToolIdsAt = 0
+
+		async function getAvailableToolIds(): Promise<string[]> {
+			if (cachedToolIds && Date.now() - cachedToolIdsAt < TOOL_IDS_CACHE_MS) return cachedToolIds
+			if (!ctx.tool?.list) return cachedToolIds ?? []
+			try {
+				const listed = await ctx.tool.list()
+				// `id` is the effective name — the namespaced form when the tool sits
+				// in a namespace — which is exactly the string a model would have to
+				// call, so it is what the suggestion has to quote back.
+				const ids = (listed as Array<{ id?: string; name?: string }>)
+					.map((t) => (typeof t?.id === "string" && t.id ? t.id : typeof t?.name === "string" ? t.name : ""))
+					.filter((n) => n.length > 0)
+				cachedToolIds = ids
+				cachedToolIdsAt = Date.now()
+				return ids
+			} catch (e) {
+				log("warn", `failed to list tools: ${e instanceof Error ? e.message : String(e)}`)
+				// Stale names are better than none for a "does this exist" check: a
+				// tool added since the cache would be wrongly called unknown, but
+				// that costs one extra suggestion, while an empty list skips the
+				// check entirely and loses the feature.
+				return cachedToolIds ?? []
+			}
+		}
+
+		/**
+		 * Name a replacement when a model keeps calling a tool that does not exist.
+		 *
+		 * v1 asks `ctx.client.tool.ids()`. v2 has no such route; `ctx.tool.list()`
+		 * returns the same set of effective names, which is all this needs.
+		 *
+		 * The tool parts come from the message history rather than from events,
+		 * because the whole point is a part that already *errored* — by the time the
+		 * error lands, the `session.tool.called` event for that part is long gone,
+		 * and this code only runs on idle anyway.
+		 */
+		/**
+		 * Nudge a turn that ended with a tool call that never returned, or retry
+		 * one that failed at end of turn.
+		 *
+		 * The event-counted `pendingTools` only sees what the plugin observed live:
+		 * a turn that ends while a call is still in flight (compress wedging at
+		 * 13:09:44 in ses_edf403f5, a write left streaming in ses_ee14d727) parks
+		 * the session idle with `pendingTools === 0`, no failure, and no stall — so
+		 * every event-driven path reads healthy-idle and stays silent. The history
+		 * still shows the unfinished part, so this reads it instead.
+		 *
+		 * Only parts newer than the last user message count: a user message after
+		 * the call means the turn is not parked, it moved on. Only parts older
+		 * than the stall window count: a call that just went out has not had a
+		 * chance to answer yet. Anything else (completed/error) is settled.
+		 */
+	/**
+	 * The message-history scan shared by the stuck-tool pass and the stall
+	 * timer. Extracted (not duplicated) so both judge the same shape: tool
+	 * parts newer than the last user message that never settled, split into
+	 * aged-out `stuck` names versus a trailing failure plus whether anything
+	 * is still in flight at all.
+	 */
+		function scanToolParts(
+			messages: unknown[],
+			lastUserAt: number,
+			cutoff: number,
+		): { stuck: string[]; trailing: { name: string; err: string; created: number } | null; anythingInFlight: boolean } {
+			const stuck: string[] = []
+			// A failed call is retried only when the turn ENDED on it: the error
+			// is the trailing part of the latest assistant content, with nothing
+			// after it. An error the model already continued past (later text or
+			// later calls) is handled feedback, not abandonment — nudging those
+			// would nag on every normal turn. Unknown names belong to the
+			// suggester, not the retrier: telling the model to reissue a name
+			// that does not exist teaches persistence on a typo.
+			let trailing: { name: string; err: string; created: number } | null = null
+			let anythingInFlight = false
+			for (const m of messages as Array<{ type?: string; time?: { created?: number }; content?: Array<{ type?: string; name?: string; state?: { status?: string; error?: unknown; output?: unknown }; time?: { created?: number } }> }>) {
+				if (!m || msgRole(m) !== "assistant" || !Array.isArray(m.content)) continue
+				for (const part of m.content) {
+					if (part?.type !== "tool") {
+						trailing = null
+						continue
+					}
+					const st = part?.state?.status
+					const name = typeof part?.name === "string" && part.name ? part.name : "(unnamed)"
+					const created =
+						typeof part?.time?.created === "number" ? part.time.created
+						: typeof m?.time?.created === "number" ? m.time.created
+						: 0
+					if (st === "error") {
+						const rawErr =
+							part?.state && typeof part.state === "object"
+								? (part.state as { error?: unknown }).error
+								: undefined
+						const eType =
+							rawErr && typeof rawErr === "object" && typeof (rawErr as { type?: unknown }).type === "string"
+								? ((rawErr as { type?: string }).type as string)
+								: ""
+						const eMsg = toolErrorText(part?.state)
+						// Abort-shaped errors are never retried: that path fights a
+						// user interrupt (ses_edf403f5 13:09: the error WAS the
+						// user's own stop landing mid-turn).
+						if (isAbortError(eType, eMsg)) {
+							trailing = null
+							continue
+						}
+						// Policy blocks are verdicts, not failures: the guardrail
+						// text forbids retry outright, and reissuing the call
+						// teaches circumvention (ses_edf403f5 15:59 shell block).
+						if (NEVER_RETRY_RE.test(eMsg)) {
+							trailing = null
+							continue
+						}
+						trailing = { name, err: eMsg.slice(0, 160), created }
+						continue
+					}
+					if (st === "completed") {
+						trailing = null
+						continue
+					}
+					if (created <= lastUserAt) continue
+					anythingInFlight = true
+					if (created >= cutoff) continue
+					if (!stuck.includes(name)) stuck.push(name)
+				}
+			}
+			return { stuck, trailing, anythingInFlight }
+		}
+
+		function buildStuckNudgePrompt(stuck: string[]): string {
+			const names = stuck.slice(0, 3).join('", "')
+			return (
+				`A "${names}" call never returned a result and the turn went idle waiting on it. ` +
+				`Proceed without it: continue the task from where you left off and do not retry the same call.`
+			)
+		}
+
+		async function checkForStuckToolCalls(sid: string, w: SessionWatch): Promise<boolean> {
+			if (w.userCancelled || w.completionSignaled) return false
+			{
+				const locked = lockKind(w)
+				if (locked) {
+					dbg(`${short(sid)} locked (${locked}) — skipping stuck-tool pass`)
+					return false
+				}
+			}
+			const messages = await loadMessages(sid)
+			let lastUserAt = 0
+			for (const m of messages) {
+				if (msgRole(m) === "user") lastUserAt = Math.max(lastUserAt, msgAt(m))
+			}
+			const cutoff = Date.now() - stuckToolAgeMs
+			const { stuck, trailing, anythingInFlight } = scanToolParts(messages, lastUserAt, cutoff)
+			// A call still in flight (any age) means the turn may yet resolve on
+			// its own — the stall and dead-stream paths own that case, not this one.
+			if (trailing && !anythingInFlight && trailing.created > lastUserAt) {
+				const available = await getAvailableToolIds()
+				if (available.length > 0 && available.includes(trailing.name)) {
+					const prompt =
+						`The "${trailing.name}" call failed${trailing.err ? ` with: ${trailing.err}` : ""}. ` +
+						`Retry it now — reissue the same call.`
+					log("warn", `${short(sid)} "${trailing.name}" failed at end of turn, retrying promptly (attempt ${(w.stuckToolAttempts ?? 0) + 1}/${maxRetries})`)
+					return targetedRecovery(sid, "stuck-tool", prompt, "stuckToolAttempts").then(() => true)
+				}
+			}
+			if (stuck.length === 0) return false
+			const prompt = buildStuckNudgePrompt(stuck)
+			const names = stuck.slice(0, 3).join('", "')
+			log("warn", `${short(sid)} tool call(s) "${names}" stuck unfinished — nudging to proceed without it`)
+			return targetedRecovery(sid, "stuck-tool", prompt, "stuckToolAttempts").then(() => true)
+		}
+
+		/**
+		 * Nudge a turn that thought without producing anything.
+		 *
+		 * The parked shape from ses_edd1eb519/ses_edd1e39c3 (2026-10-09): a user
+		 * question, then assistant turn(s) with reasoning but zero text and zero
+		 * tool calls, then idle indefinitely. No failure fires, the stall path
+		 * needs a busy session, and the targeted patterns need text — so every
+		 * event-driven path reads healthy-idle and stays silent.
+		 *
+		 * Deliberately narrow: any text or any tool part since the last user
+		 * message means the turn produced or delegated — only the total void
+		 * counts (reasoning with no output and nothing delegated). Tool-
+		 * completing turns leave results the next turn consumes; text turns
+		 * speak. Fires on the structural idle pass for fresh parkings and on
+		 * the watchdog idle sweep for already-parked sessions (which emit no
+		 * further events). History-only: no HTTP dependency.
+		 */
+		async function checkForSilentReasoningTurn(sid: string, w: SessionWatch): Promise<boolean> {
+			if (w.userCancelled || w.completionSignaled) return false
+			{
+				const locked = lockKind(w)
+				if (locked) {
+					dbg(`${short(sid)} locked (${locked}) — skipping silent-reasoning pass`)
+					return false
+				}
+			}
+			const messages = await loadMessages(sid)
+			let lastUserAt = 0
+			for (const m of messages) {
+				if (msgRole(m) === "user") lastUserAt = Math.max(lastUserAt, msgAt(m))
+			}
+			let newestPostUserAt = 0
+			let sawReasoning = false
+			for (const m of messages as Array<{ type?: string; time?: { created?: number }; content?: Array<{ type?: string; text?: string }> }>) {
+				if (!m || msgRole(m) !== "assistant" || !Array.isArray(m.content)) continue
+				const at = msgAt(m)
+				if (at <= lastUserAt) continue
+				if (at > newestPostUserAt) newestPostUserAt = at
+				for (const part of m.content) {
+					const t = part?.type ?? ""
+					if (t === "text" && typeof part?.text === "string" && part.text.length > 0) return false
+					if (t === "tool_use" || t === "tool" || t === "tool_call" || t.startsWith("tool")) return false
+					if (t === "reasoning" && typeof part?.text === "string" && part.text.length > 0) sawReasoning = true
+				}
+			}
+			if (!sawReasoning) return false
+			// Fresh turns get the stall window before being judged parked.
+			if (Date.now() - newestPostUserAt < chunkTimeoutMs) return false
+			const prompt =
+				`Your last turn produced reasoning but no visible output and no tool calls. ` +
+				`Continue the task: produce the answer or the next tool call.`
+			log("warn", `${short(sid)} reasoning-only turn with no output — nudging to continue`)
+			return targetedRecovery(sid, "silent-reasoning", prompt, "stuckToolAttempts").then(() => true)
+		}
+
+		async function checkForUnknownToolCalls(sid: string, w: SessionWatch): Promise<boolean> {
+			if (w.userCancelled || w.completionSignaled) return false
+			{
+				const locked = lockKind(w)
+				if (locked) {
+					dbg(`${short(sid)} locked (${locked}) — skipping unknown-tool pass`)
+					return false
+				}
+			}
+			try {
+				const messages = await loadMessages(sid)
+				// The history is read before the "already suggested" guard, and the
+				// per-request reset rides on that read. The guard used to come first,
+				// and since this runs alongside inspectOnIdle the ordering was undefined
+				// — on a re-armed turn the guard could see the previous turn's latch
+				// still standing and skip the check that was supposed to re-arm it.
+				noteInboundUserMessage(sid, w, messages)
+				// Stop statements latch in the pattern pass, which runs after this
+				// check on the same idle - evaluate the stop here too, from the
+				// just-loaded history, or a turn that ends stopped eats one
+				// unknown-tool nudge first.
+				if (containsStopStatement(w.lastAssistantText || lastAssistantTextFrom(messages))) return false
+				if (w.unknownToolSuggestionSent) return false
+				const available = await getAvailableToolIds()
+				// No registry, or nothing registered: every name would look unknown.
+				if (available.length === 0) return false
+				for (const msg of messages) {
+					const content = (msg as { content?: unknown })?.content
+					if (!Array.isArray(content)) continue
+					for (const part of content as Array<Record<string, unknown>>) {
+						if (part?.type !== "tool") continue
+						// v2's tool part identifies itself by `id` and names the tool in
+						// `name` — v1 read `part.tool`, which v2 never emits, so the
+						// comparison there would have been against "" and never matched.
+						const partId = typeof part.id === "string" ? part.id : ""
+						if (!partId || w.checkedToolPartIDs.has(partId)) continue
+						w.checkedToolPartIDs.add(partId)
+						// Bounded: the history is re-walked on every idle, so this set
+						// otherwise grows one entry per tool part for the life of the
+						// session — audit 2026-10-10, the only uncapped collector here
+						// (ownPromptTexts 10, textParts 2, recentToolCalls 120s).
+						// A FIFO trim is enough: parts old enough to fall out are old
+						// enough that re-reporting them would be wrong anyway.
+						if (w.checkedToolPartIDs.size > CHECKED_TOOL_PART_IDS_MAX) {
+							const oldest = w.checkedToolPartIDs.values().next().value
+							if (typeof oldest === "string") w.checkedToolPartIDs.delete(oldest)
+						}
+						const state = part.state as { status?: string } | undefined
+						if (state?.status !== "error") continue
+						const toolName = typeof part.name === "string" ? part.name : ""
+						if (!toolName || available.includes(toolName)) continue
+						const count = (w.unknownToolErrors.get(toolName) ?? 0) + 1
+						w.unknownToolErrors.set(toolName, count)
+						if (count < UNKNOWN_TOOL_THRESHOLD) continue
+						const suggestion = resolveToolSuggestion(toolName, available)
+						const toolList = available.slice(0, UNKNOWN_TOOL_LIST_LIMIT).join(", ")
+						const prompt = suggestion
+							? `You tried to use the tool "${toolName}" ${count} times, but it does not exist. ` +
+								`The closest matching tool is "${suggestion}". ` +
+								`Please use "${suggestion}" instead and adjust your arguments accordingly. ` +
+								`Available tools include: ${toolList}.`
+							: `You tried to use the tool "${toolName}" ${count} times, but it does not exist. ` +
+								`Please check the available tools and use the correct one. ` +
+								`Available tools include: ${toolList}.`
+						w.unknownToolSuggestionSent = true
+						log(
+							"warn",
+							`${short(sid)} unknown tool "${toolName}" called ${count}x, suggesting "${suggestion ?? "(none)"}" mod=${MODULE_INSTANCE}`,
+						)
+						// Feature corrections go synthetic, never visible: the model needs
+						// the correction, the user does not need a full-text user message
+						// for it. (Synthetic still renders as a plugin notification in
+						// the TUI — quieter, not silent.) Stall recovery stays visible
+						// by design so an intervention loop is self-evident.
+						await injectOnce(sid, prompt, "unknown-tool", false, false, quietCorrections)
+						return true
+					}
+				}
+				return false
+			} catch (e) {
+				log("warn", `${short(sid)} unknown-tool check failed: ${e instanceof Error ? e.message : String(e)}`)
+				return false
+			}
+		}
+
+		/**
+		 * `task_complete`: the model's explicit "I am finished".
+		 *
+		 * v2 has no built-in equivalent — `grep -rl task_complete packages` finds
+		 * nothing — so registering it here is the only way it exists at all, and
+		 * this is a real feature rather than a compatibility shim: it is the
+		 * strongest completion signal available, stronger than a trailing 🎉,
+		 * because the model chose to call it.
+		 *
+		 * Ported from v1 with its escalation intact. The ack tool-result is fed
+		 * straight back into the turn, and a stuck model answers it by calling the
+		 * tool again rather than ending with text — v1 logged 27 consecutive acked
+		 * calls with zero new user input. So: first call acks with an explicit stop
+		 * instruction, second warns, third throws and the turn is forced to end.
+		 *
+		 * The counter is reset by a new inbound user message and by any other tool
+		 * call, so the escalation only ever measures a genuinely stuck loop rather
+		 * than several legitimate rounds of work.
+		 */
+
+		/**
+		 * Register a FALLBACK copy of the `task_complete` tool.
+		 *
+		 * The tool's home is the task-complete plugin: it is a general capability,
+		 * and the tool registry is one global map per opencode server, so every
+		 * plugin can list it, extend it and observe its calls. This copy exists
+		 * only so auto-resume keeps working AS IS when that plugin is not
+		 * installed - which is why it registers ONLY when nothing else already
+		 * provides the tool.
+		 *
+		 * The check is the registry itself (`ctx.tool.list()`), so it is
+		 * order-independent: if the other plugin set up first, the tool is
+		 * already there and no fallback is registered; if auto-resume set up
+		 * first, the other plugin's registration overwrites this one (the
+		 * registry keys by name, last write wins).
+		 *
+		 * v1 semantics, kept: the todo gate, and the ack self-loop guard (first
+		 * call acks, second warns, third throws) so a stuck model cannot loop on
+		 * the ack.
+		 */
+		async function registerTaskCompleteFallback(): Promise<void> {
+			if (!ctx.tool?.transform) {
+				dbg("tool registry unavailable — task_complete not offered")
+				return
+			}
+			// Two signals, in the order infra-memory uses for its todo fallback.
+			//
+			// 1. The LIVE tool list: decisive when the other plugin set up
+			//    first. It cannot see a plugin that loads later.
+			let provided = false
+			try {
+				const listed = (await ctx.tool.list?.()) ?? []
+				const arr = Array.isArray(listed) ? listed : []
+				provided = arr.some((t: any) => {
+					const n = String(t?.id ?? t?.name ?? t ?? "").toLowerCase()
+					return n === "task_complete" || n.endsWith("/task_complete")
+				})
+			} catch (e) {
+				dbg("tool list failed — checking the config instead:", e instanceof Error ? e.message : String(e))
+			}
+			// 2. The CONFIG FILE: decisive when it did not, because the load
+			//    order is the CONFIG order and auto-resume may set up before the
+			//    other plugin. A configured plugin is the signal; live tools still
+			//    cover a plugin that is loaded without appearing in this config.
+			if (!provided) {
+				// <config>/opencode/plugins/auto-resume/index.js
+				// -> config root is <config>/opencode/opencode.jsonc.
+				const cfgPath = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "opencode.jsonc")
+				provided = await configMentionsTaskComplete(cfgPath)
+				if (provided) log("info", "task-complete plugin configured in opencode.jsonc — fallback stays out")
+			}
+			if (provided) return
+			try {
+				await ctx.tool.transform((editor) => {
+					editor.add({
+						name: "task_complete",
+						description: TASK_COMPLETE_DESCRIPTION,
+						// DIRECT, not Code Mode: the model must be able to call this
+						// itself. A plugin tool without codemode:false is only
+						// reachable through the `execute` runtime.
+						options: { codemode: false },
+						// No arguments. v1's `args: {}` is the same thing: the signal
+						// is the call, not a payload.
+						input: { type: "object", properties: {}, additionalProperties: false },
+						execute: async (_input, toolCtx) => {
+							const sid = toolCtx?.sessionID
+							if (!sid) return { content: TASK_COMPLETE_ACK }
+							const w = ensureWatch(sid)
+
+							// A subagent reporting completion is not a parent finishing,
+							// and gating a child's report on the parent's todo list would
+							// block it on work it was never asked to do. v1 skips the
+							// todo gate for subagents for the same reason.
+							if (!(await isSubAgentSession(sid))) {
+								const open = getOpenTodos(await readTodos(sid))
+								if (open.length > 0 && w.taskCompleteOverrides < maxRetries) {
+									w.taskCompleteOverrides++
+									// Work remains, so a later completion is legitimate: reset
+									// the repeat-signal counter rather than letting this
+									// override feed the escalation.
+									w.taskCompleteSignals = 0
+									const reminder = buildOpenTodosReminder(open)
+									const blockMsg = `Mark any finished todos complete and do not redo completed work.\n${reminder}`
+									log(
+										"info",
+										`${short(sid)} task_complete blocked: ${open.length} open todos remain (override ${w.taskCompleteOverrides}/${maxRetries})`,
+									)
+									// Also fire a visible nudge naming the blocking todos, in
+									// case the tool result collapses to an invisible one-liner.
+									// Skipped when the user holds the ball - injecting then
+									// would start a step their real reply interrupts.
+									let awaitingInput = false
+									try {
+										awaitingInput = hasPendingUserInput(await loadMessages(sid))
+									} catch (e) {
+										dbg(`${short(sid)} task_complete block: awaiting-input check failed:`, e instanceof Error ? e.message : String(e))
+									}
+									if (awaitingInput) {
+										log("info", `${short(sid)} task_complete blocked but user input pending — skipping visible nudge`)
+									} else {
+										await injectOnce(sid, blockMsg, "task-complete-blocked")
+									}
+									return { content: blockMsg }
+								}
+							}
+
+							w.completionSignaled = true
+							w.completionSignaledAt = Date.now()
+							log("info", `${short(sid)} task_complete called, ${(await isSubAgentSession(sid)) ? "subagent" : "agent"} done`)
+							w.taskCompleteSignals++
+							if (w.taskCompleteSignals === 2) return { content: TASK_COMPLETE_REPEAT_WARNING }
+							if (w.taskCompleteSignals > 2) throw new Error(TASK_COMPLETE_REPEAT_ERROR)
+							return { content: TASK_COMPLETE_ACK }
+						},
+					})
+				})
+				log("info", "registered the task_complete tool (fallback — the task-complete plugin is not installed)")
+			} catch (e) {
+				// A failed registration must not take the watchdog down with it.
+				const msg = e instanceof Error ? e.message : String(e)
+				log("warn", `task_complete registration failed (${msg}) — continuing without it`)
+			}
+		}
+		/**
+		 * Watch the `task_complete` tool and stand the session down.
+		 *
+		 * The tool itself lives in its own plugin (config/plugins/task-complete):
+		 * it is a general capability, and the tool registry is one global map per
+		 * server, so every plugin can see and observe it. What is auto-resume's
+		 * business is the STAND-DOWN - the latch that stops the nudges once the
+		 * model says the work is done.
+		 *
+		 * The tool reports `metadata.completed`: true when the completion was
+		 * accepted, false when its todo gate refused it. On a refusal auto-resume
+		 * fires the visible nudge naming the work that is left, because a
+		 * collapsed tool result would hide it.
+		 */
+		async function observeTaskCompleteTool(): Promise<void> {
+			if (!ctx.tool?.hook) {
+				dbg("tool hook unavailable — task_complete stand-down not observed")
+				return
+			}
+			try {
+				ctx.tool.hook("execute.after", async (event: any) => {
+					if (event?.tool !== "task_complete") return
+					if (event?.status !== "completed") return
+					const sid = event?.sessionID
+					if (!sid) return
+					const w = ensureWatch(sid)
+					const result = event?.result
+					if (result?.metadata?.completed === false) {
+						// The todo gate refused it: name the work that is left.
+						const content = typeof result?.content === "string" ? result.content : ""
+						if (!content) return
+						let awaitingInput = false
+						try {
+							awaitingInput = hasPendingUserInput(await loadMessages(sid))
+						} catch (e) {
+							dbg(`${short(sid)} task_complete block: awaiting-input check failed:`, e instanceof Error ? e.message : String(e))
+						}
+						if (awaitingInput) {
+							log("info", `${short(sid)} task_complete blocked but user input pending — skipping visible nudge`)
+							return
+						}
+						await injectOnce(sid, content, "task-complete-blocked")
+						return
+					}
+					w.completionSignaled = true
+					w.completionSignaledAt = Date.now()
+					w.taskCompleteSignals = 0
+					w.taskCompleteOverrides = 0
+					log("info", `${short(sid)} task_complete called, ${(await isSubAgentSession(sid)) ? "subagent" : "agent"} done`)
+				})
+			} catch (e) {
+				const msg = e instanceof Error ? e.message : String(e)
+				log("warn", `task_complete observer failed (${msg}) — continuing without the stand-down`)
+			}
+		}
+
+		/**
+		 * Judge a finished turn — in two phases, because the text may not have settled.
+		 *
+		 * v1 evaluates the done/tool patterns from a timer armed on the idle event
+		 * (`toolTextCheckDelayMs`, 3s by default) rather than on the event itself, and
+		 * the delay is the feature: `session.idle` can arrive while the assistant's
+		 * final text is still being written into the message history, and a check that
+		 * reads too early sees a half-finished turn and either misses the pattern or
+		 * judges a turn that was not over.
+		 *
+		 * v2 already avoids most of that race with the live delta buffer, which is
+		 * why this port was able to judge on idle for as long as it did. It does not
+		 * remove it: the buffer is empty when the plugin loaded mid-turn, and the
+		 * fallback is exactly the history that may not have flushed. So the option is
+		 * honoured by splitting the work:
+		 *
+		 * - **structural** (immediately): is this a dead stream, is it handing control
+		 *   to the user, is the user already busy. None of these depend on the final
+		 *   text, and a dead stream must be caught before anything that reads text.
+		 * - **pattern** (after the delay): the celebration, tool-call-as-text, ready-to-
+		 *   continue, action-intent and done-claim detectors. These are exactly the
+		 *   ones that read the last text and so are exactly the ones the settle delay
+		 *   exists for.
+		 *
+		 * The guards above the split run again in the pattern phase, deliberately: three
+		 * seconds is long enough for the user to have replied, and a nudge fired through
+	 *   their reply is the bug the hand-off and stand-down guards exist to prevent.
+		 */
+		async function inspectOnIdle(sid: string, phase: "structural" | "pattern" = "structural") {
+			const w = ensureWatch(sid)
+			const messages = await loadMessages(sid)
+			noteInboundUserMessage(sid, w, messages)
+
+			// Judged first, and before anything that needs text: a stream that died
+			// before delivering any text is precisely the case where every
+			// text-based check below would find nothing to look at.
+			if (await recoverSilentDeadStream(sid, messages)) return
+
+			// A turn parked on a tool result that never arrives reads healthy-idle
+			// to every event-driven path (no failure, no stall, counters at zero).
+			// The history still shows the unfinished part, so check it structurally
+			// here rather than in the text-dependent pattern phase below.
+			if (await checkForStuckToolCalls(sid, w)) return
+			if (await checkForSilentReasoningTurn(sid, w)) return
+
+			// Prefer the live delta buffer; fall back to the authoritative message
+			// history when it is empty (e.g. the plugin loaded mid-turn) or stale.
+			let text = w.lastAssistantText
+			if (!text) text = lastAssistantTextFrom(messages)
+			if (!text) {
+				// Nothing delivered and nothing to judge: no finish to call
+				// dead, no parts to call stuck, no text for the pattern checks
+				// below. Without this branch such a turn is invisible to every
+				// detector and the session sits until the next event — which
+				// may never come. One quiet continue, single-shot per episode;
+				// the user's stop stays final (see guards inside).
+				await nudgeEmptyIdleTurn(sid, w, messages)
+				return
+			}
+
+			// A turn that ends by handing control back to the user (a question or an
+			// explicit prompt) is awaiting their reply; a synthetic nudge here starts
+			// an in-flight step that their real reply then interrupts ("Step
+			// interrupted"). Never nudge a hand-off turn.
+			if (isUserHandoff(text)) {
+				dbg(`${short(sid)} idle turn ends with a user hand-off — skipping targeted recovery`)
+				return
+			}
+
+			if (await shouldStandDownForUser(sid, messages, activeUserWindowMs)) {
+				// Latch FIRST, then stand down. A turn that completed inside the
+				// activity window must still record its completion: latching is
+				// read-only state (no nudge, no interruption), so it is safe to do
+				// even while standing down. Without this, the claim is never
+				// evaluated — the deferred re-check below can lose the race to the
+				// busy watchdog — and the ladder fires on a finished turn:
+				// ses_ed33c0da (2026-10-11) stood down on a TASK COMPLETE turn at
+				// 21:08:42 and stalled at +197s. Mirrors the busy-path latch, same
+				// predicate, same no-open-todos condition. Open todos fall through
+				// to the normal stand-down (the later checks nudge for them when
+				// the window expires); challenges and reminders stay below, because
+				// those INTERVENE and stand-down exists to prevent exactly that.
+				{
+					const tailText = w.lastAssistantText || lastAssistantTextFrom(messages)
+					if (tailText && turnEndsWithCompletionClaim(tailText)) {
+						const open = getOpenTodos(await readTodos(sid))
+						if (open.length === 0 && !w.completionSignaled) {
+							w.completionSignaled = true
+							w.completionSignaledAt = Date.now()
+							log("info", `${short(sid)} turn ends with a completion claim inside the activity window — latching completion, standing down`)
+						}
+					} else {
+						dbg(`${short(sid)} stand-down evaluation: tail is not a completion claim (score the tail, not the turn)`)
+					}
+				}
+				dbg(`${short(sid)} user has pending input or was recently active — standing down`)
+				// ...but only for now. This evaluation is the only one this idle
+				// gets, so standing down without a follow-up makes the session
+				// invisible until the next event (ses_edbb4e67, 2026-10-10: two
+				// manual continues on an action-intent stall). Re-arm one
+				// deferred pattern pass for when the activity window expires. A
+				// new turn replaces it through the toolTextTimer slot (markBusy
+				// clears); a hand-off never reaches here (returned above), so an
+				// awaited user reply is never nagged.
+				{
+					const lastUser = lastUserMessageAt(messages)
+					const waitMs =
+						(lastUser === undefined ? activeUserWindowMs : Math.max(0, lastUser + activeUserWindowMs - Date.now())) + 1000
+					if (w.toolTextTimer) clearTimeout(w.toolTextTimer)
+					w.toolTextTimer = setTimeout(() => {
+						w.toolTextTimer = null
+						if (w.status !== "idle") {
+							dbg(`${short(sid)} stand-down recheck skipped — session is ${w.status}, not idle`)
+							return
+						}
+						if (w.userCancelled) return
+						void inspectOnIdle(sid, "pattern")
+					}, waitMs)
+				}
+				return
+			}
+
+			if (phase === "structural") {
+				schedulePatternPass(sid)
+				return
+			}
+
+			// The model's own completion signal. A trailing 🎉 means it considers the
+			// work finished, so nudging here would talk over a deliberate stop.
+			// Latched rather than re-derived, because the next idle with no new text
+			// would otherwise re-check the same turn forever.
+			//
+			// Cross-checked against the todo list, because the emoji alone is not
+			// trustworthy: a model that finishes early celebrates early, and latching
+			// on that turns a false positive into permanent silence. With work still
+			// listed, the celebration is a false positive and the right answer is to
+			// name what is unfinished.
+			if (endsWithCelebration(text)) {
+				const open = getOpenTodos(await readTodos(sid))
+				if (open.length > 0) {
+					// Deliberately not latching: the list is still open, so this turn is
+					// not a completion and the next one must be free to judge again.
+					await targetedRecovery(
+						sid,
+						"open-todos-celebration-false-positive",
+						buildOpenTodosReminder(open),
+						"todoNudgeAttempts",
+					)
+					return
+				}
+				if (!w.completionSignaled) {
+					w.completionSignaled = true
+					w.completionSignaledAt = Date.now()
+					log("info", `${short(sid)} turn ends with a celebration and no open todos — latching completion, not nudging`)
+				} else {
+					dbg(`${short(sid)} completion already latched — skipping`)
+				}
+				return
+			}
+
+			// A raw tool call written into the reasoning block never executes: no
+			// part is tagged as a tool call, so nothing on the session side ever
+			// runs it. Judged before the text variant because a message can have
+			// both, and the reasoning one is the one that silently does nothing.
+			const reasoning = lastAssistantReasoning(messages)
+			if (reasoning && containsToolCallAsText(reasoning)) {
+				await targetedRecovery(sid, "tool-call-in-reasoning", thinkingToolRecoveryPrompt, "toolTextAttempts")
+				return
+			}
+			if (containsToolCallAsText(text)) {
+				await targetedRecovery(sid, "tool-call-as-text", opts.toolTextRecoveryPrompt ?? TOOL_TEXT_RECOVERY_PROMPT, "toolTextAttempts")
+				return
+			}
+			if (containsReadyToContinuePattern(text, readyToContinuePatterns)) {
+				await targetedRecovery(sid, "ready-to-continue", opts.continuePrompt ?? SAFE_CONTINUE_PROMPT, "intentNudgeAttempts")
+				return
+			}
+			if (resumeOnActionIntent && containsActionIntent(text)) {
+				await targetedRecovery(sid, "action-intent", opts.actionIntentPrompt ?? opts.continuePrompt ?? SAFE_CONTINUE_PROMPT, "intentNudgeAttempts")
+				return
+			}
+			// An explicit stop latches like a celebration and wins over the
+			// done-claim challenge below: a turn that says it is stopping
+			// with no open todos is finished, not evidence-light. Challenging
+			// it for details would nag exactly the completed sessions this
+			// latch exists to quiet (ses_eec5ba74). Tool-call-as-text and
+			// action-intent above still win: pasted tool calls and declared
+			// next steps are unfinished business even beside stop words.
+			// An explicit stop latches like a celebration: the turn declares the
+			// work over without claiming anything to verify. Open todos still
+			// earn the once-budgeted reminder (a stop with listed work is not a
+			// completion); with nothing open, latch and end the turn quietly.
+			if (containsStopStatement(text)) {
+				const open = getOpenTodos(await readTodos(sid))
+				if (open.length > 0) {
+					await targetedRecovery(sid, "stop-open-todos", buildOpenTodosReminder(open), "todoNudgeAttempts")
+					return
+				}
+				if (!w.completionSignaled) {
+					w.completionSignaled = true
+					w.completionSignaledAt = Date.now()
+					log("info", `${short(sid)} turn ends with an explicit stop and no open todos — latching completion, not nudging`)
+				} else {
+					dbg(`${short(sid)} completion already latched — skipping`)
+				}
+				return
+			}
+
+			if (containsDoneClaimPattern(text, doneClaimPatterns)) {
+				// Two different prompts for two different situations, which is why the
+				// budgets are separate: spending the details prompt must not silence the
+				// one that says work is still listed.
+				const open = getOpenTodos(await readTodos(sid))
+				if (open.length > 0) {
+					await targetedRecovery(sid, "done-claim-open-todos", doneWithoutWorkPrompt, "doneClaimOpenTodosAttempts")
+					return
+				}
+				if (w.doneClaimAttempts < maxRetries) {
+					// Ask once for the work report. v2 used to gate this on a 400-char
+					// length, which cannot tell "Task done." from a real summary and so
+					// both over-nudged terse reports and let short-but-real ones pass.
+					// containsWorkDescription is the same structural test v1 uses, and
+					// prompting again after a real report loops forever (#26).
+					if (!containsWorkDescription(text)) {
+						await targetedRecovery(sid, "done-claim-no-details", doneWithoutDetailsPrompt, "doneClaimAttempts")
+					} else {
+						dbg(`${short(sid)} done-claim carries a work description — skipping details prompt`)
+					}
+				}
+			}
+
+			// A full context window is a separate failure mode from a stalled one: the
+			// session keeps working happily until it chokes. Judged last, because it is
+			// the only check here that acts on the session rather than the text, and a
+			// saturated session that also produced a terse done-claim wants the
+			// reclamation, not the details prompt.
+			await checkContextSaturation(sid)
+		}
+
+		// ---------------------------------------------------------------------
+		// Watchdog timer
+		// ---------------------------------------------------------------------
+
+		/**
+		 * `session.active()` exists on the v2 client but is not part of the
+		 * plugin SessionDomain pick — access defensively; empty map if missing.
+		 */
+		/**
+		 * `session.active()` exists on the v2 client but is not part of the plugin
+		 * SessionDomain pick, so it is normally absent — see
+		 * Mte90/opencode-auto-resume#33. Fall back to our own event-derived busy
+		 * flags rather than returning an empty set: returning `[]` made the
+		 * subagent-wait guard below unreachable, so a parent session that went
+		 * quiet while its child ran was declared stalled and interrupted.
+		 */
+		async function getActiveSessions(): Promise<string[]> {
+			// Without server truth the watchdog can only see sessions it observed
+			// events for since load: after any reload a hung-but-silent session is
+			// invisible while the server still reports it running, and nothing ever
+			// fires (ses_edf403f5, 2026-10-09: running 7+ min with two user messages
+			// unanswered). The HTTP loopback below restores server truth in prod.
+			try {
+				const fn = (ctx.session as any).active
+				if (typeof fn !== "function") {
+					// Production has no active surface at all (verified 2026-10-06).
+					const http = await activeSessionsHttp()
+					if (http !== null) return http
+					return busySessions()
+				}
+				const active = await fn.call(ctx.session)
+				return Object.keys(active ?? {}).filter((k) => typeof k === "string")
+			} catch {
+				// Same loopback here: a throwing surface must not blind the watchdog.
+				const http = await activeSessionsHttp()
+				if (http !== null) return http
+				return busySessions()
+			}
+		}
+
+		type ActiveMap = Record<string, { type?: unknown }>
+		let activeCache: { at: number; ids: string[] } | null = null
+		const ACTIVE_TTL_MS = 10_000
+		async function activeSessionsHttp(): Promise<string[] | null> {
+			const now = Date.now()
+			if (activeCache && now - activeCache.at < ACTIVE_TTL_MS) return activeCache.ids
+			for (const base of serverBaseUrls()) {
+				try {
+					const res = await fetch(`${base}/api/session/active`, { headers: serverHeaders() })
+					if (!res.ok) continue
+					const body = (await res.json()) as unknown
+					const data = (body as { data?: unknown } | undefined)?.data ?? body
+					if (data && typeof data === "object") {
+						const ids = Object.keys(data as ActiveMap).filter((k) => k.startsWith("ses_"))
+						activeCache = { at: now, ids }
+						return ids
+					}
+				} catch {
+					// Next base URL, then fail-open.
+				}
+			}
+			return null
+		}
+
+		/** Busy sessions we are tracking, excluding cancelled ones. The orphan watch
+		 * keys on this count: a subagent finishing is only interesting because it
+		 * leaves exactly one session busy. */
+		function busySessionsForOrphanWatch(): string[] {
+			const out: string[] = []
+			for (const [sid, w] of sessions) {
+				if (w.status === "busy" && !w.userCancelled) out.push(sid)
+			}
+			return out
+		}
+
+		/**
+		 * The subagents of `parentSid`, by v2's own parent link.
+		 *
+		 * v1 had no way to ask, so it treated *any other busy session* as a subagent of
+		 * the one in hand. That works on a single-project box and misfires on a busy
+		 * one: a second unrelated session looks like a child, and the parent gets
+		 * aborted for someone else's work. v2 stores `parent_id` on the session row, so
+		 * the question can simply be asked.
+		 *
+		 * The filter is requested *and* verified client-side. `parentID` is part of
+		 * the list input, but the only consequence of it being quietly ignored would be
+		 * aborting real sessions, so the returned rows are checked rather than trusted.
+		 */
+		async function listSubagentIds(parentSid: string): Promise<string[]> {
+			const listed = unwrapList(await callSessionApi<unknown>("list", { parentID: parentSid }))
+			const out: string[] = []
+			for (const row of listed) {
+				const sid = row?.id
+				if (typeof sid !== "string" || !sid.startsWith("ses_")) continue
+				if (sid === parentSid) continue
+				if ((row as { parentID?: unknown }).parentID !== parentSid) continue
+				out.push(sid)
+			}
+			if (out.length === 0) {
+				// HTTP fallback: prod ctx has no list surface, so the call
+				// above always misses there (verified 2026-10-06). Same
+				// client-side verification as above.
+				for (const row of await listSessionsHttp()) {
+					const sid = row?.id
+					if (typeof sid !== "string" || !sid.startsWith("ses_")) continue
+					if (sid === parentSid) continue
+					if (row?.parentID !== parentSid) continue
+					out.push(sid)
+				}
+			}
+			return out
+		}
+
+		type SubagentVerdict = { status: "crashed" | "idle" | "busy" | "waiting"; stuckSid?: string }
+
+		/**
+		 * What a parent's subagents are doing, in v1's three-way shape.
+		 *
+		 * v1 scans the global status map for any other *busy* session and treats a
+		 * quiet one as "idle" — the parent is stuck with nothing to wait for. That
+		 * reading cannot work on v2, and the reason is worth stating: this function is
+		 * only ever reached *after* a child went idle, so a child being absent from
+		 * the active set is the premise, not the finding. Reading that absence as
+		 * "idle" would make every crashed subagent look like a healthy one, and the
+		 * whole feature would abort the parent without ever trying to wake the child.
+		 *
+		 * So a child is judged on what it last did, not on whether the server still
+		 * lists it:
+		 *
+		 * - **active, and recent** — running. Wait.
+		 * - **active, and silent past the threshold** — hung. The fuse is tripled while
+		 *   a tool call is still outstanding, because a five-minute build is not a
+		 *   dead model and killing the parent there loses the work.
+		 * - **not active, recent** — it finished. Nothing to wait for.
+		 * - **not active, silent past the threshold** — it stopped without ever
+		 *   reporting. Waking it is worth one attempt.
+		 */
+		async function subagentVerdict(parentSid: string, activeIDs: Set<string>): Promise<SubagentVerdict> {
+			try {
+				const children = await listSubagentIds(parentSid)
+				if (children.length === 0) return { status: "idle" }
+				const now = Date.now()
+				let sawBusy = false
+				let sawWaiting: string | null = null
+				for (const child of children) {
+					const messages = await loadMessages(child)
+					const last = messages[messages.length - 1] as
+						| {
+							type?: string
+							error?: unknown
+							time?: { created?: number }
+							content?: Array<{ type?: string; state?: { status?: string } }>
+						}
+						| undefined
+					if (last && msgRole(last) === "assistant" && last.error !== undefined) {
+						dbg(`subagent ${short(child)} reported an error`)
+						return { status: "crashed" }
+					}
+					const msgTime = msgAt(last) || undefined
+					const silentFor = typeof msgTime === "number" ? now - msgTime : Infinity
+					// An active subagent (the server reports it running) is alive,
+					// regardless of how long it has been silent: silence alone cannot
+					// distinguish a slow subagent from a dead one, and treating a slow
+					// one as crashed nudged parents that were genuinely waiting
+					// (ses_e9c4d8de7ffe5DC0yedTw7Cvk7, 2026-10-22: W2 sat quiet for
+					// ~28 minutes and was judged "crashed", so the parent got nudged).
+					// The active set is authoritative for liveness.
+					if (activeIDs.has(child)) {
+						sawBusy = true
+						continue
+					}
+					// An unanswered tool part is the "still working, slowly" case.
+					const hasToolCall = (last?.content ?? []).some(
+						(p) => p?.type === "tool" && p.state?.status !== "completed" && p.state?.status !== "error",
+					)
+					const limit = hasToolCall ? SUBAGENT_STUCK_MS * 3 : SUBAGENT_STUCK_MS
+					// Outer bound: quiet past the stuck window but inside the dead
+					// window, with no error evidence, is a long thinker — waited
+					// on, not killed. Only past-dead quiet reads as crashed, so
+					// a hung model still terminates (bounded wait, ses_ef1c822c).
+					// Error evidence above already returned; scan on so a later
+					// crashed sibling is still surfaced.
+					const deadLimit = hasToolCall ? subagentDeadMs * 3 : subagentDeadMs
+					if (silentFor <= limit) {
+						// Recent: assume alive (don't nudge the parent) even if not
+						// in the active set — that set lags, and a mid-work
+						// subagent is indistinguishable from a just-finished one by
+						// silence alone. A truly finished subagent ages out.
+						if (sawWaiting === null) sawWaiting = child
+						continue
+					}
+					if (silentFor <= deadLimit) {
+						dbg(
+							`subagent ${short(child)} quiet for ${Math.round(silentFor / 1000)}s, inside ${Math.round(deadLimit / 1000)}s patience — waiting, not crashed (active=${activeIDs.has(child)})`,
+						)
+						if (sawWaiting === null) sawWaiting = child
+						continue
+					}
+					dbg(
+						`subagent ${short(child)} silent for ${Math.round(silentFor / 1000)}s (active=${activeIDs.has(child)})`,
+					)
+					return { status: "crashed", stuckSid: child }
+				}
+				if (sawBusy) return { status: "busy" }
+				if (sawWaiting !== null) return { status: "waiting", stuckSid: sawWaiting }
+				return { status: "idle" }
+			} catch (e) {
+				dbg(`subagent check failed for ${short(parentSid)}:`, e instanceof Error ? e.message : String(e))
+				// Unknown is treated as busy: the cost of waiting is a later abort, and
+				// the cost of guessing wrong is a killed session.
+				return { status: "busy" }
+			}
+		}
+
+		/**
+		 * Nudge a stuck subagent directly.
+		 *
+		 * v1 uses the client prompt route. v2's plugin-scoped `session.synthetic`
+		 * takes an explicit sessionID and appends the message to that session, which is
+		 * the same effect without needing a cross-session route the plugin API does
+		 * not expose.
+		 *
+		 * The general `injectOnce` refuses subagents, and correctly so: a child is
+		 * not ours to recover. This is the one exception, and it is deliberate — the
+		 * parent is stuck *because* the child is, so waking the child is cheaper than
+		 * killing the parent and its whole turn.
+		 */
+		async function recoverStuckSubagent(sid: string): Promise<boolean> {
+			if (!running) return false
+			try {
+				await callSessionApi("synthetic", { sessionID: sid, text: SUBAGENT_RECOVERY_PROMPT })
+				log("info", `${short(sid)} recovery prompt sent to stuck subagent`)
+				return true
+			} catch (e) {
+				log("warn", `failed to recover subagent ${short(sid)}: ${e instanceof Error ? e.message : String(e)}`)
+				return false
+			}
+		}
+
+		/**
+		 * The orphan watch.
+		 *
+		 * The failure it exists for: a parent dispatches a subagent, the subagent dies
+		 * without a terminal event, and the parent waits forever on a result that is
+		 * never coming. Nothing is busy, nothing is idle-from-the-runtime's-point-of-view,
+		 * and every ordinary watchdog path declines to act because the silence is shorter
+		 * than `chunkTimeoutMs`.
+		 *
+		 * Armed from `session.idle`: when the busy count drops from more than one to
+		 * exactly one, the survivor is a parent whose children have all gone quiet.
+		 * After `subagentWaitMs` the watchdog asks what the children are doing and, if
+		 * there is no live work left, aborts and resumes the parent.
+		 */
+		/**
+		 * Arm the watch on a session that just outlived its subagents — but only if it
+		 * really had some.
+		 *
+		 * The busy-count drop alone is not evidence. Two unrelated conversations open
+		 * at once, one of them finishes, and the survivor looks identical to a parent
+		 * whose child died: one session left, busy. v1 has no way to tell them apart
+		 * and aborts the survivor either way, which on a busy box means killing
+		 * somebody's conversation for a colleague's finishing turn.
+		 *
+		 * v2 can tell them apart, so it does: one listing call at arm time turns a
+		 * guess into a fact. The cost is one query per 2-to-1 transition, and the
+		 * alternative is an abort that cannot be undone.
+		 */
+		async function armOrphanWatch(sid: string): Promise<void> {
+			const w = sessions.get(sid)
+			if (!w || w.orphanWatchStartAt !== null) return
+			if (w.status !== "busy" || w.userCancelled || w.completionSignaled) return
+			try {
+				if (await isSubAgentSession(sid)) return
+				const children = await listSubagentIds(sid)
+				// Re-checked after the await: the session may have gone idle, been
+				// cancelled, or been picked up by another arming while we were listing.
+				if (w.orphanWatchStartAt !== null || w.status !== "busy" || w.userCancelled) return
+				if (children.length === 0) {
+					dbg(`${short(sid)} outlived a busy session but has no subagents — not an orphan parent`)
+					return
+				}
+				w.orphanWatchStartAt = Date.now()
+				w.orphanWatchArmedAt = w.orphanWatchStartAt
+				w.orphanRecoveryTried = false
+				// orphanEscalatedChildSid is deliberately NOT cleared here. It records
+				// that a specific dead child has already cost this parent one abort.
+				// Arming happens on EVERY 2-to-1 busy transition, and re-arming is
+				// exactly what produced the 8 escalations in 3 hours (ses_ed726872);
+				// clearing here wiped the record before the next verdict could read
+				// it, so the guard never fired. Cleared only on teardown, on gaveUp,
+				// or superseded by a genuinely different child in runOrphanWatch.
+				log(
+					"info",
+					`subagents of ${short(sid)} fell quiet while it stayed busy. orphan watch (${subagentWaitMs / 1000}s, ${children.length} subagent(s))`,
+				)
+			} catch (e) {
+				dbg(`orphan arming check failed for ${short(sid)}:`, e instanceof Error ? e.message : String(e))
+			}
+		}
+
+		async function runOrphanWatch(sid: string, w: SessionWatch, now: number, activeIDs: Set<string>): Promise<void> {
+			if (now - w.orphanWatchStartAt! < subagentWaitMs + gracePeriodMs) return
+			const profile = resolveProfile(sid)
+			const profileMaxRetries = profile.maxRetries
+			if (w.resumeAttempts >= profileMaxRetries) {
+				if (!w.gaveUp) {
+					w.gaveUp = true
+					w.orphanWatchStartAt = null
+					w.orphanWatchArmedAt = null
+					// gaveUp is a legitimate reset: the watch stood down for good, so a
+					// future episode (even with the same dead child) starts clean.
+					w.orphanEscalatedChildSid = undefined
+					log("warn", `${short(sid)} orphan watch gave up after ${profileMaxRetries} attempts`)
+				}
+				return
+			}
+			// Never abort a parent that is running a tool. Two independent sources,
+			// because the counter can miss a tool that started before the plugin loaded:
+			// our own event-derived count, and the tool parts in the message history.
+			if (w.pendingTools > 0) {
+				dbg(`${short(sid)} parent has ${w.pendingTools} tool(s) in flight — deferring orphan abort`)
+				w.orphanWatchStartAt = now
+				return
+			}
+			if (hasPendingUserInput(await loadMessages(sid))) {
+				dbg(`${short(sid)} parent is waiting on the user — deferring orphan abort`)
+				w.orphanWatchStartAt = now
+				return
+			}
+			// Never abort a parent the user just spoke to. `hasPendingUserInput`
+			// above only sees a pending INTERACTIVE tool — a question awaiting an
+			// answer. An instruction ("clean up any remaining residue") is a plain
+			// user message, so it sailed straight through and the abort landed on
+			// top of it: ses_ed726872, 187ms after the user's message, escalated
+			// `interrupt + fresh continue` onto a live turn. The idle path has
+			// always had this guard (shouldStandDownForUser); the orphan path did
+			// not.
+			//
+			// The newest user message is read from HISTORY, not from
+			// w.lastGenuineUserAt: that field only advances on the execution/step
+			// event handlers (the watchdog skips noteInboundUserMessage for a busy,
+			// non-cancelled parent), so on a timer tick it can still hold a
+			// pre-message value — which is precisely the race this closes. Reading
+			// history is the same source hasPendingUserInput just used, so it
+			// cannot lag behind it.
+			//
+			// Compared against orphanWatchArmedAt, NOT orphanWatchStartAt: the
+			// latter is advanced on every deferral above, so a deferral would age
+			// out the very message it was deferring for and the next tick would
+			// fire anyway.
+			if (w.orphanWatchArmedAt !== null) {
+				const msgs = await loadMessages(sid)
+				let newestUserAt = 0
+				for (const m of msgs as Array<{ type?: string; role?: string; time?: { created?: number }; info?: { time?: { created?: number } } }>) {
+					if (msgRole(m) !== "user") continue
+					const at = msgAt(m)
+					if (typeof at === "number" && at > newestUserAt) newestUserAt = at
+				}
+				if (newestUserAt > w.orphanWatchArmedAt) {
+					dbg(
+						`${short(sid)} user spoke ${Math.round((now - newestUserAt) / 1000)}s ago, after the orphan watch armed — deferring orphan abort`,
+					)
+					return
+				}
+			}
+
+			const verdict = await subagentVerdict(sid, activeIDs)
+			if (verdict.status === "crashed") {
+				// One dead subagent may cost the parent exactly ONE abort.
+				// ses_ed726872: `…Ut64EfTB` ended 2.5h before, kept returning a
+				// crashed verdict, and the parent was aborted + re-continued 8
+				// times across 3 hours. `orphanRecoveryTried` bounds only the WAKE
+				// attempt; once that fails, every later crashed verdict escalated
+				// again. Recording the child closes that loop. A genuinely
+				// different stuck child still gets its own escalation, and a new
+				// orphan episode (new arm) clears the record.
+				if (verdict.stuckSid && w.orphanEscalatedChildSid === verdict.stuckSid) {
+					// Already counted against the budget when it was escalated; spend it
+					// again so the episode still TERMINATES via the gaveUp latch instead
+					// of being held here forever. The no-cycling guarantee (the one the
+					// subagent-patience suite pins) is preserved; only the abort is
+					// skipped.
+					w.resumeAttempts++
+					const profile = resolveProfile(sid)
+					const profileMaxRetries = profile.maxRetries
+					if (w.resumeAttempts >= profileMaxRetries) {
+						if (!w.gaveUp) {
+							w.gaveUp = true
+							log("warn", `${short(sid)} orphan watch gave up after ${profileMaxRetries} attempts`)
+						}
+					} else {
+						w.orphanWatchStartAt = now
+					}
+					dbg(
+						`${short(sid)} subagent ${short(verdict.stuckSid)} already escalated this episode — not re-aborting the parent`,
+					)
+					return
+				}
+				// Waking the child is cheaper than killing the parent, so it is tried
+				// first — but exactly once. If the child does not come back, the parent
+				// is the only thing left to save and the watch stops asking.
+				if (verdict.stuckSid && !w.orphanRecoveryTried) {
+					w.orphanRecoveryTried = true
+					if (await recoverStuckSubagent(verdict.stuckSid)) {
+						w.orphanWatchStartAt = now
+						return
+					}
+				}
+				log("info", `${short(sid)} subagent crashed and did not recover — aborting and resuming the parent`)
+				if (verdict.stuckSid) w.orphanEscalatedChildSid = verdict.stuckSid
+				// Count orphan aborts toward the gaveUp budget (checked at this
+				// function's top): without this the watch cycles forever, because
+				// nothing else increments resumeAttempts on this path.
+				w.resumeAttempts++
+				tryAbortAndResume(sid, w, true)
+				return
+			}
+			if (verdict.status === "waiting") {
+				dbg(`${short(sid)} subagents quiet but inside patience — waiting, not aborting`)
+				w.orphanWatchStartAt = now
+				return
+			}
+			if (verdict.status === "busy") {
+				dbg(`${short(sid)} subagents still working — waiting`)
+				w.orphanWatchStartAt = now
+				return
+			}
+			// No subagent is active and none is stuck enough to name. v1 aborts here,
+			// and so does this — the thing standing between that and a wrong kill is
+			// subagentWaitMs, which is how long the parent was given to consume a
+			// finished child's result before this runs at all. Set it to something
+			// small and this becomes a blunt instrument; the option's own default is
+			// 15s, and its name is the warning.
+			log("info", `${short(sid)} stuck with no live subagents — aborting and resuming`)
+			tryAbortAndResume(sid, w)
+			w.resumeAttempts++
+		}
+
+		/**
+		 * Parent-wait guard for the busy-stall path. A parent blocked on a live
+		 * subagent is quiet on its own sessionID by construction — the child's
+		 * events belong to the child — so "no activity for Ns" must not by itself
+		 * trigger recovery. Deliberately independent of the `lastWasTaskTool`
+		 * heuristic below: native dispatches may never emit `session.tool.called`,
+		 * and the server active set may lag the parentID link.
+		 *
+		 * Waits when the verdict confirms a live child or a quiet one inside
+		 * the patience window, or when the parent still holds tools in flight
+		 * against children that are neither confirmed live nor proven dead.
+		 * A crashed verdict, or tools held with no children on the link at
+		 * all (wedged bare tool), falls through to normal recovery.
+		 */
+		async function parentWaitingOnSubagents(sid: string, activeIDs: Set<string>): Promise<boolean> {
+			const verdict = await subagentVerdict(sid, activeIDs)
+			if (verdict.status === "busy" || verdict.status === "waiting") return true   // live subagent confirmed via parentID — don't nudge
+			if (verdict.status === "crashed") return false                              // dead subagent — recover the parent
+			// verdict.status === "idle": no children discoverable via parentID.
+			const w = ensureWatch(sid)
+			if (w.pendingTools <= 0) return false                                       // no outstanding work — not waiting on anything
+			// pendingTools > 0 but no live child discoverable (parentID not
+			// propagated or timing gap). Do NOT unconditionally skip: a dead tool
+			// (no success/failed event) keeps pendingTools > 0 forever and looks
+			// identical to a slow-but-live worker in every signal we have.
+			// Falling through lets stall detection recover it. The earlier
+			// inflightTools / hasYoungUnfinishedWork TTL guards already protect
+			// recently-dispatched tools; old outstanding tools are treated as stuck.
+			return false
+		}
+
+		/**
+		 * Stall-path young gate, per tool. Interactive tools answer in seconds,
+		 * so 60s of event-silence means wedged; shells routinely run minutes
+		 * with no events, so they get the long TTL. Exempt names are handled
+		 * by their own branch at each call site, never here.
+		 */
+		function stallYoungAgeMsFor(name: string): number {
+			return LONG_RUNNING_TOOLS.includes(name) ? LONG_RUNNING_TOOL_STALE_TTL_MS : stuckToolAgeMs
+		}
+
+		/**
+	 * Durable liveness: is a tool call still unfinished in this session's HISTORY?
+	 *
+	 * `openShells` and `inflightTools` are per-instance event derivations: a
+	 * plugin reload (or a missed event) empties them while work is still running,
+	 * and the stall ladder then fires on a live session. Message history survives
+	 * reloads, so a tool part still unfinished there is the durable form of the
+	 * same signal. Observed 2026-10-11: sixteen consecutive
+	 * `silent with 1 shell(s) still running` deferrals on a live `bun test`,
+	 * then a reload adopted the watch without the shell registry and the ladder
+	 * fired `stall detected (no activity for 186s)`.
+	 *
+	 * Mirrors the event-based young-tool check and the stuck-tool pass: only
+	 * parts from the current turn (newer than the last user message) count, and
+	 * only young ones — or exempt names inside their stale TTL. An OLD
+	 * unfinished part is owned by the stuck-tool pass, which already nudged the
+	 * model to proceed without it; letting the stall answer there is the designed
+	 * backstop, not a bug.
+	 */
+		async function hasYoungUnfinishedWork(sid: string, now: number): Promise<boolean> {
+			const messages = await loadMessages(sid)
+			let lastUserAt = 0
+			for (const m of messages) {
+				if (msgRole(m) === "user") lastUserAt = Math.max(lastUserAt, msgAt(m))
+			}
+			for (const m of messages as Array<{
+				type?: string
+				time?: { created?: number }
+				content?: Array<{ type?: string; name?: string; state?: { status?: string }; time?: { created?: number } }>
+			}>) {
+				if (!m || msgRole(m) !== "assistant" || !Array.isArray(m.content)) continue
+				for (const part of m.content) {
+					if (part?.type !== "tool") continue
+					const st = part?.state?.status
+					if (st === "completed" || st === "error") continue
+					const created =
+						typeof part?.time?.created === "number"
+							? part.time.created
+							: typeof m?.time?.created === "number"
+								? m.time.created
+								: 0
+					if (created <= lastUserAt) continue
+					const name = typeof part?.name === "string" && part.name ? part.name.toLowerCase() : ""
+					const age = now - created
+					if (neverInterruptTools.includes(name)) {
+						if (age < NEVER_INTERRUPT_STALE_TTL_MS) return true
+						continue
+					}
+					if (age < stallYoungAgeMsFor(name)) return true
+				}
+			}
+			return false
+		}
+
+		async function checkActiveSessions() {
+			const now = Date.now()
+
+			// Cross-check our busy set against server truth (also catches sessions
+			// we never saw an execution.started for, e.g. after plugin reload).
+			const activeIDs = await getActiveSessions()
+			for (const sid of activeIDs) {
+				const w = ensureWatch(sid)
+				if (w.status !== "busy") markBusy(sid)
+			}
+			const activeSet = new Set(activeIDs)
+
+			for (const [sid, w] of sessions) {
+				if (isPaused(sid)) continue
+				if (w.status !== "busy" || w.userCancelled) {
+					// A stood-down session still gets its inbound mail read: a
+					// genuine new user message re-arms (clears userCancelled
+					// inside noteInboundUserMessage), so the latch cannot block
+					// its own clearing path. Skipped otherwise.
+					if (w.status === "busy" && w.userCancelled) {
+						noteInboundUserMessage(sid, w, await loadMessages(sid))
+						if (w.userCancelled) continue
+					} else if (w.status === "idle" && !w.userCancelled) {
+						// Already-parked sessions emit no further events, so the
+						// event-driven idle pass never revisits them. Sweep here,
+						// throttled to ~one history read per stall window: a
+						// reasoning-only turn with no output means parked, and
+						// only the watchdog can still see it.
+						const idleFor = now - (w.idleSince ?? w.lastActivityAt)
+						if (idleFor > chunkTimeoutMs && now - w.lastSilentReasoningCheck > chunkTimeoutMs) {
+							w.lastSilentReasoningCheck = now
+							await checkForSilentReasoningTurn(sid, w)
+						}
+						// Re-run the stuck-tool pass for a parked session. The
+						// event-driven pass runs once, on `session.idle`; if the call
+						// was still inside the age gate then (which is normal — the
+						// turn ends the moment the model stops emitting, not the
+						// moment the tool answers), it is declined by design and a
+						// parked session emits no further events, so nothing would
+						// ever re-examine it. The call's own age gate still decides:
+						// this only catches calls that have since aged into stuck.
+						// Throttled to the age gate so the cost is ~one history read
+						// per gate, and reusing checkForStuckToolCalls means the same
+						// locks, budgets and busy-shell guard apply as on the idle path.
+						if (idleFor > stuckToolAgeMs && now - w.lastStuckToolCheck > stuckToolAgeMs) {
+							w.lastStuckToolCheck = now
+							await checkForStuckToolCalls(sid, w)
+						}
+						// STALL DETECTION FOR IDLE SESSIONS: a session that went
+						// idle mid-work (not waiting on user, not completed) must
+						// still be nudged. The same guards as the busy path apply.
+						// (ses_e9c4d8de7ffe5DC0yedTw7Cvk7, 2026-10-22: idle 13 min
+						// with no nudge because idle path skipped stall detection.)
+						{
+							const history = await loadMessages(sid)
+							noteInboundUserMessage(sid, w, history)
+							if (w.completionSignaled) {
+								if (w.lastGenuineUserAt > w.completionSignaledAt) {
+									w.completionSignaled = false
+									w.completionSignaledAt = 0
+									dbg(`${short(sid)} genuine new user message after latched completion — re-opening stall detection`)
+								} else {
+									dbg(`${short(sid)} completion latched — skipping stall detection`)
+								}
+							} else if (!isWaitingOnUser(sid, w, history)) {
+								if (w.compacting) {
+									dbg(`${short(sid)} mid-compaction — skipping stall detection`)
+								} else if (await hasYoungUnfinishedWork(sid, now)) {
+									dbg(`${short(sid)} tool call still unfinished in history — working, not stalled`)
+								} else if (await parentWaitingOnSubagents(sid, activeSet)) {
+									dbg(`${short(sid)} waiting on subagents — skipping stall detection`)
+								} else {
+									const profile = resolveProfile(sid)
+									const profileChunkTimeoutMs = profile.chunkTimeoutMs
+									const profileGracePeriodMs = profile.gracePeriodMs
+									const silence = now - w.lastActivityAt
+									const fuseMult = Math.min(8, 2 ** Math.max(0, w.episodeRefires))
+									const baseInterval = (profileChunkTimeoutMs + profileGracePeriodMs) * fuseMult
+									// Per-session jitter so nudges don't land on exact minute boundaries
+									// (causes UI minute-rounding to show multiple nudges at same time).
+									// Only applied when base interval > 60s — short intervals need
+									// deterministic behavior for tests and real short timeouts.
+									const jitter = baseInterval > 60_000
+										? Math.floor(Math.random() * STALL_JITTER_MS * 2) - STALL_JITTER_MS
+										: 0
+									if (silence >= baseInterval + jitter) {
+										// Quota guard for idle sessions: don't inject a stall nudge
+										// when the last assistant message carries a quota/usage error.
+										try {
+											const _qlast2 = history.length ? history[history.length - 1] : null
+											let _qtype2 = ""
+											let _qmsg2 = ""
+											if (_qlast2 && msgRole(_qlast2) === "assistant") {
+												const _qe2 = (_qlast2 as { error?: unknown; info?: { error?: unknown } }).error ?? (_qlast2 as { info?: { error?: unknown } }).info?.error
+												if (typeof _qe2 === "string") _qmsg2 = _qe2
+												else if (_qe2 && typeof _qe2 === "object") {
+													_qtype2 = String((_qe2 as { name?: unknown; type?: unknown }).name ?? (_qe2 as { type?: unknown }).type ?? "")
+													_qmsg2 = String((_qe2 as { message?: unknown }).message ?? "")
+												}
+												const _qtxt2 = lastAssistantTextFrom(history)
+												if (_qtxt2) _qmsg2 = _qmsg2 ? `${_qmsg2} ${_qtxt2}` : _qtxt2
+											}
+											if (isRateLimitError(_qtype2, _qmsg2)) {
+												handleRateLimitFailure(sid, w, _qtype2, _qmsg2)
+												continue
+											}
+										} catch (e) {
+											dbg(`${short(sid)} quota guard (idle) failed: ${e instanceof Error ? e.message : String(e)}`)
+										}
+										if (w.awaitingQuotaRetry || w.rateLimitedAt > 0) {
+											dbg(`${short(sid)} quota-armed — skipping stall recover`)
+											continue
+										}
+										await recover(sid, `no activity for ${Math.ceil(silence / 1000)}s`)
+									}
+								}
+							}
+						}
+						continue
+					} else {
+						continue
+					}
+				}
+				// Warmup: a session that only just went busy has not had a chance to
+				// emit anything. Without this a freshly-started turn can be declared
+				// stalled while it is still queueing its first model call.
+				if (now - w.createdAt < warmupMs) continue
+				// The orphan watch comes first, ahead of the silence check below,
+				// because that is the whole point of it: a parent waiting on a dead
+				// subagent has been quiet for less than chunkTimeoutMs, so every
+				// ordinary path would decline to act.
+				if (w.orphanWatchStartAt !== null) {
+					if (!w.aborting && !w.gaveUp && !w.completionSignaled) {
+						await runOrphanWatch(sid, w, now, activeSet)
+					}
+					continue
+				}
+				// A latched completion stands down the stall path too: the session
+				// declared itself done (task_complete tool, celebration, or an
+				// explicit stop). Nudging a completed quiet session is the nagging
+				// this exists to prevent.
+				//
+				// The latch re-opens ONLY on genuine new work: a user message newer
+				// than the latch itself, read here from history (not from
+				// lastGenuineUserAt, which lags on timer ticks for busy parents).
+				// noteInboundUserMessage is the arbiter — it already distinguishes
+				// genuine messages from our own prompts, so own injections never
+				// re-open it. Plumbing transitions (watchdog re-marks, discovery
+				// adopts, step events) must NOT clear it: ses_ed33c0da (2026-10-11)
+				// would have latched TASK COMPLETE at idle and lost it at the
+				// re-mark 1s later, stalling at +197s anyway.
+				if (w.completionSignaled) {
+					noteInboundUserMessage(sid, w, await loadMessages(sid))
+					if (w.lastGenuineUserAt > w.completionSignaledAt) {
+						w.completionSignaled = false
+						w.completionSignaledAt = 0
+						dbg(`${short(sid)} genuine new user message after latched completion — re-opening stall detection`)
+					} else {
+						dbg(`${short(sid)} completion latched — skipping stall detection`)
+						continue
+					}
+				}
+				// Stale compaction flag: a compaction that never reports
+				// ended/failed within the TTL is wedged — clear the guard so
+				// recovery can eventually intervene.
+				if (w.compacting && w.compactionStartedAt && now - w.compactionStartedAt > COMPACTION_STALE_TTL_MS) {
+					w.compacting = false
+					w.compactionStartedAt = null
+					log("warn", `${short(sid)} compaction flag stale (>${COMPACTION_STALE_TTL_MS / 60000}m) — clearing guard`)
+				}
+				// NEVER interrupt a session that is mid-compaction.
+				if (w.compacting) {
+					dbg(`${short(sid)} mid-compaction — skipping stall detection`)
+					continue
+				}
+			// Per-session profile based on model provider (local vs online)
+				const profile = resolveProfile(sid)
+				const profileChunkTimeoutMs = profile.chunkTimeoutMs
+				const profileGracePeriodMs = profile.gracePeriodMs
+				const silence = now - w.lastActivityAt
+				// Episode backoff: each progress-restarted refire without
+				// genuine user input doubles the fuse (cap x8), so a
+				// slow-trickling session decays to patience instead of
+				// nagging on a fixed 3-minute clock (ses_ed975114).
+				// Genuine user input resets episodeRefires to 0.
+				const fuseMult = Math.min(8, 2 ** Math.max(0, w.episodeRefires))
+				const baseInterval = (profileChunkTimeoutMs + profileGracePeriodMs) * fuseMult
+				// Per-session jitter so nudges don't land on exact minute boundaries
+				// (causes UI minute-rounding to show multiple nudges at same time).
+				// Only applied when base interval > 60s — short intervals need
+				// deterministic behavior for tests and real short timeouts.
+				const jitter = baseInterval > 60_000
+					? Math.floor(Math.random() * STALL_JITTER_MS * 2) - STALL_JITTER_MS
+					: 0
+				if (silence < baseInterval + jitter) continue
+				// A quiet turn that already declared completion, but no idle
+				// inspection ever latched it: no session.idle event arrived, or a
+				// take-over landed mid-silence. Judge the tail from history
+				// rather than firing the stall. ses_edd1eb51 (2026-10-09) fired
+				// resume attempt 1/3 186s after a "TASK COMPLETE" delivery
+				// exactly this way. Same reminder-or-latch semantics as the idle
+				// stop path. Placed past the silence gate so a partial stream
+				// (still emitting deltas) can never match an end-anchored claim,
+				// and so the history read happens at most once per stall window.
+				{
+					const histText = lastAssistantTextFrom(await loadMessages(sid))
+					// Hand-off turns wait on the user the same way completed ones
+					// are finished: nudging either talks over someone. A hand-off
+					// is not latched (no completion claimed) — it is only
+					// skipped while its text is still the tail.
+					if (histText && isUserHandoff(histText)) {
+						dbg(`${short(sid)} quiet turn ends with a hand-off — waiting on user, not stalled`)
+						continue
+					}
+					if (histText && turnEndsWithCompletionClaim(histText)) {
+						const open = getOpenTodos(await readTodos(sid))
+						if (open.length > 0) {
+							await targetedRecovery(sid, "stop-open-todos", buildOpenTodosReminder(open), "todoNudgeAttempts")
+						} else if (!w.completionSignaled) {
+							w.completionSignaled = true
+							w.completionSignaledAt = Date.now()
+							log("info", `${short(sid)} quiet turn ends with a completion claim and no open todos — latching completion, not nudging`)
+						} else {
+							dbg(`${short(sid)} completion already latched — skipping`)
+						}
+						continue
+					}
+				}
+				if (busyStallStrategy === "off") {
+					dbg(`stall on ${short(sid)} ignored (busyStallStrategy=off)`)
+					continue
+				}
+				// Same stale-guard as the compaction flag: an unanswered `permission.asked`
+				// must not stand this session down forever.
+				clearStalePermissionFlag(sid, w)
+				if (w.permissionPending) {
+					dbg(`${short(sid)} silent but permission pending — skipping`)
+					continue
+				}
+				if (selfAbortActive(w)) {
+					dbg(`${short(sid)} silent but inside our own abort window — skipping`)
+					continue
+				}
+				// A session with a shell still running is working, not stalled. This
+				// covers the parked-parent case the task-tool heuristic below cannot
+				// see: a backgrounded `shell` spawns no child session, so
+				// `lastWasTaskTool` stays false and `others.length` never gets a
+				// chance to say "this parent is waiting on something".
+				const busyShells = openShellCount(sid)
+				if (busyShells > 0) {
+					dbg(`${short(sid)} silent with ${busyShells} shell(s) still running — waiting`)
+					continue
+				}
+				// A tool call still running is working, not stalled — even with no
+				// events for longer than the chunk timeout. A 4-minute `write` or
+				// `compress` emits nothing while it runs, so event-silence accrues
+				// and the injection below would interrupt the live call ("Tool
+				// execution interrupted"). Young tools defer; tools older than the
+				// stuck age gate are wedged and the stall answers normally. Exempt
+				// names (default: compress) are never interrupted while fresh —
+				// interrupting a compress risks half-compacted state, the same
+				// reason compaction itself is never interrupted — with the same
+				// stale-TTL escape when one wedges for real.
+				{
+					const now = Date.now()
+					let youngTool = false
+					// ?? []: a watch adopted from a pre-map build may reach this loop
+					// before any ensureWatch call migrates it (the sweep iterates the
+					// map directly). A missing map reads as no tools, never a throw.
+					for (const [, rec] of w.inflightTools ?? []) {
+						const age = now - rec.at
+						if (neverInterruptTools.includes(rec.name)) {
+							if (age < NEVER_INTERRUPT_STALE_TTL_MS) {
+								dbg(`${short(sid)} silent with exempt tool "${rec.name}" still running (${Math.round(age / 1000)}s) — waiting`)
+								youngTool = true
+								break
+						}
+							continue
+					}
+					if (age < stallYoungAgeMsFor(rec.name)) youngTool = true
+				}
+					if (youngTool) continue
+				}
+				// Durable form of the two guards above. Both read per-instance event
+				// derivations that a reload empties while work is still running;
+				// history survives, so an unfinished tool part there means the
+				// session is working no matter what the event counters say.
+				// Placed last so the cheap event checks run first and this history
+				// read happens only when they show nothing.
+				if (await hasYoungUnfinishedWork(sid, now)) {
+					dbg(`${short(sid)} tool call still unfinished in history — working, not stalled`)
+					continue
+				}
+				// A parent that dispatched a task tool and then went quiet is often
+				// waiting for a child. "Some other session is running" is NOT that
+				// evidence: on a busy box the reading silenced the stall detector for
+				// every session that ever dispatched a task tool, for as long as
+				// anything else was running (ses_ea173ea1effe7LdQB40HNuv2Jl, 2026-10-21:
+				// the 9am upstream-sync parent sat idle for 7 hours with its workers
+				// already cancelled). The parentID link below is the real evidence —
+				// it waits on a live child, waits on a quiet one inside the patience
+				// window, and RECOVERS a crashed one, which the coarse reading masked.
+				// When the link is undiscoverable the parent is recovered on purpose
+				// (cf1a395): an unfinished tool part in the parent's own history
+				// (checked above) still shows a live dispatch.
+				// A parent waiting on a live subagent is working, not stalled. The
+				// heuristic above misses native dispatches (no tool.called event)
+				// and active-set lag; the parentID link does not (see
+				// parentWaitingOnSubagents, ses_ef73a206 2026-10-04).
+				if (await parentWaitingOnSubagents(sid, activeSet)) {
+					dbg(`${short(sid)} waiting on subagents — skipping stall detection`)
+					continue
+				}
+				// A turn parked on user input (a `question` awaiting an answer,
+				// an unanswered permission beyond the event flow) is waiting,
+				// not stalled. Narrower than the idle-path check on purpose: a
+				// wedged bare tool with zero events is still a stall.
+				if (isWaitingOnUser(sid, w, await loadMessages(sid))) {
+					dbg(`${short(sid)} waiting on user input — skipping stall detection`)
+					continue
+				}
+				// busyStallStrategy picks how a stall is answered. "abort" interrupts
+				// the wedged step before continuing, because a stream that went
+				// silent mid-generation will not pick the prompt up on its own.
+				// Mirrors the v1 branch at src/index.ts.
+				if (busyStallStrategy === "abort" && w.resumeAttempts < maxRetries) {
+					log("info", `${short(sid)} stall (busyStallStrategy=abort): aborting before continue`)
+					// The operator opted into interrupting busy sessions; honour
+					// that even though the default policy refuses to.
+					await tryAbortAndResume(sid, w, true)
+				} else {
+					// Quota guard: if the last assistant message carries a quota/usage-limit
+					// error, treat it as a rate-limit failure (stand down + quota ladder)
+					// instead of injecting a stall-recovery prompt that will also fail.
+					try {
+						const _qm = await loadMessages(sid)
+						const _qlast = _qm.length ? _qm[_qm.length - 1] : null
+						let _qtype = ""
+						let _qmsg = ""
+						if (_qlast && msgRole(_qlast) === "assistant") {
+							const _qe = (_qlast as { error?: unknown; info?: { error?: unknown } }).error ?? (_qlast as { info?: { error?: unknown } }).info?.error
+							if (typeof _qe === "string") _qmsg = _qe
+							else if (_qe && typeof _qe === "object") {
+								_qtype = String((_qe as { name?: unknown; type?: unknown }).name ?? (_qe as { type?: unknown }).type ?? "")
+								_qmsg = String((_qe as { message?: unknown }).message ?? "")
+							}
+							const _qtxt = lastAssistantTextFrom(_qm)
+							if (_qtxt) _qmsg = _qmsg ? `${_qmsg} ${_qtxt}` : _qtxt
+						}
+						if (isRateLimitError(_qtype, _qmsg)) {
+							handleRateLimitFailure(sid, w, _qtype, _qmsg)
+							continue
+						}
+					} catch (e) {
+						dbg(`${short(sid)} quota guard failed: ${e instanceof Error ? e.message : String(e)}`)
+					}
+					if (w.awaitingQuotaRetry || w.rateLimitedAt > 0) {
+						dbg(`${short(sid)} quota-armed — skipping stall recover`)
+						continue
+					}
+					await recover(sid, `no activity for ${Math.ceil(silence / 1000)}s`)
+				}
+			}
+			// Rate-limit gate: sessions stood down on quota get one attempt per
+			// served cooldown, evaluated here so no armed timer can be lost to
+			// a reload. Guards mirror the failure handler; `recover()` applies
+			// its own budget, loop and inject guards on top.
+			for (const [rsid, rw] of sessions) {
+				if (!rw.awaitingQuotaRetry) continue
+				const ladder = rateLimitCooldownsMs
+				const rn = rw.rateLimitAttempts
+				if (rn >= ladder.length) {
+					rw.awaitingQuotaRetry = false
+					continue
+				}
+				if (rw.userCancelled || rw.gaveUp || rw.compacting || rw.permissionPending) continue
+				if (selfAbortActive(rw)) continue
+				if (Date.now() - rw.rateLimitedAt < ladder[rn]) continue
+				serveQuotaRung(rsid, rw, rn, ladder)
+			}
+			cleanupIdleSessions()
+		}
+
+		// Re-entrancy guard: `checkActiveSessions` awaits per-session history reads and
+	// subagent polls, so a sweep can outlast the interval and the next tick would
+	// start a second concurrent sweep over the same SessionWatch objects. Audit
+	// 2026-10-10. Skipping is the safe direction — the next tick picks up whatever
+	// this one skipped — whereas overlapping means two evaluators can both decide a
+	// stall is real and both recover it.
+	let watchdogBusy = false
+	const watchdog = setInterval(() => {
+		if (watchdogBusy) {
+			dbg("watchdog sweep still running — skipping this tick")
+			return
+		}
+		watchdogBusy = true
+		checkActiveSessions()
+			.catch((e) => log("error", `watchdog failed: ${e instanceof Error ? e.message : String(e)}`))
+			.finally(() => {
+				watchdogBusy = false
+			})
+	}, checkIntervalMs)
+
+		// Discovery sweep. Separate timer from the watchdog because the two have
+		// different jobs and different costs: the watchdog runs every few seconds
+		// and must stay cheap, discovery lists every session and runs every 60s.
+		// The initial sweep waits out discoveryDelayMs so plugin load does not
+		// compete with the turn that triggered it.
+		const discoveryTimer = setInterval(() => {
+			discoverSessions().catch((e) =>
+				log("error", `discovery failed: ${e instanceof Error ? e.message : String(e)}`),
+			)
+		}, DEFAULT_SESSION_DISCOVERY_INTERVAL_MS)
+		const initialDiscovery = setTimeout(() => {
+			discoverSessions().catch(() => {})
+		}, discoveryDelayMs)
+
+		// Offered to the model before the first turn, so it can actually be called.
+		// Awaited, but guarded: a registry that refuses the registration must not
+		// stop the watchdog from starting.
+		await registerTaskCompleteFallback()
+		await observeTaskCompleteTool()
+
+		// ---------------------------------------------------------------------
+		// Context saturation
+		// ---------------------------------------------------------------------
+
+		/**
+		 * v2 emits `session.usage.updated` with the session's current usage, so the
+		 * token count is read rather than reconstructed. `TokenUsage.total` in the
+		 * schema sums input + output + reasoning + cache read + cache write; v1
+		 * accumulated the same way.
+		 */
+		function tokenTotalOf(tokens: unknown): number {
+			if (!tokens || typeof tokens !== "object") return 0
+			const t = tokens as {
+				input?: number
+				output?: number
+				reasoning?: number
+				cache?: { read?: number; write?: number }
+			}
+			const cache = t.cache ?? {}
+			return posNum(t.input) + posNum(t.output) + posNum(t.reasoning) + posNum(cache.read) + posNum(cache.write)
+		}
+		function posNum(v: unknown): number {
+			return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0
+		}
+
+		/**
+		 * The usable context window for a session's model: the full window minus the
+		 * smaller of a 20k output reserve and the model's own output limit. This is
+		 * v1's arithmetic (`limit.context - Math.min(20_000, limit.output)`), kept
+		 * identical so the same threshold means the same thing on both builds.
+		 *
+		 * v2 hands the limit over directly on `ctx.model.get()` — `Model.Info.limit`
+		 * is `{ context, input?, output }` — where v1 had to walk the raw provider
+		 * list. Cached per model, because the answer never changes at runtime.
+		 */
+		const usableLimitCache = new Map<string, number>()
+		async function getUsableContextLimit(sid: string): Promise<number | null> {
+			try {
+				let ref = sessions.get(sid)?.modelRef
+				if (!ref) {
+					// No step observed yet (plugin loaded mid-session): take the ref off
+					// the newest assistant message instead.
+					const msgs = await ctx.session.context({ sessionID: sid })
+					if (Array.isArray(msgs)) {
+						for (let i = msgs.length - 1; i >= 0; i--) {
+							const m = msgs[i] as {
+								role?: string
+								model?: { providerID?: string; id?: string; modelID?: string }
+							}
+							if (msgRole(m) !== "assistant" || !m.model) continue
+							const providerID = m.model.providerID
+							const modelID = m.model.modelID ?? m.model.id
+							if (typeof providerID === "string" && typeof modelID === "string") {
+								ref = { providerID, modelID }
+								const w = sessions.get(sid)
+								if (w) w.modelRef = ref
+							}
+							break
+						}
+					}
+				}
+				if (!ref) return null
+				const key = `${ref.providerID}/${ref.modelID}`
+				const cached = usableLimitCache.get(key)
+				if (cached !== undefined) return cached
+
+				const info = (ctx.model as any)?.get?.(ref.providerID, ref.modelID)
+				if (!info) return null
+				const limit = (info as { limit?: { context?: number; output?: number } }).limit
+				if (!limit || typeof limit.context !== "number" || limit.context === 0) return null
+				const usable = limit.context - Math.min(20_000, limit.output ?? 0)
+				if (!Number.isFinite(usable) || usable <= 0) return null
+				usableLimitCache.set(key, usable)
+				return usable
+			} catch (e) {
+				dbg(`usable-context-limit lookup failed for ${short(sid)}:`, e instanceof Error ? e.message : String(e))
+				return null
+			}
+		}
+
+		/**
+		 * v2 hands plugins a narrowed `ctx.session` domain (see
+		 * `packages/plugin/src/promise/session.ts`) that omits `list`, `active` and
+		 * `compact`, so those are read defensively: off the session domain first,
+		 * then off the raw client. A host that supplies neither degrades to the
+		 * event-derived busy set rather than failing.
+		 *
+		 * `args` matters for the client's methods, which take a request object
+		 * (`{ sessionID }`), unlike the plugin-domain wrappers.
+		 */
+		async function callSessionApi<T>(name: string, args?: Record<string, unknown>): Promise<T | undefined> {
+			const fromDomain = (ctx.session as any)[name]
+			if (typeof fromDomain === "function") {
+				try {
+					return (await fromDomain.call(ctx.session, args)) as T
+				} catch (e) {
+					dbg(`ctx.session.${name}() failed:`, e instanceof Error ? e.message : String(e))
+				}
+			}
+			const fromClient = ctx.client?.session?.[name as "get"]
+			if (typeof fromClient === "function") {
+				try {
+					return (await (fromClient as any).call(ctx.client!.session, args)) as T
+				} catch (e) {
+					dbg(`ctx.client.session.${name}() failed:`, e instanceof Error ? e.message : String(e))
+				}
+			}
+			return undefined
+		}
+
+		/**
+		 * Is magic-context installed?
+		 *
+		 * v1 read `config.get().plugin`. v2 has no `config` domain on the plugin
+		 * context, but `ctx.plugin.list()` carries the same information in the
+		 * server's own words: `Plugin.Info[]` with an `id` plus a `source` that is a
+		 * package spec, a local path, or an SDK module. Matching id *and* source is
+		 * what makes this work regardless of how the plugin was installed.
+		 *
+		 * Cached, negative verdict included — an idle check must not re-list plugins.
+		 */
+		let magicContextDetected: boolean | null = null
+		async function isMagicContextInstalled(): Promise<boolean> {
+			if (magicContextDetected !== null) return magicContextDetected
+			try {
+				const list = (ctx.plugin as any)?.list
+				if (typeof list !== "function") {
+					dbg("magic-context detection: ctx.plugin.list unavailable, treating as not installed")
+					return false
+				}
+				const plugins = unwrapList(await list.call(ctx.plugin)) as Array<{ id?: string; source?: unknown }>
+				magicContextDetected = plugins.some((p) => {
+					const id = typeof p?.id === "string" ? p.id : ""
+					if (id.toLowerCase().includes("magic-context")) return true
+					const src = p?.source as { target?: string; path?: string } | undefined
+					const spec = src?.target ?? src?.path ?? ""
+					return typeof spec === "string" && spec.toLowerCase().includes("magic-context")
+				})
+				dbg(`magic-context detection: ${magicContextDetected ? "installed" : "not installed"}`)
+				return magicContextDetected
+			} catch (e) {
+				dbg("magic-context detection failed, treating as not installed:", e instanceof Error ? e.message : String(e))
+				return false
+			}
+		}
+
+		/** Unwrap the `{ data }` envelope the client uses, or pass an array through. */
+		function unwrapList(response: unknown): Array<Record<string, unknown>> {
+			if (Array.isArray(response)) return response as Array<Record<string, unknown>>
+			if (response && typeof response === "object") {
+				const data = (response as { data?: unknown }).data
+				if (Array.isArray(data)) return data as Array<Record<string, unknown>>
+			}
+			return []
+		}
+
+		/**
+		 * v1's saturation routing, ported to the v2 API.
+		 *
+		 * A session can fill its window without stalling — it just keeps working
+		 * until it chokes. On idle, when used/usable crosses the threshold, routing
+		 * depends on session kind:
+		 *
+		 *   subagent — opt-in only (`subagentNativeCompactionEnabled`). v1 called
+		 *             `session.summarize()`; v2 spells it `session.compact`, which
+		 *             is NOT in the plugin `session` Pick, so it goes through the same
+		 *             defensive lookup as `list`/`active`.
+		 *   parent   — only when magic-context is installed, because its setup
+		 *             disables native compaction and compacting here would
+		 *             double-compress. v1 sent the `ctx-wrapup` command through the
+		 *             client; `session.command` IS on the plugin domain in v2.
+		 *
+		 * Fail-safe, as in v1: a missing limit, a missing token count, a user
+		 * cancellation, or a signalled completion means no intervention at all.
+		 * The intervention is one-shot per turn.
+		 */
+		async function checkContextSaturation(sid: string): Promise<void> {
+			const w = sessions.get(sid)
+			if (!w) return
+			if (w.lastTokenTotal <= 0) return
+			if (w.contextWrapupAttempts >= 1) return
+			if (w.userCancelled || w.completionSignaled || w.aborting) return
+
+			const usable = await getUsableContextLimit(sid)
+			if (!usable) return
+			if (w.lastTokenTotal / usable < contextSaturationThreshold) return
+
+			const pct = Math.round((w.lastTokenTotal / usable) * 100)
+			if (await isSubAgentSession(sid)) {
+				if (!subagentNativeCompactionEnabled) {
+					dbg(`${short(sid)} subagent at ${pct}% of usable context; native compaction is opt-in`)
+					return
+				}
+				w.contextWrapupAttempts++
+				log(
+					"warn",
+					`${short(sid)} context saturation (subagent): ${w.lastTokenTotal}/${usable} tokens (${pct}% of usable); triggering native compaction`,
+				)
+				// Re-check the latches: the awaits above left a window for the user
+				// to cancel in.
+				if (w.userCancelled || w.completionSignaled) return
+				const compacted = await callSessionApi<unknown>("compact", { sessionID: sid })
+				if (compacted === undefined) {
+					log("warn", `${short(sid)} native compaction is not exposed on this host — skipping`)
+				}
+				return
+			}
+
+			if (!(await isMagicContextInstalled())) {
+				dbg(`${short(sid)} at ${pct}% of usable context; magic-context not installed, not intervening`)
+				return
+			}
+			w.contextWrapupAttempts++
+			log(
+				"warn",
+				`${short(sid)} context saturation: ${w.lastTokenTotal}/${usable} tokens (${pct}% of usable); sending magic-context wrapup command`,
+			)
+			if (w.userCancelled || w.completionSignaled) return
+			try {
+				await (ctx.session as any).command({ sessionID: sid, name: CTX_WRAPUP_TRIGGER })
+			} catch (e) {
+				log(
+					"warn",
+					`${short(sid)} magic-context wrapup command failed: ${e instanceof Error ? e.message : String(e)}`,
+				)
+			}
+		}
+
+		/**
+		 * Seed watch state for sessions that already exist, and mark the ones
+		 * currently running as busy.
+		 *
+		 * v1 did this by polling `session.list()` and trusting a `status` field
+		 * on each row. v2 has something better: `session.active()` is the
+		 * server's own record of what is running right now, so "busy" is read
+		 * rather than guessed. A session that was already mid-turn when the
+		 * plugin loaded would otherwise be invisible — no `execution.started`
+		 * ever reaches us for it, so the stall watchdog would have nothing to
+		 * watch.
+		 */
+		async function discoverSessions() {
+			try {
+				const listed = unwrapList(await callSessionApi<unknown>("list"))
+				let seeded = 0
+				for (const row of listed) {
+					const sid = row?.id
+					if (typeof sid !== "string" || !sid.startsWith("ses_")) continue
+					if (!sessions.has(sid)) {
+						ensureWatch(sid)
+						seeded++
+					}
+				}
+
+				// Authoritative busy set. Anything listed as running but not
+				// already tracked busy starts its stall clock now, not from
+				// whenever the plugin happened to attach.
+				const active = await callSessionApi<Record<string, unknown>>("active")
+				let adopted = 0
+				if (active && typeof active === "object") {
+					for (const [sid, val] of Object.entries(active)) {
+						if (!sid.startsWith("ses_")) continue
+						const w = ensureWatch(sid)
+						if (w.status !== "busy") {
+							markBusy(sid)
+							adopted++
+						} else {
+							// Already busy from events; refresh nothing, but make
+							// sure the session is not left `createdAt`-stale so
+							// the warmup window does not swallow its first stall.
+							void val
+						}
+					}
+				}
+
+				if (seeded > 0 || adopted > 0) {
+					log("info", `discovery: seeded ${seeded} session(s), adopted ${adopted} already running`)
+				} else {
+					dbg("discovery: nothing new")
+				}
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err)
+				dbg(`session discovery failed: ${msg}`)
+			}
+		}
+
+		/**
+		 * Re-arm quota ladders lost to a reload.
+		 *
+		 * The ladder gate is in-memory (`awaitingQuotaRetry`, `rateLimitedAt`,
+		 * `rateLimitAttempts`), and `dispose()` clears the session map — so any
+		 * reload between arming and the next rung silently cancels the retry.
+		 * The `quota-armed` marker lines in the (file-backed, reload-proof) log
+		 * are the record. For each still-listed session with a marker:
+		 * live state wins (already armed — nothing to do), stale markers past
+		 * the ladder horizon are dropped, and a user message newer than the arm
+		 * means the ladder already reset — re-arming would retry a session the
+		 * user already continued. Otherwise the gate is restored at its rung and
+		 * the watchdog serves it on schedule, possibly immediately if overdue.
+		 */
+		async function restoreQuotaLadders(): Promise<void> {
+			let listed: Set<string>
+			try {
+				listed = new Set(unwrapList(await callSessionApi<unknown>("list")).map((r) => r.id).filter((id): id is string => typeof id === "string"))
+			} catch {
+				return
+			}
+			const horizon = rateLimitCooldownsMs.reduce((a, b) => a + b, 0)
+
+			// Primary channel: the plugin's own storage record. No history read —
+			// `syncQuotaState` deletes the record the moment a genuine user
+			// message resets the ladder, so its absence is the answer to "did
+			// they speak after the arm?" That is what removes the per-session
+			// loadMessages() at boot, which was N sequential HTTP round-trips
+			// during startup.
+			const restored = new Set<string>()
+			if (ctx.storage?.set) {
+				for (const sid of listed) {
+					let rec: unknown
+					try {
+						rec = await ctx.storage.get(`${QUOTA_STATE_PREFIX}${sid}`)
+					} catch (e) {
+						dbg(`${short(sid)} quota record read failed:`, e instanceof Error ? e.message : String(e))
+						continue
+					}
+					const r = rec as { v?: number; at?: unknown; rung?: unknown; noticed?: unknown } | null
+					if (!r || typeof r.at !== "number") continue
+					if (Date.now() - r.at >= QUOTA_STATE_MAX_AGE_MS) {
+						void syncQuotaState(sid, ensureWatch(sid), true)
+						continue
+					}
+					if (Date.now() - r.at >= horizon) continue
+					const w = ensureWatch(sid)
+					if (w.awaitingQuotaRetry || w.rateLimitedAt > 0) continue
+					// Never arm a session that is already working. A user who
+					// messaged while the plugin was still starting has a busy
+					// watch by the time the watchdog sweeps it, and serving a
+					// restored ladder into that turn is the false nag this
+					// whole change exists to remove. Status is already in
+					// memory, so this guard costs no history read.
+					if (w.status === "busy") {
+						dbg(`${short(sid)} busy — skipping quota restore`)
+						continue
+					}
+					w.rateLimitedAt = r.at
+					w.rateLimitAttempts = typeof r.rung === "number" ? r.rung : 0
+					w.awaitingQuotaRetry = true
+					// The arm that wrote this record also sent the user-visible
+					// notice, so carry that across the restart — otherwise the
+					// next hit re-announces a stand-down already announced.
+					w.quotaNoticedAt = typeof r.noticed === "number" && r.noticed > 0 ? r.noticed : r.at
+					restored.add(sid)
+					log("warn", `${short(sid)} quota ladder restored (armed ${Math.round((Date.now() - r.at) / 1000)}s ago, rung ${w.rateLimitAttempts}) — retry due on schedule`)
+				}
+			}
+
+			// Fallback for arms written before R1 shipped, or by a host whose
+			// storage has no `set`. Costs a history read per session, so it runs
+			// only for sessions the storage channel did not already settle.
+			let text: string
+			try {
+				text = readFileSync(logFile, "utf8")
+			} catch {
+				return
+			}
+			const marks = new Map<string, { at: number; rung: number }>()
+			for (const line of text.split("\n").slice(-3000)) {
+				const m = /quota-armed sid=(ses_\S+) at=(\d+) rung=(\d+)/.exec(line)
+				if (m) marks.set(m[1], { at: Number(m[2]), rung: Number(m[3]) })
+			}
+			if (marks.size === 0) return
+			for (const [sid, mark] of marks) {
+				if (!listed.has(sid) || restored.has(sid)) continue
+				const w = ensureWatch(sid)
+				if (w.awaitingQuotaRetry || w.rateLimitedAt > 0) continue
+				if (Date.now() - mark.at >= horizon) continue
+				const messages = await loadMessages(sid)
+				let lastUserAt = 0
+				for (const m of messages) {
+					if (msgRole(m) === "user") lastUserAt = Math.max(lastUserAt, msgAt(m))
+				}
+				if (lastUserAt > mark.at) continue
+				w.rateLimitedAt = mark.at
+				w.rateLimitAttempts = mark.rung
+				w.awaitingQuotaRetry = true
+				w.quotaNoticedAt = mark.at
+				log("warn", `${short(sid)} quota ladder restored (armed ${Math.round((Date.now() - mark.at) / 1000)}s ago, rung ${mark.rung}) — retry due on schedule`)
+			}
+		}
+
+		/**
+		 * Mirror the rate-limit ladder into `ctx.storage` so it survives a real
+		 * process restart. Writes only while an episode is armed, deletes the
+		 * record as soon as a genuine turn resets the ladder — so a restored
+		 * ladder can never outlive the user having spoken.
+		 *
+		 * Best-effort by design: a storage failure must never block recovery, so
+		 * every path here swallows and logs at debug. When `set` is missing
+		 * (a host that only offers `get`) this is a no-op and the log markers
+		 * remain the channel.
+		 */
+		async function syncQuotaState(sid: string, w: SessionWatch, force = false): Promise<void> {
+			try {
+				const st = ctx.storage
+				if (!st?.set) return
+				const key = `${QUOTA_STATE_PREFIX}${sid}`
+				if (!w.rateLimitedAt) {
+					if (force || st.remove) await st.remove?.(key)
+					return
+				}
+				await st.set(key, {
+					v: 1,
+					at: w.rateLimitedAt,
+					rung: w.rateLimitAttempts,
+					noticed: w.quotaNoticedAt,
+				})
+			} catch (e) {
+				dbg(`${short(sid)} quota state sync failed:`, e instanceof Error ? e.message : String(e))
+			}
+		}
+
+		async function syncCounters(sid: string, w: SessionWatch) {
+			try {
+				const st = ctx.storage
+				if (!st?.set) return
+				const key = `${COUNTER_STATE_PREFIX}${sid}`
+				await st.set(key, {
+					v: 1,
+					workRetries: w.workRetries ?? 0,
+					resumeAttempts: w.resumeAttempts ?? 0,
+					lifetimeContinues: w.lifetimeContinues ?? 0,
+					episodeRefires: w.episodeRefires ?? 0,
+					at: Date.now()
+				})
+			} catch (e) {
+				dbg(`${short(sid)} counter sync failed:`, e instanceof Error ? e.message : String(e))
+			}
+		}
+
+		// ---------------------------------------------------------------------
+		// Event stream
+		// ---------------------------------------------------------------------
+
+		function handleEvent(ev: V2Event) {
+			switch (ev.type) {
+				// --- lifecycle -------------------------------------------------
+				case "session.execution.started": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					const w = ensureWatch(sid)
+					if (w.selfRecovery) {
+						w.selfRecovery = false
+					} else {
+						// A provider retry that opencode schedules itself starts a
+						// turn without the user asking. It is not a new episode: it
+						// must not wipe the visible progress counter, or the ladder
+						// reads 1/3 forever while the session is actually working
+						// (ses_ea0141a1bffeX189yxDLHl1QDU, 2026-10-21: five stalls
+						// in a row, every one of them "attempt 1/3 (retry #1)").
+						const providerRetryFresh = isProviderRetryFresh(w)
+						clearLocks(w, sid)
+						// A genuine turn is activity, and activity means quota is
+						// available again: the rate-limit ladder starts over. Our
+						// own recovery turns (selfRecovery) do not reset it.
+						w.rateLimitedAt = 0
+						w.rateLimitAttempts = 0
+						w.quotaNoticedAt = 0
+						w.awaitingQuotaRetry = false
+						// A genuine turn re-opens a stood-down session: the stall
+						// gaveUp latch clears here (and on genuine user messages
+						// and abort+resume), never on lifecycle transitions.
+						w.gaveUp = false
+						// Same for the empty-idle single-shot: a genuine turn is
+						// a new episode, so the instant nudge re-arms here.
+						// The work count resets here on a genuine new turn (not a
+						// provider retry): a new episode means the work done after
+						// the last nudge starts over, bounded by
+						// lifetimeMaxContinues (9). Own recovery turns skip this
+						// branch, so they keep counting.
+						// F1 (2026-10-26, live-vs-production audit m00412): our own
+						// stall-continue injects fire session.execution.started, so a
+						// fresh self-inject is the only time this branch runs on OUR
+						// turn. Wiping counters there made the visible retry# repeat
+						// #1 across rungs (auditor I2: 3 invariant breaks in 19
+						// nudges). Gate the whole reset on 'not a fresh self-inject'.
+						// F1 recency (2026-10-26, audit m00412): the proxy below
+						// (lastInjectAt >= lastGenuineUserAt) cannot see a user
+						// message that is ALREADY in the history but not yet
+						// learned — boot seeds are learned by the sweep, which runs
+						// later. A user message newer than our last inject means a new
+						// episode, not our rung; skipping the wipe there lets one
+						// episode's counters leak into the next (watch state is
+						// module-persistent). Our own nudge reads ≈ lastInjectAt, so
+						// it never trips this.
+						void (async () => {
+							const selfInjectFresh =
+								w.lastInjectAt > 0 && w.lastInjectAt >= w.lastGenuineUserAt
+							let ownRung = !providerRetryFresh && selfInjectFresh
+							if (ownRung) {
+								try {
+									for (const m of await loadMessages(sid)) {
+										if (
+											msgRole(m) === "user" &&
+											msgAt(m) > w.lastInjectAt
+										) {
+											ownRung = false
+											break
+										}
+									}
+								} catch {
+									// Fail closed: if the history cannot be read
+									// (no session.context in the environment), we
+									// cannot confirm this is our rung — fall back
+									// to the pre-fix reset behaviour (wipe).
+									ownRung = false
+								}
+							}
+							if (!ownRung) {
+								// Lifetime cap is per genuine episode too: a real turn
+								// is new work, not our nudge looping. Own recovery
+								// rungs skip the wipe entirely, so they keep counting.
+								w.lifetimeContinues = 0
+								// The retry count rides that budget (see the user-message
+								// site): it is bounded by lifetimeMaxContinues.
+								w.workRetries = 0
+								w.emptyIdleNudged = false
+								if (ctx.storage?.remove) {
+									ctx.storage.remove(`${COUNTER_STATE_PREFIX}${sid}`).catch(() => {})
+								}
+							}
+							// Drop the durable arm with the in-memory one. This delete is
+							// what lets restore skip the history read: no record means the
+							// user has spoken since the arm, so there is nothing to serve.
+							void syncQuotaState(sid, w)
+							// The stall ladder resets per episode (see the progress
+							// check) — never on own rungs, which continue the episode.
+							if (!ownRung) {
+								w.resumeAttempts = 0
+							}
+						})()
+					}
+					markBusy(sid)
+					return
+				}
+				case "session.usage.updated": {
+					// The session's current context usage. `tokenTotalOf` mirrors
+					// `TokenUsage.total` in the schema (input + output + reasoning +
+					// cache read + cache write) so the ratio means the same thing here
+					// as in v1, which accumulated the same five fields.
+					const sid = sidOf(ev)
+					if (!sid) return
+					const total = tokenTotalOf(ev.data?.tokens)
+					if (total <= 0) return
+					const w = ensureWatch(sid)
+					// Token flow is activity: a turn generating for minutes straight
+					// must not read as idle. Touch ONLY on growth — a flat total
+					// means nothing resumed, so the clock goes stale and the
+					// stall answers on schedule (2026-10-13: three recoveries
+					// into a live 1.9M-token turn).
+					if (total > w.lastTokenTotal) touch(sid)
+					w.lastTokenTotal = total
+					dbg(`${short(sid)} usage: ${total} tokens`)
+					return
+				}
+
+				case "session.execution.succeeded":
+				case "session.idle": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					// Turn-identity probe (2026-10-12): the idle evaluation judges
+					// "whatever is newest" (w.lastAssistantText || history read),
+					// which goes stale across markBusy transitions and lets stale
+					// tails defeat every guard, including the approval-question
+					// ones. If this event carries the ended turn's message id,
+					// the evaluation can read THAT turn instead of a snapshot.
+					// Logging only — remove once answered.
+					dbg(`${short(sid)} idle event data keys: ${JSON.stringify(Object.keys((ev as { data?: unknown })?.data ?? {}))}`)
+					// Counted across every tracked session, and read *before* this one goes
+					// idle, because the transition is the signal: a session leaving a crowd
+					// of busy sessions behind it. Sampling after markIdle would make every
+					// idle look like a drop to zero and the arming condition unreachable.
+					const busyBefore = busySessionsForOrphanWatch().length
+					// Snapshot before the transition for the same reason: markIdle
+					// zeroes the live counter, and idle fires while tools run.
+					const wPre = ensureWatch(sid)
+					wPre.toolsInFlightAtIdle = wPre.pendingTools
+					markIdle(sid)
+					const w = ensureWatch(sid)
+					w.pendingRecoveryArmed = false
+					w.selfRecovery = false // stale — no in-flight recovery prompt by the time we idle
+					// Never run the idle heuristics on top of our own abort: the idle
+					// transition caused by interrupt() would otherwise trigger a second,
+					// independent injection.
+					if (selfAbortActive(w)) {
+						dbg(`${short(sid)} idle after plugin-initiated abort — skipping targeted recovery`)
+						return
+					}
+					// Arm the orphan watch. A subagent going idle is only interesting because
+					// of what it leaves behind: when the busy count drops from more than one
+					// to exactly one, the survivor is a parent whose children have all gone
+					// quiet, and it may be waiting for a result that is never coming.
+					//
+					// Re-arming is guarded: an already-armed watch keeps its start time, or a
+					// stream of child idles would keep pushing the deadline out.
+					const busyNow = busySessionsForOrphanWatch()
+					if (busyBefore > 1 && busyNow.length === 1) {
+						void armOrphanWatch(busyNow[0])
+					}
+
+					void inspectOnIdle(sid)
+					// Independent of the idle heuristics above: this looks at tool parts
+					// that already errored, which none of those read. Fire-and-forget
+					// so it cannot delay them. The latch check lives inside the function
+					// rather than here, because the per-request re-arm is derived from the
+					// history and only happens once the history has been read.
+					if (!w.completionSignaled && !w.userCancelled) {
+						void checkForUnknownToolCalls(sid, w)
+					}
+					return
+				}
+				case "session.execution.interrupted": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					const w = ensureWatch(sid)
+					// Stable v2 carries the interrupt `reason`. Only a genuine user
+					// interrupt should suppress recovery; shutdown/superseded/inactivity
+					// (or a missing reason on older runtimes) must not.
+					const reason = typeof ev.data?.reason === "string" ? ev.data.reason : undefined
+					// Use the latch, not the transient `aborting` flag: the runtime
+				// delivers this event asynchronously, after `aborting` may have
+				// already been cleared. Only a genuine user stop latches
+				// userCancelled; `shutdown`/`superseded`/`inactivity` must not
+				// permanently disable recovery for the session.
+				const mine = w.aborting || selfAbortActive(w)
+				if (!mine) {
+					w.userCancelled = reason === undefined || reason === "user"
+					if (w.userCancelled) w.userCancelledAt = Date.now()
+				}
+					// A user interrupt also ends any in-flight compaction.
+					w.compacting = false
+					w.compactionStartedAt = null
+					w.recovering = false
+					markIdle(sid)
+					return
+				}
+				case "session.deleted": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					forgetShells(sid)
+					sessions.delete(sid)
+					return
+				}
+				// --- reverts ---
+				// v1.18.34 (verified live, 2026-10-01, on an arch LXC with the real
+				// v1 plugin loaded): v1 has NO revert-named event. A revert arrives as
+				// `session.updated` whose `properties.info.revert` is populated with
+				// { messageID, partID?, snapshot?, diff? }, preceded by `session.diff`.
+				// So on v1 a plugin that only switches on the event *name* never sees a
+				// rewind at all — which is exactly why the v1 port never dropped its
+				// watch state on one. (An earlier comment here claimed v1 emitted
+				// `session.reverted`; that was wrong, and the case it defended is gone.)
+				//
+				// v2 emits a three-stage revert family. `staged` is intermediate
+				// (the user can still clear it), while `cleared` and `committed`
+				// are terminal; drop our watch state on the terminal stages so a
+				// rewind cannot leave a stale recovery armed against old turns.
+				case "session.revert.staged": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					// Staging is user activity, but not terminal: keep the state.
+					touch(sid)
+					return
+				}
+				case "session.revert.cleared":
+				case "session.revert.committed": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					forgetShells(sid)
+					sessions.delete(sid)
+					return
+				}
+
+				// --- compaction (NEVER interrupt a session that is compacting) ---
+				case "session.compaction.started": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					const w = ensureWatch(sid)
+					if (!w.compacting) {
+						w.compacting = true
+						w.compactionStartedAt = Date.now()
+						log("info", `${short(sid)} compaction started — auto-resume recovery suspended until it ends`)
+					}
+					touch(sid)
+					return
+				}
+				case "session.compaction.ended":
+				case "session.compaction.failed": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					const w = ensureWatch(sid)
+					if (w.compacting) {
+						w.compacting = false
+						w.compactionStartedAt = null
+						log("info", `${short(sid)} compaction ${ev.type.endsWith("failed") ? "failed" : "ended"} — guard cleared`)
+					}
+					touch(sid)
+					return
+				}
+
+				// --- activity --------------------------------------------------
+				case "session.step.started": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					const w = ensureWatch(sid)
+					w.agent = typeof ev.data?.agent === "string" ? ev.data.agent : w.agent
+					{
+						const m = ev.data?.model as { providerID?: string; provider?: string; modelID?: string; id?: string } | undefined
+						const providerID = m?.providerID ?? m?.provider
+						const modelID = m?.modelID ?? m?.id
+						if (typeof providerID === "string" && typeof modelID === "string") {
+							w.modelRef = { providerID, modelID }
+							w.model = `${providerID}/${modelID}`
+						} else if (m) {
+							w.model = `${providerID ?? "?"}/${modelID ?? "?"}`
+						} else {
+							w.model = w.model
+						}
+					}
+					w.lastWasTaskTool = false
+					markBusy(sid)
+					return
+				}
+				case "session.step.ended": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					touch(sid)
+					return
+				}
+				// Liveness between step start and the first token. Without these a
+				// step that starts and then produces nothing for `chunkTimeoutMs`
+				// looks identical to a stall.
+				case "session.step.streamed":
+				case "session.text.started":
+				case "session.reasoning.started":
+				case "session.synthetic": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					touch(sid)
+					return
+				}
+				// A long tool-input generation (e.g. a big heredoc write) emits no
+				// text deltas; treating that silence as a stall resumes a session
+				// that is in fact working.
+				case "session.tool.input.started":
+				case "session.tool.input.delta": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					touch(sid)
+					return
+				}
+				case "session.text.delta":
+				case "session.reasoning.delta": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					appendText(sid, ev.data?.assistantMessageID, typeof ev.data?.delta === "string" ? ev.data.delta : "")
+					touch(sid)
+					return
+				}
+				case "session.text.ended":
+				case "session.reasoning.ended": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					touch(sid)
+					return
+				}
+
+				// --- tools ------------------------------------------------------
+				case "session.tool.called": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					const w = ensureWatch(sid)
+					const name = typeof ev.data?.tool === "string" ? ev.data.tool : (ev.data?.id as string | undefined) ?? "tool"
+					w.lastWasTaskTool = isTaskToolCall(ev)
+					w.pendingTools++
+					{
+						const callId =
+							typeof ev.data?.id === "string" && ev.data.id ? ev.data.id : `${name}#${Date.now()}`
+						w.inflightTools.set(callId, { name: String(name).toLowerCase(), at: Date.now() })
+					}
+					// Any real tool work between completions legitimises the next
+					// task_complete — reset the repeat-signal counter. task_complete
+					// itself is excluded; it manages the counter inside its execute.
+					//
+					// Without this, a model that finishes, calls the tool, then does one
+					// more piece of work and finishes again would be counted as a repeat,
+					// and the escalation would fire against a legitimate second round.
+					if (name !== "task_complete") w.taskCompleteSignals = 0
+					if (trackToolCall(w, name)) {
+						void targetedRecovery(sid, "tool-loop", TOOL_LOOP_RECOVERY_PROMPT, "intentNudgeAttempts").catch(() => {})
+					}
+					touch(sid)
+					return
+				}
+				case "session.tool.progress":
+				case "session.shell.started":
+				case "session.shell.ended": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					touch(sid)
+					return
+				}
+				// --- shell process registry ---
+				// `session.shell.*` above is the session-scoped family. The runtime
+				// also emits a process-registry family, and which one fires depends
+				// on the tool path (the bash/Code Mode shell emits only these). We
+				// need the registry pair because it is the one that reports a
+				// backgrounded job's real completion: `session.tool.success` fires
+				// as soon as the *tool call* returns, which for `background: true`
+				// is a few hundred ms — long before the process finishes.
+				//
+				// `shell.deleted` is deliberately not used: it carries a different
+				// id family than `created`/`exited` (verified against the running
+				// server), so it cannot close an entry. `shell.exited` can.
+				case "shell.created": {
+					const info = ev.data?.info
+					if (!info || typeof info !== "object") return
+					const rec = info as { id?: unknown; metadata?: { sessionID?: unknown } }
+					const id = rec.id
+					const sid = rec.metadata?.sessionID
+					if (typeof id !== "string" || typeof sid !== "string") return
+					openShells.set(id, { sessionID: sid, startedAt: Date.now() })
+					touch(sid)
+					return
+				}
+				case "shell.exited": {
+					const id = ev.data?.id
+					if (typeof id !== "string") return
+					const sid = openShells.get(id)?.sessionID
+					if (sid === undefined) return
+					openShells.delete(id)
+					const wsh = ensureWatch(sid)
+					wsh.completedSinceProd++
+					wsh.succeededSinceProd++
+					touch(sid)
+					return
+				}
+				case "session.tool.success": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					const w = ensureWatch(sid)
+					w.lastWasTaskTool = false
+					w.pendingTools = Math.max(0, w.pendingTools - 1)
+					{
+						const callId = typeof ev.data?.id === "string" ? ev.data.id : undefined
+						if (callId !== undefined) w.inflightTools.delete(callId)
+						else {
+							// No call id on the result: drop the oldest entry. Results
+							// normally arrive in order; a wrong drop only mistimes one
+							// deferral, and entries die with the watch regardless.
+							const oldest = w.inflightTools.keys().next().value
+							if (typeof oldest === "string") w.inflightTools.delete(oldest)
+						}
+					}
+					w.completedSinceProd++
+					w.succeededSinceProd++
+					touch(sid)
+					return
+				}
+				case "session.tool.failed": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					const w = ensureWatch(sid)
+					w.lastWasTaskTool = false
+					w.pendingTools = Math.max(0, w.pendingTools - 1)
+					{
+						const callId = typeof ev.data?.id === "string" ? ev.data.id : undefined
+						if (callId !== undefined) w.inflightTools.delete(callId)
+						else {
+							// No call id on the result: drop the oldest entry. Results
+							// normally arrive in order; a wrong drop only mistimes one
+							// deferral, and entries die with the watch regardless.
+							const oldest = w.inflightTools.keys().next().value
+							if (typeof oldest === "string") w.inflightTools.delete(oldest)
+						}
+					}
+					w.completedSinceProd++
+					touch(sid)
+					return
+				}
+
+				// --- permissions -------------------------------------------------
+				case "permission.asked": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					const w = ensureWatch(sid)
+					w.permissionPending = true
+					w.permissionPendingAt = Date.now()
+					return
+				}
+				case "permission.replied": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					const w = ensureWatch(sid)
+					w.permissionPending = false
+					w.permissionPendingAt = null
+					touch(sid)
+					return
+				}
+
+				// --- failures ----------------------------------------------------
+				case "session.retry.scheduled": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					const w = ensureWatch(sid)
+					touch(sid) // provider-level retry is progress of its own kind
+					// ...and proof that this stall is the provider's to fix, not
+					// the model's: see isProviderRetryFresh / PROVIDER_RETRY_GRACE_MS.
+					w.providerRetryAt = Date.now()
+					const errType = String(ev.data?.error?.type ?? "")
+					const errMsg = String(ev.data?.error?.message ?? "")
+					maybeLockOoc(sid, errMsg, errType)
+					if (maybeLockPermanent(sid, errMsg, errType, ev.data?.error?.status)) return
+					log("info", `${short(sid)} provider retry #${ev.data?.attempt ?? "?"}: ${errType || errMsg}`)
+					if (!isStreamingFailure(errMsg, streamingFailureMessagePatterns) && !isStreamingFailureName(errType, streamingFailureErrorNames) && errType !== "retryable") return
+					// Let the provider retries play out first; only intervene if it stays quiet
+					if (nowSilenceTooLong(w)) {
+						w.pendingRecoveryArmed = true
+						void recover(sid, "streaming failure with scheduled retry")
+					}
+					return
+				}
+				case "session.step.failed":
+				case "session.execution.failed": {
+					const sid = sidOf(ev)
+					if (!sid) return
+					const w = ensureWatch(sid)
+					const errMsg = String(ev.data?.error?.message ?? "")
+					const errType = String(ev.data?.error?.type ?? "")
+					// Our own abort: do not recover from it, and do not arm the delayed
+					// recovery (arming here is what kept the watchdog injecting into an
+					// already-interrupted session).
+					if (w.aborting || selfAbortActive(w)) {
+						dbg(`${short(sid)} ${ev.type} is this plugin's own abort (${errType || "error"}) — not recovering`)
+						w.recovering = false
+						w.pendingRecoveryArmed = false
+						return
+					}
+					// Any interrupt-shaped failure (ours or the user's) is not recoverable.
+					// v2 reports these as {type:"aborted", message:"Step interrupted"}.
+					if (isAbortError(errType, errMsg)) {
+						dbg(`${short(sid)} failure was an interrupt (${errType || "error"}) — not recovering`)
+						w.pendingRecoveryArmed = false
+						return
+					}
+					// Quota/rate-limit failures stand down on the gate ladder — an
+					// immediate continue retries straight into the ban.
+					if (isRateLimitError(errType, errMsg)) {
+						handleRateLimitFailure(sid, w, errType, errMsg)
+						return
+					}
+					maybeLockOoc(sid, errMsg, errType)
+					// Permanent failures still go idle — the session really is done —
+					// but nothing arms behind them, so no watchdog pass revives it.
+					if (maybeLockPermanent(sid, errMsg, errType, ev.data?.error?.status)) {
+						markIdle(sid)
+						w.pendingRecoveryArmed = false
+						w.recovering = false
+						log("warn", `${short(sid)} ${ev.type}: ${errType || "error"} ${errMsg.slice(0, 160)}`)
+					return
+					}
+					markIdle(sid)
+					w.pendingRecoveryArmed = true // our delayed recovery must survive this idle transition
+					log("warn", `${short(sid)} ${ev.type}: ${errType || "error"} ${errMsg.slice(0, 160)}`)
+					void recover(sid, `${ev.type}${isStreamingFailure(errMsg, streamingFailureMessagePatterns) ? " (streaming)" : ""}`)
+					return
+				}
+
+				default:
+					return
+			}
+		}
+
+		function nowSilenceTooLong(w: SessionWatch): boolean {
+			return Date.now() - w.lastActivityAt > chunkTimeoutMs + gracePeriodMs
+		}
+
+		// Subscribe and pump events in the background (setup must not block).
+		// Stable v2 recommends passing an AbortSignal so the stream is torn down
+		// promptly on plugin unload instead of staying suspended in `for await`.
+		let running = true
+		const eventAbort = new AbortController()
+		const pump = async () => {
+			try {
+				const stream = ctx.event.subscribe({ signal: eventAbort.signal })
+				for await (const raw of stream) {
+					if (!running) return
+					const ev = raw as unknown as V2Event
+					if (!ev || typeof ev.type !== "string") continue
+					try {
+						handleEvent(ev)
+					} catch (e) {
+						dbg("handler error:", e instanceof Error ? e.message : String(e))
+					}
+				}
+			} catch (e) {
+				if (running) log("error", `event stream ended: ${e instanceof Error ? e.message : String(e)}`)
+			}
+		}
+		void pump()
+		void restoreQuotaLadders()
+		// Restore counters (workRetries, resumeAttempts, etc.) from persisted
+		// state so an armed session keeps its budget across a plugin reload /
+		// process restart. Stale records (>24h) and sessions with a live watch
+		// (workRetries > 0) are skipped. See syncCounters (write side).
+		void (async () => {
+			try {
+				const listed = new Set(unwrapList(await callSessionApi("list")).map((r) => r.id).filter((id) => typeof id === "string"))
+				for (const sid of listed) {
+					let rec: unknown
+					try {
+						rec = await ctx.storage.get(`${COUNTER_STATE_PREFIX}${sid}`)
+					} catch {
+						continue
+					}
+					if (!rec || typeof rec !== "object") continue
+					const recObj = rec as { v?: unknown; at?: unknown; workRetries?: unknown; resumeAttempts?: unknown; lifetimeContinues?: unknown; episodeRefires?: unknown }
+					if (typeof recObj.v !== "number") continue
+					// Only restore if recent (within 24h)
+					if (typeof recObj.at !== "number" || Date.now() - recObj.at > 24 * 3600000) continue
+					const w = ensureWatch(sid)
+					if (w.workRetries > 0) continue // already has state (e.g., not a restart)
+					w.workRetries = typeof recObj.workRetries === "number" ? recObj.workRetries : 0
+					w.resumeAttempts = typeof recObj.resumeAttempts === "number" ? recObj.resumeAttempts : 0
+					w.lifetimeContinues = typeof recObj.lifetimeContinues === "number" ? recObj.lifetimeContinues : 0
+					w.episodeRefires = typeof recObj.episodeRefires === "number" ? recObj.episodeRefires : 0
+					dbg(`${short(sid)} counters restored: workRetries=${w.workRetries} resumeAttempts=${w.resumeAttempts} lifetimeContinues=${w.lifetimeContinues}`)
+				}
+			} catch (e) {
+				dbg("counter restore failed:", e instanceof Error ? e.message : String(e))
+			}
+		})()
+
+		if (superseded) {
+			// Two mod ids under ONE boot is the evidence that separates a plugin
+			// reload from an opencode restart. WARN, not dbg: a storm of these is
+			// the finding, not a curiosity.
+			log(
+				"warn",
+				`superseded live instance mod=${superseded.mod} (age ${Math.round((Date.now() - superseded.startedAt) / 1000)}s) by mod=${MODULE_INSTANCE} boot=${HOST_BOOT}`,
+			)
+		}
+		if (adoptedSessions > 0) {
+			log("info", `adopted ${adoptedSessions} watched session(s) from previous instance (stall memory retained) mod=${MODULE_INSTANCE}`)
+		}
+
+		// Register /auto-resume slash command (pause/resume this session).
+		if (ctx.command && typeof ctx.command.transform === "function") {
+			try {
+				await ctx.command.transform((cmd) => {
+					cmd.add({
+						name: "auto-resume",
+						description: "Pause or resume auto-resume for this session: /auto-resume off|on|status",
+						execute: async (input: any) => {
+							const sessionID = String(input?.sessionID ?? "")
+							const rawArg = input?.args ?? input?.prompt?.args ?? input?.prompt?.text ?? input?.text ?? ""
+							const verb = String(rawArg).trim().toLowerCase().split(/\s+/)[0] || "status"
+							const w = ensureWatch(sessionID)
+							const msg = (text: string) => ctx.session.prompt({ sessionID, text } as any)
+							if (verb === "off" || verb === "pause") {
+								setPaused(sessionID, true)
+								w.paused = true
+								await msg("auto-resume paused for this session. Run /auto-resume on to resume.")
+							} else if (verb === "on" || verb === "resume") {
+								setPaused(sessionID, false)
+								w.paused = false
+								await msg("auto-resume resumed for this session.")
+							} else {
+								const state = isPaused(sessionID) ? "paused" : "active"
+								await msg(`auto-resume is ${state} for this session.`)
+							}
+						},
+					})
+				})
+			} catch (e) {
+				log("warn", `auto-resume command registration failed: ${e instanceof Error ? e.message : String(e)}`)
+			}
+		}
+
+		// Pause is process-lifetime only: a restart re-arms auto-resume so a
+		// forgotten pause cannot silently disable it forever.
+		try { writeFileSync(PAUSED_MARKER_FILE, "", "utf8") } catch {}
+
+		log(
+			"info",
+			`ready (opencode v2). timeout=${chunkTimeoutMs}ms interval=${checkIntervalMs}ms retries=${maxRetries} loop=${loopMaxContinues}/${loopWindowMs / 1000}s warmup=${warmupMs}ms stall=${busyStallStrategy} visibleContinue=${visibleContinue} probe=${configProbe ?? "-"} mod=${MODULE_INSTANCE} up=${HOST_UPTIME_S}s boot=${HOST_BOOT}` +
+				(gatedInUse.length > 0 ? ` accepted-but-inert=${gatedInUse.join(",")}` : ""),
+		)
+
+		// Cleanup: stop timers and the event pump; OpenCode awaits this on disable/reload/shutdown.
+		const dispose = () => {
+			running = false
+			eventAbort.abort()
+			clearInterval(watchdog)
+			clearInterval(discoveryTimer)
+			clearTimeout(initialDiscovery)
+			// A pending pattern pass outlives the plugin otherwise, and would judge a
+			// session against a history this build is no longer watching.
+			for (const w of sessions.values()) {
+				if (w.toolTextTimer) clearTimeout(w.toolTextTimer)
+				w.toolTextTimer = null
+				if (w.recoverTimer) clearTimeout(w.recoverTimer)
+				w.recoverTimer = null
+			}
+			// NOTE: the sessions map is intentionally NOT cleared — it is
+			// registry-owned (see adoption in State) so stall memory survives
+			// setup churn. Only this instance's timers and loops are torn down.
+			// Only clear the registry slot if it is still OURS: a later setup may
+			// already have superseded us, and unregistering it would strand a live
+			// watchdog. The identity check matters across copies too, since they
+			// share one registry.
+			const reg = singletonRegistry(registryScope)
+			if (reg.live?.dispose === dispose) reg.live = undefined
+			log("info", `stopped mod=${MODULE_INSTANCE}`)
+		}
+		registry.live = { dispose, mod: MODULE_INSTANCE, startedAt: Date.now() }
+		return dispose
+	},
+})

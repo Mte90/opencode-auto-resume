@@ -2,3 +2,6 @@ node_modules/
 dist/
 .DS_Store
 *.log
+
+# v2 build output (bun build src/v2/index.ts --outdir dist-v2 --target bun)
+dist-v2/
