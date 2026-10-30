@@ -92,6 +92,7 @@ async function setup(opts: {
 	const rows = opts.listRows ?? [{ id: SID }, { id: CHILD, parentID: SID }]
 
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: stream,
 		options: { ...OPTIONS, registryScope: LOG_SALT },
 		session: {

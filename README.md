@@ -453,7 +453,7 @@ On v2 a clean load writes nothing at startup: warnings and recovery lines go to 
 | Tool-text not detected | Check server logs — requires SDK message fetching (v1). On v2 the history comes from the client message surface or loopback HTTP — check the server process output instead |
 | Long-running tool killed | Should not happen — active-tool guard prevents it. Report a bug. |
 | No plugin activity in the log | The entry is not in a location opencode scans, or not listed in `plugins`; fix the config and restart opencode. |
-| Log says `ctx.app.version is missing` (or `ctx.serverUrl is missing` on v1) | The build was loaded on the wrong server generation. Update the npm package (the universal entry auto-selects the branch) or match the build file to the server. |
+| Log says `ctx.app.version is missing` (or `ctx.serverUrl is missing` on v1) | The build was loaded on the wrong server generation. The plugin disables itself with this diagnostic instead of crashing. Update the npm package (the universal entry auto-selects the branch by context shape) or match the build file to the server. |
 | Never recovers a parent waiting on a subagent | Intentional: parent sessions blocked on a running subagent are left alone. |
 | Never recovers while a permission dialog is open | Intentional: recovery is held until the permission is answered. |
 | Recovers but you don't see a notice (v2) | Your model/provider may reject `session.synthetic()`; the plugin falls back to `session.prompt()` (no TUI banner). |

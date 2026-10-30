@@ -100,6 +100,7 @@ async function setup(opts: { toolRegistry?: boolean } = {}): Promise<Harness> {
 	const history: unknown[] = [userMessage("do the work", OLD)]
 
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: stream,
 		options: { registryScope: LOG_SALT, ...OPTIONS },
 		session: {

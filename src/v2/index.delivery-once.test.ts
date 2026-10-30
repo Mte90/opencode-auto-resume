@@ -100,6 +100,7 @@ async function setup(opts: {
 
 	const logMessages: unknown[] = opts.logMessages ?? []
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: stream,
 		options: { ...OPTIONS, registryScope: LOG_SALT },
 		session: {
@@ -173,6 +174,7 @@ describe("v2: a disposed instance sends nothing more", () => {
 		const stream = makeEventStream()
 		const capture = capturePluginLogs()
 		const ctx: any = {
+			app: { name: "opencode", version: "2.0.27", channel: "stable" },
 			event: stream,
 			options: { ...OPTIONS, maxRetries: 1, registryScope: LOG_SALT },
 			session: {

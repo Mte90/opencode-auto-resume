@@ -135,6 +135,7 @@ async function replay(h: HarnessOpts) {
 	if (h.clientCompact) (client.session as any).compact = async (a: any) => compacted.push(a?.sessionID)
 
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: stream,
 		options: {
 			registryScope: LOG_SALT,
@@ -226,6 +227,7 @@ describe("v2: context saturation — parent sessions", () => {
 		const stream = makeEventStream()
 		const capture = capturePluginLogs()
 		const ctx: any = {
+			app: { name: "opencode", version: "2.0.27", channel: "stable" },
 			event: stream,
 			options: { warmupMs: 0, checkIntervalMs: 20, chunkTimeoutMs: 600_000, gracePeriodMs: 0, registryScope: LOG_SALT },
 			session: { context: async () => [], active: async () => ({}), interrupt: async () => ({}), synthetic: async () => ({}) },
@@ -330,6 +332,7 @@ describe("v2: the saturation arithmetic matches v1", () => {
 		const stream = makeEventStream()
 		const capture = capturePluginLogs()
 		const ctx: any = {
+			app: { name: "opencode", version: "2.0.27", channel: "stable" },
 			event: stream,
 			options: { warmupMs: 0, checkIntervalMs: 20, chunkTimeoutMs: 600_000, gracePeriodMs: 0, registryScope: LOG_SALT },
 			session: { context: async () => [], active: async () => ({}), interrupt: async () => ({}), synthetic: async () => ({}) },

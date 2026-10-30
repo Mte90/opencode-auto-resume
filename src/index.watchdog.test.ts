@@ -20,6 +20,7 @@ function createWatchdogContext(opts: {
     let callIndex = 0
 
     const ctx = {
+        serverUrl: "http://localhost:4096",
         client: {
             app: {
                 log: mock(async (o: { body: { level: string; message: string } }) => {

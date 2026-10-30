@@ -21,6 +21,7 @@ function createMockContext(opts: {
 }) {
     const promptCalls: any[] = []
     const ctx = {
+        serverUrl: "http://localhost:4096",
         client: {
             app: { log: mock(async () => {}) },
             tool: { ids: mock(async () => ({ data: AVAILABLE_TOOLS })) },

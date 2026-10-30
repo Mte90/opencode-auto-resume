@@ -75,6 +75,7 @@ async function setup(opts: Record<string, unknown>, history: unknown[]): Promise
 	const stream = makeEventStream()
 	const capture = capturePluginLogs()
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: stream,
 		options: {
 			registryScope: LOG_SALT,

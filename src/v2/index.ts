@@ -2143,9 +2143,14 @@ export default define({
 		// Build/server version guard: this bundle only works on opencode v2, where the
 		// plugin input exposes `app.version`. A v1 server omits `ctx.app` entirely;
 		// without this check setup crashes later with an opaque API error.
-		if (typeof (ctx as any).app?.version !== "string") {
-			log("warn", "this looks like the opencode v1 build running on the wrong server: ctx.app.version is missing. The v2 bundle requires opencode v2 — update the plugin package (the npm build auto-selects per server) or load the build matching your server; see the README on npm (opencode-auto-resume).")
-		}
+ 		if (typeof (ctx as any).app?.version !== "string") {
+ 			log("warn", "this looks like the opencode v1 build running on the wrong server: ctx.app.version is missing. The v2 bundle requires opencode v2 — update the plugin package (the npm build auto-selects per server) or load the build matching your server; see the README on npm (opencode-auto-resume).")
+ 			// Abort inertly: no state, no timers, and above all no event pump —
+ 			// a v1-shaped host must never reach ctx.event.subscribe, whose
+ 			// absence crashes with an opaque error. Callers get a callable
+ 			// dispose.
+ 			return () => {}
+ 		}
 		// Feature-gated options are valid but inert on v2. Warned only when one is
 		// actually set — the user cannot act on the note either way, so an empty
 		// list must not produce a per-start line.

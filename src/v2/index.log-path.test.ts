@@ -14,6 +14,7 @@ describe("v2: console-only logging", () => {
 	test("info lines go to console.log with [auto-resume] prefix", async () => {
 		const capture = capturePluginLogs()
 		const ctx: any = {
+			app: { name: "opencode", version: "2.0.27", channel: "stable" },
 			event: {
 				subscribe: () => ({ [Symbol.asyncIterator]: () => ({ next: () => Promise.resolve({ done: true }) }) }),
 			},
@@ -66,6 +67,7 @@ describe("v2: console-only logging", () => {
 	test("debug lines go to console.log with [auto-resume:debug] prefix when enabled", async () => {
 		const capture = capturePluginLogs()
 		const ctx: any = {
+			app: { name: "opencode", version: "2.0.27", channel: "stable" },
 			event: {
 				subscribe: () => ({ [Symbol.asyncIterator]: () => ({ next: () => Promise.resolve({ done: true }) }) }),
 			},

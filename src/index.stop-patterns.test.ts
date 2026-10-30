@@ -11,6 +11,7 @@ function createMockContext(opts: {
     const statusMap: Record<string, { type: string }> = {}
     for (const s of opts.sessions) statusMap[s.id] = { type: s.status }
     const ctx = {
+        serverUrl: "http://localhost:4096",
         client: {
             app: { log: mock(async () => {}) },
             session: {

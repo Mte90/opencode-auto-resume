@@ -521,6 +521,13 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     // console and cannot depend on log().
     if (!(ctx as any).serverUrl) {
         console.warn("[auto-resume] this looks like the opencode v1 build running on the wrong server: ctx.serverUrl is missing. The v1 bundle requires opencode v1 — update the plugin package (the npm build auto-selects per server) or load the build matching your server; see the README on npm (opencode-auto-resume).")
+        // Abort inertly instead of wiring the recovery pipeline against a
+        // foreign server: hooks exist and are callable, but nothing listens
+        // (no task_complete tool, no ready log, no handlers).
+        return {
+            event: async () => {},
+            config: async () => {},
+        }
     }
     const chunkTimeoutMs: number =
     (options?.chunkTimeoutMs as number) ?? DEFAULT_CHUNK_TIMEOUT_MS

@@ -99,6 +99,7 @@ async function setup(history: History, active: string[]): Promise<any> {
 	const rows: Array<{ id: string; parentID?: string }> = [{ id: SID }]
 
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: stream,
 		options: { ...OPTIONS, registryScope: LOG_SALT },
 		session: {

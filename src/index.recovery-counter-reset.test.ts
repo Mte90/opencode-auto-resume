@@ -13,7 +13,8 @@ function createMockContext(opts: {
     const abortCalls: Array<{ sid: string }> = []
     const release: Array<() => void> = []
     let callIndex = 0
-    const ctx = {
+const ctx = {
+        serverUrl: "http://localhost:4096",
         client: {
             app: {
                 log: mock(async (o: { body: { level: string; message: string } }) => {

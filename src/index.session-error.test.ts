@@ -6,7 +6,8 @@ type LogCall = { level: string; message: string }
 function createMockContext() {
     const logCalls: LogCall[] = []
     const promptCalls: Array<{ sid: string }> = []
-    const ctx = {
+const ctx = {
+        serverUrl: "http://localhost:4096",
         client: {
             app: {
                 log: mock(async (o: any) => {

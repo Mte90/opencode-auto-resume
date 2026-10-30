@@ -67,6 +67,7 @@ async function setup(promptImpl: (a: any) => Promise<unknown>, opts: Record<stri
 	const capture = capturePluginLogs()
 	const now = Date.now()
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: stream,
 		options: {
 			registryScope: LOG_SALT,

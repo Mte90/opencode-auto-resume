@@ -125,6 +125,7 @@ async function setup(
 	const listed = opts.tools ?? TOOLS
 
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: stream,
 		options: { ...OPTIONS, ...(opts.quietCorrections === undefined ? {} : { quietCorrections: opts.quietCorrections }), registryScope: LOG_SALT },
 		session: {

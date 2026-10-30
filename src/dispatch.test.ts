@@ -250,5 +250,88 @@ describe("dispatch.ts — dual-shape plugin entry", () => {
                 cleanup?.()
             }
         })
+
+        test("setup() with a v1-shaped ctx (no app, no event) falls back to the v1 build", async () => {
+            const capture = capturePluginLogs()
+
+            // Setup-style host carrying a v1 PluginInput shape: serverUrl and
+            // client present, no ctx.app, no ctx.event.
+            const appLog = mock()
+            const ctx: any = {
+                serverUrl: "http://localhost:4096",
+                client: {
+                    app: { log: appLog },
+                    session: {
+                        list: async () => ({ data: [] }),
+                        status: async () => ({ data: {} }),
+                        todo: async () => ({ data: [] }),
+                        messages: async () => ({ data: [] }),
+                        prompt: async () => ({}),
+                        abort: async () => ({}),
+                    },
+                    config: { get: async () => ({ data: { plugin: [] } }) },
+                    file: { status: async () => ({ data: [] }) },
+                    auth: { list: async () => ({ data: {} }) },
+                    find: { text: async () => ({ data: [] }) },
+                    app: { log: appLog, agents: async () => ({ data: [] }) },
+                },
+                options: {
+                    enabled: true,
+                    baseBackoffMs: 1,
+                    checkIntervalMs: 10_000_000,
+                    maxRetries: 3,
+                    loopMaxContinues: 10,
+                    minActivityGapMs: 0,
+                    toolTextCheckDelayMs: 10,
+                    warmupMs: 0,
+                    activeUserWindowMs: 0,
+                },
+            }
+
+            const hooks = await (dispatcher.setup as any)(ctx)
+
+            try {
+                // The v1 build ran for real: it wires the task_complete tool
+                // and logs "ready" through ctx.client.app.log on the first
+                // event. An inert abort would have neither.
+                expect(hooks).toBeDefined()
+                expect(hooks.tool).toBeDefined()
+
+                const serverUrlWarnings = capture.warns.filter((l: string) =>
+                    l.includes("ctx.serverUrl is missing"),
+                )
+                expect(serverUrlWarnings.length).toBe(0)
+
+                await hooks.event({ event: { type: "session.idle", properties: {} } } as any)
+                const readyCalls = appLog.mock.calls.filter((c: any[]) =>
+                    JSON.stringify(c).includes("opencode-auto-resume ready"),
+                )
+                expect(readyCalls.length).toBe(1)
+            } finally {
+                capture.stop()
+            }
+        })
+
+        test("setup() with an unrecognised ctx warns and returns an inert dispose", async () => {
+            const capture = capturePluginLogs()
+
+            // No app.version, no event.subscribe, no serverUrl, no client.
+            const cleanup = await (dispatcher.setup as any)({})
+
+            try {
+                expect(typeof cleanup).toBe("function")
+                expect(() => cleanup()).not.toThrow()
+
+                const diag = capture.warns.filter((l: string) =>
+                    l.includes("unrecognised host context"),
+                )
+                expect(diag.length).toBe(1)
+                expect(diag[0]).toContain("ctx.app.version")
+                expect(diag[0]).toContain("ctx.serverUrl")
+                expect(diag[0]).toContain("README")
+            } finally {
+                capture.stop()
+            }
+        })
     })
 })

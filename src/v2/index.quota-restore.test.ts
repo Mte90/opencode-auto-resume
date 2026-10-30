@@ -68,6 +68,7 @@ async function setup(capture: any, history: unknown[] = [], store = new Map<stri
 	const stream = makeEventStream()
 
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: stream,
 		options: {
 			registryScope: LOG_SALT,

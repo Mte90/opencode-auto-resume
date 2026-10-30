@@ -72,6 +72,7 @@ async function boot(instances: number): Promise<Boot> {
 	const capture = capturePluginLogs()
 	let next = 0
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: {
 			subscribe: ({ signal }: { signal?: AbortSignal } = {}) => {
 				const s = streams[next++] ?? streams[streams.length - 1]
@@ -145,6 +146,7 @@ describe("v2: the singleton lives on globalThis, so re-evaluations share it", ()
 	const streams = [mk(), mk()]
 	let next = 0
 	const makeCtx = (registryScope: string): any => ({
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: {
 			subscribe: ({ signal }: { signal?: AbortSignal } = {}) => {
 				const s = streams[next++] ?? streams[streams.length - 1]

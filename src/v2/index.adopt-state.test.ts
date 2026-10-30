@@ -83,6 +83,7 @@ const OPTIONS = {
 function makeCtx(stream: any, injected: Array<{ sid?: string; text?: string }>) {
 	const capture = capturePluginLogs()
 	return {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: stream,
 		options: { ...OPTIONS, registryScope: LOG_SALT },
 		session: {

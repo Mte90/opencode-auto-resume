@@ -107,6 +107,7 @@ async function setup(history: unknown[], opts: { chunkTimeoutMs?: number } = {})
 	const capture = capturePluginLogs()
 
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: stream,
 		options: {
 			registryScope: LOG_SALT,

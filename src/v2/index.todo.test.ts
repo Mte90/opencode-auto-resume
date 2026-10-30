@@ -147,6 +147,7 @@ async function replay(
 	let history: unknown[] = []
 
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: stream,
 		options: { ...OPTIONS, ...opts, registryScope: LOG_SALT },
 		session: {
@@ -330,6 +331,7 @@ describe("v2: the todo list, read from the tool that owns it", () => {
 			const capture = capturePluginLogs()
 			const injected: unknown[] = []
 			const ctx: any = {
+				app: { name: "opencode", version: "2.0.27", channel: "stable" },
 				event: stream,
 				options: { ...OPTIONS, registryScope: LOG_SALT },
 				session: {

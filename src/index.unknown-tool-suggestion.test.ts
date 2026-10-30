@@ -36,6 +36,7 @@ function makeToolPart(opts: {
 function createMockContext(toolIds: string[] = AVAILABLE_TOOLS, messages: Array<Record<string, unknown>> = []) {
     const promptCalls: PromptCall[] = []
     const ctx = {
+        serverUrl: "http://localhost:4096",
         client: {
             app: { log: mock(async (_o: any) => {}) },
             tool: {

@@ -15,7 +15,8 @@ function createMockContext(opts: {
     const promptCalls: PromptCall[] = []
     const commandCalls: CommandCall[] = []
     const summarizeCalls: SummarizeCall[] = []
-    const ctx = {
+const ctx = {
+        serverUrl: "http://localhost:4096",
         client: {
             app: { log: mock(async (_o: any) => {}) },
             config: {

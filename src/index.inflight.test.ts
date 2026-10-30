@@ -7,6 +7,7 @@ function createMockContext(opts: { messages?: Record<string, Array<any>> } = {})
     const promptCalls: PromptCall[] = []
     const abortCalls: Array<{ sid: string }> = []
     const ctx = {
+        serverUrl: "http://localhost:4096",
         client: {
             app: { log: mock(async (_o: any) => {}) },
             session: {

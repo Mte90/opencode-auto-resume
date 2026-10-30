@@ -86,6 +86,7 @@ async function replay(
 	const capture = capturePluginLogs()
 
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: stream,
 		options: { ...FAST, ...opts, debug: true, registryScope: LOG_SALT },
 		session: {

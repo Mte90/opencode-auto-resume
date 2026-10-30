@@ -67,6 +67,7 @@ async function bootStormed(instances: number, opts: Record<string, unknown> = {}
 	let next = 0
 
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		// ONE event source shared by every setup: `subscribe` hands out a fresh
 		// async iterable per caller, which is what the host does.
 		event: {

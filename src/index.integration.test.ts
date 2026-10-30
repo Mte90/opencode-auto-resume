@@ -75,6 +75,7 @@ const createRealisticContext = () => {
     ])
 
     const ctx = {
+        serverUrl: "http://localhost:4096",
         client: {
             app: {
                 log: mock(async (opts: { body: { service: string; level: string; message: string } }) => {
@@ -178,6 +179,7 @@ describe("Plugin Integration", () => {
         const sid = "ses_tool_text"
         const promptCalls: Array<{ sid: string; body: string }> = []
         const ctx = {
+            serverUrl: "http://localhost:4096",
             client: {
                 app: {
                     log: mock(async () => {})
@@ -232,6 +234,7 @@ describe("Plugin Integration", () => {
         const abortCalls: string[] = []
         const statusCalls: number[] = []
         const ctx = {
+            serverUrl: "http://localhost:4096",
             client: {
                 app: {
                     log: mock(async () => {})
@@ -273,6 +276,7 @@ describe("Plugin Integration", () => {
         const abortCalls: string[] = []
         const messagesCalls: string[] = []
         const ctx = {
+            serverUrl: "http://localhost:4096",
             client: {
                 app: {
                     log: mock(async () => {})
@@ -322,6 +326,7 @@ describe("Plugin Integration", () => {
         const subagentSid = "ses_sub_orphan"
         const abortCalls: string[] = []
         const ctx = {
+            serverUrl: "http://localhost:4096",
             client: {
                 app: {
                     log: mock(async () => {}),
@@ -624,6 +629,7 @@ describe("Hallucination Guard Regression Tests (MT1 + MT2)", () => {
         const abortCalls: string[] = []
 
         const ctx = {
+            serverUrl: "http://localhost:4096",
             client: {
                 app: {
                     log: mock(async () => {}),
@@ -697,6 +703,7 @@ describe("Hallucination Guard Regression Tests (MT1 + MT2)", () => {
         const abortCalls: string[] = []
 
         const ctx = {
+            serverUrl: "http://localhost:4096",
             client: {
                 app: {
                     log: mock(async () => {}),
@@ -815,6 +822,7 @@ describe("WP-09: Integration Tests - Streaming Failure Recovery", () => {
         const statusMap: Record<string, string> = {}
 
         const ctx = {
+            serverUrl: "http://localhost:4096",
             client: {
                 app: {
                     log: mock(async (o: { body: { level: string; message: string } }) => {
@@ -1265,6 +1273,7 @@ describe("WP-10: Fault Injection Tests - Edge Cases & Race Conditions", () => {
         let promptIndex = 0
 
         const ctx = {
+            serverUrl: "http://localhost:4096",
             client: {
                 app: {
                     log: mock(async (o: { body: { level: string; message: string } }) => {

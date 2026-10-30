@@ -18,6 +18,7 @@ function makeEventStream() {
 	const queue: any[] = []
 	const waiters: ((ev: any) => void)[] = []
 	let closed = false
+	let subscribed = false
 	const stream = {
 		push(ev: any) {
 			if (waiters.length) waiters.shift()!(ev)
@@ -27,7 +28,10 @@ function makeEventStream() {
 			closed = true
 			while (waiters.length) waiters.shift()!(null)
 		},
-		subscribe: () => stream,
+		subscribe: () => {
+			subscribed = true
+			return stream
+		},
 		[Symbol.asyncIterator]() {
 			return {
 				next: () =>
@@ -45,20 +49,21 @@ function makeEventStream() {
 			}
 		},
 	}
-	return stream
+	return { stream, isSubscribed: () => subscribed }
 }
 
 type Harness = {
 	cleanup: (() => void) | undefined
 	capture: ReturnType<typeof capturePluginLogs>
 	logs: string[]
+	isSubscribed: () => boolean
 }
 
 /** Set up a test context and run setup(). */
 async function setupTest(app?: { name?: string; version?: string; channel?: string }): Promise<Harness> {
 	const capture = capturePluginLogs()
 
-	const stream = makeEventStream()
+	const { stream, isSubscribed } = makeEventStream()
 	const ctx: any = {
 		event: stream,
 		options: { toolTextCheckDelayMs: 0, registryScope: LOG_SALT },
@@ -91,12 +96,12 @@ async function setupTest(app?: { name?: string; version?: string; channel?: stri
 	await wait(100) // Allow setup to complete
 
 	const logs = capture.lines
-	return { cleanup, capture, logs }
+	return { cleanup, capture, logs, isSubscribed }
 }
 
 describe("build/server mismatch guard", () => {
-	test("a ctx without app.version warns about the build/server mismatch", async () => {
-		const { cleanup, capture, logs } = await setupTest(undefined)
+	test("a ctx without app.version warns about the build/server mismatch and aborts inertly", async () => {
+		const { cleanup, capture, logs, isSubscribed } = await setupTest(undefined)
 		try {
 			// setup should NOT throw
 			expect(logs).toBeDefined()
@@ -108,6 +113,12 @@ describe("build/server mismatch guard", () => {
 			expect(warnLines.length).toBe(1)
 			expect(warnLines[0]).toContain("ctx.app.version is missing")
 			expect(warnLines[0]).toContain("The v2 bundle requires opencode v2")
+
+			// The plugin must abort inertly: a callable dispose and NO event
+			// pump wired (a crash at ctx.event.subscribe is the v1-server
+			// symptom this guard exists to prevent).
+			expect(typeof cleanup).toBe("function")
+			expect(isSubscribed()).toBe(false)
 		} finally {
 			capture.stop()
 			cleanup?.()
@@ -115,7 +126,7 @@ describe("build/server mismatch guard", () => {
 	})
 
 	test("a proper v2 app context does not warn", async () => {
-		const { cleanup, capture, logs } = await setupTest({
+		const { cleanup, capture, logs, isSubscribed } = await setupTest({
 			name: "opencode",
 			version: "2.0.27",
 			channel: "stable",
@@ -129,6 +140,9 @@ describe("build/server mismatch guard", () => {
 				l.includes("build/server mismatch") || l.includes("ctx.app.version"),
 			)
 			expect(warnLines.length).toBe(0)
+
+			// The real build wires the event pump on a proper v2 ctx
+			expect(isSubscribed()).toBe(true)
 		} finally {
 			capture.stop()
 			cleanup?.()

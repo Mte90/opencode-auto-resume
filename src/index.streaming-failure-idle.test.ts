@@ -19,6 +19,7 @@ function createMockContext(opts: {
     const statusMap = opts.statusMap ?? defaultStatusMap
 
     const ctx = {
+        serverUrl: "http://localhost:4096",
         client: {
             app: {
                 log: mock(async (_o: any) => {})

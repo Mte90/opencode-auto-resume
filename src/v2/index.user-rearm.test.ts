@@ -94,6 +94,7 @@ async function setup(history: Record<string, unknown[]>, extraOpts: Record<strin
 	const capture = capturePluginLogs()
 
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: stream,
 		options: { ...OPTIONS, registryScope: LOG_SALT, ...extraOpts },
 		session: {

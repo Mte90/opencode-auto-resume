@@ -101,7 +101,7 @@ async function replay(events: any[], messages?: any[]): Promise<Injected[]> {
 	const capture = capturePluginLogs()
 	const ctx: any = {
 		event: stream,
-		app: { log: () => {} },
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		options: {
 			registryScope: LOG_SALT,
 			toolTextCheckDelayMs: 0,

@@ -101,6 +101,7 @@ async function setup(
 	const rows = opts.listRows ?? [{ id: SID }, { id: CHILD, parentID: SID }]
 
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: stream,
 		options: { ...OPTIONS, ...(opts.subagentWaitMs ? { subagentWaitMs: opts.subagentWaitMs } : {}), registryScope: LOG_SALT },
 		session: {

@@ -110,6 +110,7 @@ async function replay(
 	const capture = capturePluginLogs()
 
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: stream,
 		// The plugin reads its config from `ctx.options`; the second argument to
 		// `setup()` is ignored. Passing options the other way makes every

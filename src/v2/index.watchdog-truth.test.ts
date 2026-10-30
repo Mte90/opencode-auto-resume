@@ -67,6 +67,7 @@ async function setup(): Promise<any> {
 	// Prod shape: NO session.active, NO client. The only server truth available
 	// is the HTTP loopback (stubbed fetch here).
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: stream,
 		options: {
 			registryScope: LOG_SALT,

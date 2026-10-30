@@ -126,6 +126,7 @@ async function setup(
 	const history: unknown[] = [userMessage("do the work", OLD), ...(opts.extraMessages ?? [])]
 
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: stream,
 		options: {
 			registryScope: LOG_SALT,
@@ -405,6 +406,7 @@ describe("v2: task_complete degrades rather than failing the watchdog", () => {
 		const stream = makeEventStream()
 		const capture = capturePluginLogs()
 		const ctx: any = {
+			app: { name: "opencode", version: "2.0.27", channel: "stable" },
 			event: stream,
 			options: { ...OPTIONS, registryScope: LOG_SALT },
 			session: {

@@ -95,6 +95,7 @@ async function setup(
 	const stream = makeEventStream()
 
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: stream,
 		options: { ...OPTS, capture, ...extra, registryScope: LOG_SALT },
 		session: {
@@ -275,6 +276,7 @@ describe("v2: history readers accept the production message shape", () => {
 		const childHistory = [{ role: "assistant", error: { type: "api.error", message: "boom" }, time: { created: now } }]
 
 		const ctx: any = {
+			app: { name: "opencode", version: "2.0.27", channel: "stable" },
 			event: stream,
 			options: { ...OPTS, capture, subagentDeadMs: 60_000, subagentWaitMs: 50, registryScope: LOG_SALT },
 			session: {

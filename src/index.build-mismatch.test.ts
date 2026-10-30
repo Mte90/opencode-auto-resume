@@ -103,9 +103,16 @@ describe("build/server mismatch guard", () => {
             expect(warns[0]).toContain("opencode v1")
             expect(warns[0]).toContain("README")
 
-            // Assert the plugin still loaded successfully
+            // Assert the plugin aborted INERTLY: hooks exist, are callable, but
+            // the real pipeline is never wired — the real build always exposes
+            // the task_complete tool, and its first event logs "ready" via
+            // ctx.client.app.log.
             expect(hooks).toBeDefined()
             expect(typeof hooks.event).toBe("function")
+            expect(hooks).not.toHaveProperty("tool")
+            await hooks.event({ event: { type: "session.idle", properties: {} } } as any)
+            const appLogMock = ctx.client.app.log as any
+            expect(appLogMock.mock.calls.length).toBe(0)
         } finally {
             console.warn = originalWarn
         }

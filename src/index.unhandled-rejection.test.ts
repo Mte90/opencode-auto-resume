@@ -30,6 +30,7 @@ function createMockContext(opts: {
     }
 
     const ctx = {
+        serverUrl: "http://localhost:4096",
         client: {
             app: { log: mock(async (_o: any) => {}) },
             session: {
@@ -187,6 +188,7 @@ describe("unhandled-rejection guards (regression for plugin host crash)", () => 
 
     test("BEHAVIORAL: log() never propagates when backend is down", async () => {
         const ctx = {
+            serverUrl: "http://localhost:4096",
             client: {
                 app: {
                     log: mock(async () => {

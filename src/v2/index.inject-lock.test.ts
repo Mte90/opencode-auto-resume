@@ -71,6 +71,7 @@ async function run(slowMs: number) {
 	const stream = makeEventStream()
 	const capture = capturePluginLogs()
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: stream,
 		options: { ...FAST, maxRetries: 1, debug: true, registryScope: LOG_SALT },
 		session: {

@@ -80,6 +80,7 @@ async function setup(): Promise<any> {
 	// Prod shape: `client` is undefined in production (probed live 2026-10-06) and
 	// must stay undefined here — the gate cannot lean on a discovery API.
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: stream,
 		options: {
 			registryScope: LOG_SALT,

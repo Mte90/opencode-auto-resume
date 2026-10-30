@@ -89,6 +89,7 @@ async function replay(opts: Record<string, unknown> = {}): Promise<Harness> {
 	const capture = capturePluginLogs()
 
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: stream,
 		options: { ...OPTIONS, ...opts, registryScope: LOG_SALT },
 		session: {

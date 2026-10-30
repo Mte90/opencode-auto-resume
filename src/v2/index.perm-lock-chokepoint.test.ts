@@ -119,6 +119,7 @@ async function setup(history: unknown[]): Promise<any> {
 
 	// Prod shape: no ctx.client, empty active set.
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: stream,
 		options: { ...OPTIONS, registryScope: LOG_SALT },
 		session: {

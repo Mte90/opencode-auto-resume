@@ -93,6 +93,7 @@ async function setup(opts: {
 
 	const messages = opts.messages ?? []
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: stream,
 		options: { ...OPTIONS, registryScope: LOG_SALT },
 		session: {

@@ -84,6 +84,7 @@ async function setup(opts: { text?: string | null; toolTextCheckDelayMs?: number
 	let history: unknown[] = [userTurn(), assistantTurn(opts.text === undefined ? "Working on it." : opts.text)]
 
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: stream,
 		options: {
 			registryScope: LOG_SALT,

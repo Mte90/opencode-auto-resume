@@ -97,6 +97,7 @@ async function setup(extraOpts: Record<string, unknown> = {}, messages: any[] = 
 	const capture = capturePluginLogs()
 
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: stream,
 		options: {
 			registryScope: LOG_SALT,

@@ -15,6 +15,7 @@ function createMockContext(opts: {
     }
 
     const ctx = {
+        serverUrl: "http://localhost:4096",
         client: {
             app: {
                 log: mock(async (_o: { body: { level: string; message: string } }) => {})

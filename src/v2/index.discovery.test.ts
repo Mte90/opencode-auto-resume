@@ -108,6 +108,7 @@ async function run(
 		shape === "onClient" ? { session: { list, active } } : shape === "onDomain" ? undefined : {}
 
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: stream,
 		options: { warmupMs: 0, discoveryDelayMs: 20, toolTextCheckDelayMs: 0, ...opts, registryScope: LOG_SALT },
 		session,
@@ -166,6 +167,7 @@ describe("v2: session discovery sweep", () => {
 		const rows = [{ id: "not-a-session" }, { id: 42 }, {}, null]
 		const capture = capturePluginLogs()
 		const ctx: any = {
+			app: { name: "opencode", version: "2.0.27", channel: "stable" },
 			event: stream,
 			options: { warmupMs: 0, discoveryDelayMs: 20, toolTextCheckDelayMs: 0, registryScope: LOG_SALT },
 			session: {
@@ -187,6 +189,7 @@ describe("v2: session discovery sweep", () => {
 		const stream = makeEventStream()
 		const capture = capturePluginLogs()
 		const ctx: any = {
+			app: { name: "opencode", version: "2.0.27", channel: "stable" },
 			event: stream,
 			options: { warmupMs: 0, discoveryDelayMs: 20, toolTextCheckDelayMs: 0, registryScope: LOG_SALT },
 			session: {
@@ -207,6 +210,7 @@ describe("v2: session discovery sweep", () => {
 		const stream = makeEventStream()
 		const capture = capturePluginLogs()
 		const ctx: any = {
+			app: { name: "opencode", version: "2.0.27", channel: "stable" },
 			event: stream,
 			// Tight watchdog so a leaked interval is visible inside the wait.
 			options: { warmupMs: 0, discoveryDelayMs: 20, checkIntervalMs: 20, chunkTimeoutMs: 10_000, toolTextCheckDelayMs: 0, registryScope: LOG_SALT },

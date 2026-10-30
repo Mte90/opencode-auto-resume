@@ -99,6 +99,7 @@ async function setup(opts: SetupOpts = {}): Promise<any> {
 	// This is the production shape: a busy session, a long shell, and a stall
 	// window the watchdog reaches while the shell is still alive.
 	const ctx: any = {
+		app: { name: "opencode", version: "2.0.27", channel: "stable" },
 		event: stream,
 		options: {
 			registryScope: LOG_SALT,
