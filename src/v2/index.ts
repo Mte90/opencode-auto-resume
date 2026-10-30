@@ -448,6 +448,11 @@ export interface AutoResumeOptions {
 	chunkTimeoutMs?: number
 	gracePeriodMs?: number
 	stuckToolAgeMs?: number
+	/** How long a SOFT completion latch (a stop phrase, done claim or celebration
+	 * inferred from text) survives without a genuine user message before it
+	 * re-opens once for a self-check. A HARD latch (task_complete tool, literal
+	 * TASK COMPLETE tail) never expires. Default 5 min; tests set it low. */
+	completionLatchTtlMs?: number
 	/** Tool names the busy-stall path never interrupts (case-insensitive).
 	 * Default `["compress"]`: every tool gets the young-tool deferral, and
 	 * `compress` is additionally never interrupted while fresh;
@@ -2008,6 +2013,7 @@ export default define({
 		const checkIntervalMs = opts.checkIntervalMs ?? DEFAULT_CHECK_INTERVAL_MS
 		const gracePeriodMs = opts.gracePeriodMs ?? DEFAULT_GRACE_PERIOD_MS
 		const stuckToolAgeMs = opts.stuckToolAgeMs ?? DEFAULT_STUCK_TOOL_AGE_MS
+		const completionLatchTtlMs = opts.completionLatchTtlMs ?? COMPLETION_LATCH_TTL_MS
 		const neverInterruptTools = (opts.neverInterruptTools ?? ["compress"]).map((n) => String(n).toLowerCase())
 		// `maxRecoveryRetries` is v1's name for the same knob. Prefer the v2 name,
 		// fall back to the v1 alias so an existing v1 config ports unchanged.
@@ -2118,6 +2124,7 @@ export default define({
 		// looking like a bug. (Mte90/opencode-auto-resume#33)
 		const RECOGNISED_OPTIONS = new Set<string>([
 			"chunkTimeoutMs",
+			"completionLatchTtlMs",
 			"checkIntervalMs",
 			"gracePeriodMs",
 			"maxRetries",
@@ -2567,13 +2574,19 @@ export default define({
 			if (!w.completionSignaled) return false
 			if (w.completionHard || w.latchReopened) return false
 			if (!w.completionSignaledAt) return false
-			if (now - w.completionSignaledAt < COMPLETION_LATCH_TTL_MS) return false
+			if (now - w.completionSignaledAt < completionLatchTtlMs) return false
 			w.latchReopened = true
 			w.completionSignaled = false
 			w.completionSignaledAt = 0
+			// The re-opened session must be allowed to receive the self-check: the
+			// injected nudge goes through a delayed timer whose idle-state guard
+			// drops the injection unless a recovery is armed (the same flag the
+			// failed-turn path sets before recover()). Without it the detection
+			// re-arms every tick and nothing is ever delivered.
+			w.pendingRecoveryArmed = true
 			log(
 				"warn",
-				`${short(sid)} soft completion latch older than ${COMPLETION_LATCH_TTL_MS / 60000}m with no user message — re-opening once for a self-check`,
+				`${short(sid)} soft completion latch older than ${Math.round(completionLatchTtlMs / 1000)}s with no user message — re-opening once for a self-check`,
 			)
 			return true
 		}
