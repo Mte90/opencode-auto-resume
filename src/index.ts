@@ -156,6 +156,16 @@ const TASK_COMPLETE_REPEAT_ERROR =
 const CTX_WRAPUP_TRIGGER = "ctx-wrapup"
 const UNKNOWN_TOOL_THRESHOLD = 2
 const TOOL_IDS_CACHE_MS = 5 * 60_000
+// Prompt bodies this plugin itself injects through the visible channel. The
+// server records them as user messages, so the user-message re-arm must not
+// treat them as a genuine new request — otherwise the suggestion re-arms the
+// budget it just spent and the plugin loops (user report 2026-10-30).
+const OWN_PROMPT_SHAPES: RegExp[] = [
+	/^continue\s*\u2014\s*stalled\s*\(/,
+	/^continue\s*\nOnly continue work already in progress\./,
+	/^continue\s*\nIf work was already in progress,/,
+	/^You tried to use the tool "/,
+]
 
 const TOOL_TEXT_PATTERNS = [
     /<function\s*=/i,
@@ -1131,7 +1141,19 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             const available = await getAvailableToolIds()
             if (available.length === 0) return false
             const messages = await getSessionMessages(sid)
+            // Episode scoping (mirror of the v2 fix, 2026-10-30): only turns
+            // newer than the newest user message belong to this request. A
+            // reload starts checkedToolPartIDs empty and without this anchor
+            // the scan recounted the errored calls of FINISHED episodes back
+            // to threshold — suggesting for calls this turn never made. Same
+            // tolerance as the silent-reasoning check: messages without a
+            // usable timestamp count as old and are skipped when an anchor
+            // exists.
+            const lastUserAt = lastUserMessageTimeOf(messages)
             for (const msg of messages) {
+                if (lastUserAt !== undefined && messageTimeOf(msg) !== undefined && messageTimeOf(msg)! <= lastUserAt) {
+                    continue
+                }
                 const parts = msg.parts as Array<Record<string, unknown>> | undefined
                 if (!parts) continue
                 for (const part of parts) {
@@ -1175,6 +1197,52 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     function roleOf(msg: Record<string, unknown> | undefined): string | undefined {
         if (!msg) return undefined
         return (msg.role as string) ?? ((msg.info as Record<string, unknown> | undefined)?.role as string)
+    }
+
+    // Timestamp of a message, tolerant of both server shapes (flat `time` or
+    // `info.time`). Undefined when the message carries no usable timestamp.
+    function messageTimeOf(msg: Record<string, unknown> | undefined): number | undefined {
+        if (!msg) return undefined
+        const direct = msg.time as number | Record<string, unknown> | undefined
+        const viaInfo = (msg.info as Record<string, unknown> | undefined)?.time as
+            | number
+            | Record<string, unknown>
+            | undefined
+        const raw =
+            typeof direct === "number"
+                ? direct
+                : ((direct as Record<string, unknown> | undefined)?.created as number | undefined) ??
+                  (typeof viaInfo === "number" ? viaInfo : (viaInfo as Record<string, unknown> | undefined)?.created as number | undefined)
+        return typeof raw === "number" && raw > 0 ? raw : undefined
+    }
+
+    function lastUserMessageTimeOf(messages: Array<Record<string, unknown>>): number | undefined {
+        for (let i = messages.length - 1; i >= 0; i--) {
+            const msg = messages[i]
+            if (roleOf(msg) !== "user") continue
+            const t = messageTimeOf(msg)
+            if (t !== undefined) return t
+        }
+        return undefined
+    }
+
+    // Text of an inbound user message event, tolerant of where the server
+    // carries it (properties.parts, properties.info.parts, or a flat text).
+    function looksLikeOwnPrompt(props: Record<string, unknown> | undefined): boolean {
+        if (!props) return false
+        const parts = (props.parts ?? (props.info as Record<string, unknown> | undefined)?.parts) as
+            | Array<Record<string, unknown>>
+            | undefined
+        let text: string | undefined
+        if (Array.isArray(parts)) {
+            text = parts
+                .filter((p) => (p?.type as string) === "text")
+                .map((p) => p.text as string)
+                .join("\n")
+        }
+        text = text ?? (props.text as string | undefined) ?? ((props.info as Record<string, unknown> | undefined)?.text as string | undefined)
+        if (!text) return false
+        return OWN_PROMPT_SHAPES.some((re) => re.test(text!))
     }
 
     async function lastAssistantEndsWithCelebration(sid: string): Promise<boolean> {
@@ -2817,6 +2885,12 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 const info = props?.info as Record<string, unknown> | undefined
                 const role = (info?.role as string) ?? (props?.role as string)
                 if (role === "user") {
+                    if (looksLikeOwnPrompt(props)) {
+                        // Our own injected prompt, echoed back by the server as a
+                        // user message: NOT a new work cycle. Re-arming here let the
+                        // unknown-tool suggestion re-fire unboundedly (2026-10-30).
+                        break
+                    }
                     // Genuine new work cycle: re-arm the done-claim nudge budget.
                     // (Deliberately NOT reset in resetBusyFlags — see note there.)
                     // Also stamps inbound user activity for active-user suppression.
@@ -2826,7 +2900,10 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         w.lastUserMessageAt = Date.now()
                         w.unknownToolErrors.clear()
                         w.unknownToolSuggestionSent = false
-                        w.checkedToolPartIDs.clear()
+                        // Deliberately NOT clearing checkedToolPartIDs: a genuine new
+                        // request does not re-suggest errors already reported for it
+                        // (2026-10-04); the episode anchor in checkForUnknownToolCalls
+                        // keeps finished episodes dead regardless.
                     }
                     break
                 }

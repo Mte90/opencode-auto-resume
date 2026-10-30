@@ -168,6 +168,35 @@ const retryOf = (text: string | undefined): string | null => {
 	return m ? m[1] : null
 }
 
+describe("v2: our own unknown-tool prompt is not a genuine user message", () => {
+	test("a stale unknown-tool prompt in the history does not re-arm the budgets", async () => {
+		// User report 2026-10-30: after a reload the plugin's own unknown-tool
+		// suggestion sits in the history as a user message, and the shape list
+		// only knew the three "continue — stalled" bodies. The suggestion read
+		// as new instructions and re-armed the budget it had just spent.
+		const now = Date.now()
+		const messages: any[] = [
+			{ id: "u_real", role: "user", time: { created: now - 900_000 }, text: "fix the broken job" },
+			{
+				id: "u_own_unknown_tool",
+				role: "user",
+				time: { created: now - 600_000 },
+				text:
+					'You tried to use the tool "aft_read" 2 times, but it does not exist. ' +
+					'The closest matching tool is "read". Please use "read" instead and adjust your arguments accordingly. ' +
+					"Available tools include: bash, read, glob, grep, edit, write.",
+			},
+		]
+		const h = await setup({}, messages)
+		push(h, "session.execution.started", SID)
+		await wait(120)
+		const logs = h.capture.lines.join("\n")
+		await teardown(h)
+		expect(logs).toContain("newest user message is our own prompt")
+		expect(logs).not.toContain("re-arming the unknown-tool budget")
+	})
+})
+
 describe("v2: our own stall prompt is not a genuine user message", () => {
 	test("a stale own prompt in the history does not re-arm the budgets", async () => {
 		// Our prompt is the newest user message and it is MINUTES old: the

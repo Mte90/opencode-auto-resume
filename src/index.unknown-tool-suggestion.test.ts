@@ -222,7 +222,7 @@ describe("unknown tool suggestion", () => {
         expect(total).toBe(1)
     })
 
-    test("reset on new user message → suggestion can fire again", async () => {
+    test("new user message does not re-suggest already-reported errors", async () => {
         const messages = [
             {
                 role: "assistant",
@@ -242,12 +242,54 @@ describe("unknown tool suggestion", () => {
         ).length
         expect(firstCount).toBe(1)
 
+        // A genuine new request must not re-announce errors already reported
+        // for it (2026-10-04, 2026-10-30): re-arming re-fired the same
+        // suggestion on every idle and nagged live sessions.
         await fireUserMessage(hooks, "ses_reset")
         await fireIdle(hooks, "ses_reset")
         await wait(200)
 
         const total = promptCalls.filter(
             (p) => p.sid === "ses_reset" && p.body.includes("does not exist"),
+        ).length
+        expect(total).toBe(1)
+    })
+
+    test("new bad calls in a new turn fire the suggestion again", async () => {
+        const messages = [
+            {
+                role: "assistant",
+                parts: [
+                    makeToolPart({ id: "tp1", tool: "serach", status: "error", error: "Tool not found" }),
+                    makeToolPart({ id: "tp2", tool: "serach", status: "error", error: "Tool not found" }),
+                ],
+            },
+        ]
+        const { hooks, promptCalls } = await setup(AVAILABLE_TOOLS, messages)
+        await fireBusy(hooks, "ses_newcalls")
+        await fireIdle(hooks, "ses_newcalls")
+        await wait(200)
+
+        const firstCount = promptCalls.filter(
+            (p) => p.sid === "ses_newcalls" && p.body.includes("does not exist"),
+        ).length
+        expect(firstCount).toBe(1)
+
+        // Fresh errored calls (new part ids) in the new turn are a new
+        // episode: the suggestion legitimately fires again.
+        await fireUserMessage(hooks, "ses_newcalls")
+        messages.push({
+            role: "assistant",
+            parts: [
+                makeToolPart({ id: "tp3", tool: "serach", status: "error", error: "Tool not found" }),
+                makeToolPart({ id: "tp4", tool: "serach", status: "error", error: "Tool not found" }),
+            ],
+        })
+        await fireIdle(hooks, "ses_newcalls")
+        await wait(200)
+
+        const total = promptCalls.filter(
+            (p) => p.sid === "ses_newcalls" && p.body.includes("does not exist"),
         ).length
         expect(total).toBe(2)
     })

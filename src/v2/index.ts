@@ -1805,6 +1805,11 @@ const OWN_PROMPT_SHAPES: RegExp[] = [
 	/^continue\s*\u2014\s*stalled\s*\(/,
 	/^continue\s*\nOnly continue work already in progress\./,
 	/^continue\s*\nIf work was already in progress,/,
+	// The unknown-tool suggestion travels the visible channel when
+	// quietCorrections is off; a reload loses the in-memory record, and the
+	// suggestion read as new instructions re-armed the budget it had just
+	// spent (user report 2026-10-30).
+	/^You tried to use the tool "/,
 ]
 
 function looksLikeOwnPrompt(text: string | undefined): boolean {
@@ -4837,9 +4842,17 @@ export default define({
 				if (containsStopStatement(w.lastAssistantText || lastAssistantTextFrom(messages))) return false
 				if (w.unknownToolSuggestionSent) return false
 				const available = await getAvailableToolIds()
-				// No registry, or nothing registered: every name would look unknown.
-				if (available.length === 0) return false
-				for (const msg of messages) {
+			// No registry, or nothing registered: every name would look unknown.
+			if (available.length === 0) return false
+			// Episode scoping: only turns newer than the newest user message
+			// belong to this request. A reload starts the examined-parts set
+			// empty, and without this anchor the scan recounted the errored calls
+			// of FINISHED episodes back to threshold — suggesting for calls this
+			// turn never made (user report 2026-10-30). Same anchor and tolerance
+			// as the silent-reasoning check.
+			const lastUserAt = lastUserMessageAt(messages)
+			for (const msg of messages) {
+				if (lastUserAt !== undefined && msgAt(msg) <= lastUserAt) continue
 					const content = (msg as { content?: unknown })?.content
 					if (!Array.isArray(content)) continue
 					for (const part of content as Array<Record<string, unknown>>) {

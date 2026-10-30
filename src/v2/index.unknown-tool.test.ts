@@ -97,6 +97,14 @@ const assistantWith = (...content: unknown[]) => ({
 	content: [{ type: "text", text: "Let me look at that." }, ...content],
 })
 
+/** Same shape at an explicit time — for turns that happen after a later user
+ *  message, where the default OLD + 1s stamp would put them in a finished
+ *  episode. */
+const assistantWithAt = (at: number, ...content: unknown[]) => ({
+	...assistantWith(...content),
+	time: { created: at },
+})
+
 const TOOLS = [{ id: "read" }, { id: "write" }, { id: "glob" }, { id: "bash" }, { id: "task_complete" }]
 
 async function setup(
@@ -298,8 +306,8 @@ describe("v2: naming a replacement for a tool that does not exist", () => {
 		await goIdle(h)
 		expect(suggestions(h)).toHaveLength(1)
 		h.history.push(userMessage("now do the other thing", OLD + 2_000, "msg_u_second"))
-		h.history.push(assistantWith(toolPart("call_3", "wriet")))
-		h.history.push(assistantWith(toolPart("call_4", "wriet")))
+		h.history.push(assistantWithAt(OLD + 2_500, toolPart("call_3", "wriet")))
+		h.history.push(assistantWithAt(OLD + 2_600, toolPart("call_4", "wriet")))
 		await goIdle(h)
 		expect(suggestions(h)).toHaveLength(2)
 		expect(suggestions(h)[1].text).toContain('"wriet"')
@@ -392,6 +400,46 @@ describe("v2: naming a replacement for a tool that does not exist", () => {
 		expect(said).toHaveLength(1)
 		expect(said[0].text).toContain("Please check the available tools")
 		expect(said[0].text).not.toContain("The closest matching tool is")
+		await teardown(h)
+	})
+})
+
+describe("v2: stale errors of a finished episode stay dead after a reload", () => {
+	test("errors older than the newest user message are not recounted", async () => {
+		// User report 2026-10-30: the plugin suggested "aft_read" in a turn that
+		// never called it. A plugin reload starts the examined-parts set empty,
+		// the scan walks the whole history, and the errored calls of a FINISHED
+		// episode recount to threshold. Episode scoping: only parts in turns
+		// newer than the newest user message belong to this request.
+		const h = await setup({
+			history: [
+				userMessage("go", OLD),
+				assistantWith(toolPart("call_1", "globb")),
+				assistantWith(toolPart("call_2", "globb")),
+				userMessage("thanks, now report status", OLD + 60_000, "msg_u_second"),
+				assistantWithAt(OLD + 61_000, toolPart("call_9", "read", "completed")),
+			],
+		})
+		await goIdle(h)
+		await goIdle(h)
+		expect(suggestions(h)).toHaveLength(0)
+		await teardown(h)
+	})
+
+	test("errors in the current episode still earn the suggestion", async () => {
+		// CONTROL for the scoping: the same two calls, but the newest user
+		// message predates them, so they are this episode's calls and must count.
+		const h = await setup({
+			history: [
+				userMessage("go", OLD),
+				assistantWithAt(OLD + 2_000, toolPart("call_1", "globb")),
+				assistantWithAt(OLD + 2_100, toolPart("call_2", "globb")),
+			],
+		})
+		await goIdle(h)
+		const said = suggestions(h)
+		expect(said).toHaveLength(1)
+		expect(said[0].text).toContain('The closest matching tool is "glob"')
 		await teardown(h)
 	})
 })
