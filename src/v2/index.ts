@@ -303,6 +303,14 @@ interface SessionWatch {
 	 * (ses_ed33c0da, 2026-10-11: TASK COMPLETE latched at idle would have died
 	 * at the re-mark 1s later). Cleared alongside completionSignaled. */
 	completionSignaledAt: number
+	/** True when the latch came from a hard signal: the task_complete tool, or a
+	 * literal TASK COMPLETE / task completed tail. Hard latches never re-open on
+	 * COMPLETION_LATCH_TTL_MS — the turn genuinely said it was done. */
+	completionHard: boolean
+	/** One-shot guard: the TTL self-check for a soft completion latch already ran.
+	 * Without it a model that keeps answering "stopping here" would be nudged
+	 * every TTL forever. */
+	latchReopened: boolean
 	/** Set once the empty-idle instant nudge has fired for the current episode.
 	 * A turn that ends with nothing delivered gets exactly one quiet continue;
 	 * a new turn (markBusy) re-arms it. Without the flag every repeat idle
@@ -962,8 +970,18 @@ const OWN_PROMPT_TIME_MS = 30_000
 
 const MAX_IDLE_SESSIONS = 50
 const IDLE_CLEANUP_MS = 10 * 60_000
-/** A compaction silent for this long without an ended/failed event is wedged — stale-clear the flag. */
-const COMPACTION_STALE_TTL_MS = 30 * 60_000
+/** A compaction silent for this long without an ended/failed event is wedged — stale-clear the flag.
+ * Compaction on a single GPU legitimately runs 5-15 min here, so the guard cannot
+ * mute the watchdog for 30: a wedged or slow compaction must not hide a dead session. */
+const COMPACTION_STALE_TTL_MS = 5 * 60_000
+/** A SOFT completion latch (a stop phrase / done claim / celebration inferred from
+ * text, with no task_complete call and no TASK COMPLETE tail) re-opens once after
+ * this long with no genuine user message. A latch that only a human turn can clear
+ * parks a working session behind one stop phrase until someone types — the exact
+ * "stood down and never came back" failure (ses_e72df2be9ffe, 2026-10-30: latched
+ * at 16:19:33 mid-turn, silent until the user wrote something 20+ min later).
+ * A HARD latch (task_complete tool, or a literal TASK COMPLETE tail) never re-opens. */
+const COMPLETION_LATCH_TTL_MS = 5 * 60_000
 /** A `permission.asked` unanswered this long is treated as abandoned — stale-clear the flag. */
 const PERMISSION_STALE_TTL_MS = 30 * 60_000
 /** An exempt tool (see `neverInterruptTools`) with no result after this long is
@@ -1342,6 +1360,21 @@ function containsStopStatement(text: string): boolean {
  */
 function turnEndsWithCompletionClaim(text: string): boolean {
 	return endsWithCelebration(text) || containsStopStatement(text)
+}
+
+/** A completion signal that does not depend on interpreting a stop phrase: the
+ * model either called the task_complete tool, or the last line is the literal
+ * TASK COMPLETE marker AGENTS.md requires. Only these may latch without a
+ * self-check; every text heuristic stays soft and re-opens after
+ * COMPLETION_LATCH_TTL_MS. */
+function isHardCompletionText(text: string): boolean {
+	const tail =
+		stripBoundaryMarkers(text)
+			.split("\n")
+			.map((l) => l.trim())
+			.filter((l) => l.length > 0)
+			.pop() ?? ""
+	return /\btask\s+complete(d)?\b[.!]*$/i.test(tail)
 }
 
 /**
@@ -2292,6 +2325,8 @@ export default define({
 					intentNudgeAttempts: 0,
 					completionSignaled: false,
 					completionSignaledAt: 0,
+					completionHard: false,
+					latchReopened: false,
 					emptyIdleNudged: false,
 					todos: [],
 					todosFetchedAt: 0,
@@ -2522,6 +2557,27 @@ export default define({
 		 * A `permission.asked` with no matching `permission.replied` would otherwise
 		 * stand the session down forever. Mirrors the compaction stale-guard.
 		 */
+		/** A SOFT completion latch (stop phrase / celebration / done claim inferred
+		 * from text) expires after COMPLETION_LATCH_TTL_MS with no genuine user
+		 * message: it re-opens ONCE so a working session gets a single self-check
+		 * nudge instead of sitting silent until the human types (ses_e72df2be, 2026-10-30).
+		 * HARD latches (task_complete tool, literal TASK COMPLETE) never expire, and
+		 * a latch that already re-opened once stays shut — no repeating nudges. */
+		function softLatchExpired(sid: string, w: SessionWatch, now: number): boolean {
+			if (!w.completionSignaled) return false
+			if (w.completionHard || w.latchReopened) return false
+			if (!w.completionSignaledAt) return false
+			if (now - w.completionSignaledAt < COMPLETION_LATCH_TTL_MS) return false
+			w.latchReopened = true
+			w.completionSignaled = false
+			w.completionSignaledAt = 0
+			log(
+				"warn",
+				`${short(sid)} soft completion latch older than ${COMPLETION_LATCH_TTL_MS / 60000}m with no user message — re-opening once for a self-check`,
+			)
+			return true
+		}
+
 		function clearStalePermissionFlag(sid: string, w: SessionWatch) {
 			if (!w.permissionPending) return
 			if (w.permissionPendingAt && Date.now() - w.permissionPendingAt > PERMISSION_STALE_TTL_MS) {
@@ -4553,6 +4609,7 @@ export default define({
 			if (w.completionSignaled) {
 				w.completionSignaled = false
 				w.completionSignaledAt = 0
+				w.latchReopened = false
 				dbg(`${short(sid)} genuine new user message — re-opening latched completion`)
 			}
 			// A genuine user message is a new episode for the stall ladder too
@@ -5044,6 +5101,7 @@ export default define({
 
 							w.completionSignaled = true
 							w.completionSignaledAt = Date.now()
+							w.completionHard = true
 							log("info", `${short(sid)} task_complete called, ${(await isSubAgentSession(sid)) ? "subagent" : "agent"} done`)
 							w.taskCompleteSignals++
 							if (w.taskCompleteSignals === 2) return { content: TASK_COMPLETE_REPEAT_WARNING }
@@ -5105,6 +5163,7 @@ export default define({
 					}
 					w.completionSignaled = true
 					w.completionSignaledAt = Date.now()
+					w.completionHard = true
 					w.taskCompleteSignals = 0
 					w.taskCompleteOverrides = 0
 					log("info", `${short(sid)} task_complete called, ${(await isSubAgentSession(sid)) ? "subagent" : "agent"} done`)
@@ -5204,6 +5263,7 @@ export default define({
 						if (open.length === 0 && !w.completionSignaled) {
 							w.completionSignaled = true
 							w.completionSignaledAt = Date.now()
+							w.completionHard = isHardCompletionText(tailText)
 							log("info", `${short(sid)} turn ends with a completion claim inside the activity window — latching completion, standing down`)
 						}
 					} else {
@@ -5268,6 +5328,7 @@ export default define({
 				if (!w.completionSignaled) {
 					w.completionSignaled = true
 					w.completionSignaledAt = Date.now()
+					w.completionHard = false
 					log("info", `${short(sid)} turn ends with a celebration and no open todos — latching completion, not nudging`)
 				} else {
 					dbg(`${short(sid)} completion already latched — skipping`)
@@ -5316,6 +5377,7 @@ export default define({
 				if (!w.completionSignaled) {
 					w.completionSignaled = true
 					w.completionSignaledAt = Date.now()
+					w.completionHard = isHardCompletionText(text)
 					log("info", `${short(sid)} turn ends with an explicit stop and no open todos — latching completion, not nudging`)
 				} else {
 					dbg(`${short(sid)} completion already latched — skipping`)
@@ -5947,7 +6009,10 @@ export default define({
 								if (w.lastGenuineUserAt > w.completionSignaledAt) {
 									w.completionSignaled = false
 									w.completionSignaledAt = 0
+									w.latchReopened = false
 									dbg(`${short(sid)} genuine new user message after latched completion — re-opening stall detection`)
+								} else if (softLatchExpired(sid, w, now)) {
+									dbg(`${short(sid)} soft completion latch expired — re-opening for one self-check`)
 								} else {
 									dbg(`${short(sid)} completion latched — skipping stall detection`)
 								}
@@ -6043,7 +6108,10 @@ export default define({
 					if (w.lastGenuineUserAt > w.completionSignaledAt) {
 						w.completionSignaled = false
 						w.completionSignaledAt = 0
+						w.latchReopened = false
 						dbg(`${short(sid)} genuine new user message after latched completion — re-opening stall detection`)
+					} else if (softLatchExpired(sid, w, now)) {
+						dbg(`${short(sid)} soft completion latch expired — re-opening for one self-check`)
 					} else {
 						dbg(`${short(sid)} completion latched — skipping stall detection`)
 						continue
