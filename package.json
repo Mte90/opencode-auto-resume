@@ -26,7 +26,7 @@
     "build:v1": "bun build src/dispatch.ts --outfile dist/index.js --target bun",
     "build:v2": "bun build src/v2/index.ts --outfile dist/v2/index.js --target bun",
     "dev": "bun build src/dispatch.ts --outfile dist/index.js --target bun --watch",
-    "test": "bun test",
+    "test": "bun run build && bun test",
     "prepublishOnly": "bun run build"
 },  "files": [
     "dist/index.js",
