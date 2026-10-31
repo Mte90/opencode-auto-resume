@@ -573,20 +573,10 @@ export interface AutoResumeOptions {
 	 * nothing is lost to a reload. Past the ladder the session stays silent
 	 * until a genuine user turn. Default spans ~12h for overnight coverage.
 	 */
-	/**
-	 * Per-attempt cooldowns (ms) before a rate-limited session may be retried.
-	 * Gates, not timers: evaluated on each failure and each watchdog tick, so
-	 * nothing is lost to a reload. Past the ladder the session stays silent
-	 * until a genuine user turn. Default spans ~12h for overnight coverage.
-	 */
 	rateLimitCooldownsMs?: number[]
 	/** Bound (ms) on any single recovery send; see DEFAULT_SEND_TIMEOUT_MS. */
 	sendTimeoutMs?: number
 }
-
-// ---------------------------------------------------------------------------
-// Logging
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -818,7 +808,7 @@ const DONE_CLAIM_PATTERN_SOURCES = [
 	"\\bnothing\\s+(?:else\\s+)?(?:left|remaining|to do)",
 ]
 
-const DEFAULT_DONE_CLAIM_PATTERNS = [...DONE_CLAIM_PATTERN_SOURCES]
+
 
 const DEFAULT_READY_TO_CONTINUE_PATTERNS = [
 	"ready to continue with task",
@@ -1640,9 +1630,6 @@ function isUserHandoff(text: string): boolean {
 	return patterns.some((p) => p.test(last))
 }
 
-function backoffMs(attempt: number, base: number, max: number): number {
-	return Math.min(base * Math.pow(2, attempt - 1), max)
-}
 
 /** Silence-watchdog recover reasons look like "no activity for 186s". Shared
  * by the stall-text builder (idle-field dedup) and recover (episode reset):
@@ -2097,7 +2084,7 @@ export default define({
 			return out
 		}
 
-		const doneClaimPatterns = compilePatterns(opts.doneClaimPatterns, DEFAULT_DONE_CLAIM_PATTERNS, "im")
+		const doneClaimPatterns = compilePatterns(opts.doneClaimPatterns, DONE_CLAIM_PATTERN_SOURCES, "im")
 		const readyToContinuePatterns = compilePatterns(
 			opts.readyToContinuePatterns,
 			DEFAULT_READY_TO_CONTINUE_PATTERNS,
@@ -3639,7 +3626,7 @@ export default define({
 			}
 			w.recovering = true
 			const attempt = providerFault ? Math.max(1, w.resumeAttempts) : w.resumeAttempts + 1
-			const delay = backoffMs(attempt, baseBackoff, maxBackoff)
+			const delay = Math.min(baseBackoff * 2 ** (attempt - 1), maxBackoff)
 			if (providerFault) {
 				log(
 					"info",
@@ -6857,14 +6844,22 @@ export default define({
 							let ownRung = !providerRetryFresh && selfInjectFresh
 							if (ownRung) {
 								try {
-									for (const m of await loadMessages(sid)) {
-										if (
-											msgRole(m) === "user" &&
-											msgAt(m) > w.lastInjectAt
-										) {
-											ownRung = false
-											break
-										}
+									const hist = await loadMessages(sid)
+									for (const m of hist) {
+										if (msgRole(m) !== "user") continue
+										if (msgAt(m) <= w.lastInjectAt) continue
+										// Exclude our own prompts — they land
+										// shortly after the inject and must not
+										// be treated as a genuine user turn
+										// (which would reset the counter).
+										const text = messageTextOf(m)
+										const ownByText = typeof text === "string" && text.length > 0 && w.ownPromptTexts.includes(text)
+										const ownByShape = looksLikeOwnPrompt(text)
+										const ownByTime = msgAt(m) >= w.lastInjectAt && msgAt(m) - w.lastInjectAt < OWN_PROMPT_TIME_MS
+										const ownByTimeOnly = ownByTime && !(typeof text === "string" && text.length > 0)
+										if (ownByText || ownByShape || ownByTimeOnly) continue
+										ownRung = false
+										break
 									}
 								} catch {
 									// Fail closed: if the history cannot be read
