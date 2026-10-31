@@ -424,17 +424,9 @@ Aborts the active run, then continues. The only family that can unblock a live r
 
 Paths: orphan parent, subagent stuck (parent side), hallucination loop, streaming-failure escalation. All aborts pass the active-tool guards first, and plugin-initiated aborts are marked so they are not mistaken for user ESC (`session.error` → `MessageAbortedError` race).
 
-## Complementary plugins (for v2)
+<<<<<<< HEAD
+## Architecture
 
-Auto-resume works on its own, but two companion plugins make it sharper. Both are optional — auto-resume detects their presence and degrades gracefully when they are absent.
-
-| Plugin | Required? | If absent |
-|---|---|---|
-| opencode-todolist | No | No task-aware nudges; other paths unaffected |
-| opencode-task-complete | No | Built-in fallback `task_complete` tool; text/emoji completion |
-
-- [opencode-todolist](https://github.com/aiev/opencode-todolist) — Restores `todowrite` / `todoread` in opencode v2
-- [opencode-task-complete](https://github.com/famewolf/opencode-task-complete) — Provides the `task_complete` tool for explicit completion signalling
 
 ## Verification & troubleshooting
 
