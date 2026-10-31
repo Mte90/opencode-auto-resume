@@ -207,9 +207,6 @@ interface SessionWatch {
 	 * explanation reads as broken (ses_edd3d940, 2026-10-10). */
 	quotaNoticedAt: number
 	gaveUp: boolean
-	/** Timestamp of the last quota notice sent (dedupes back-to-back duplicates
-	 * from concurrent event paths; 100ms window). */
-	lastQuotaNoticeAt: number
 	/** User-paused: auto-resume will not inject or arm quota for this session
 	 * until explicitly resumed. Persisted via the marker file + storage. */
 	paused: boolean
@@ -303,6 +300,14 @@ interface SessionWatch {
 	 * (ses_ed33c0da, 2026-10-11: TASK COMPLETE latched at idle would have died
 	 * at the re-mark 1s later). Cleared alongside completionSignaled. */
 	completionSignaledAt: number
+	/** True when the latch came from a hard signal: the task_complete tool, or a
+	 * literal TASK COMPLETE / task completed tail. Hard latches never re-open on
+	 * COMPLETION_LATCH_TTL_MS — the turn genuinely said it was done. */
+	completionHard: boolean
+	/** One-shot guard: the TTL self-check for a soft completion latch already ran.
+	 * Without it a model that keeps answering "stopping here" would be nudged
+	 * every TTL forever. */
+	latchReopened: boolean
 	/** Set once the empty-idle instant nudge has fired for the current episode.
 	 * A turn that ends with nothing delivered gets exactly one quiet continue;
 	 * a new turn (markBusy) re-arms it. Without the flag every repeat idle
@@ -440,6 +445,11 @@ export interface AutoResumeOptions {
 	chunkTimeoutMs?: number
 	gracePeriodMs?: number
 	stuckToolAgeMs?: number
+	/** How long a SOFT completion latch (a stop phrase, done claim or celebration
+	 * inferred from text) survives without a genuine user message before it
+	 * re-opens once for a self-check. A HARD latch (task_complete tool, literal
+	 * TASK COMPLETE tail) never expires. Default 5 min; tests set it low. */
+	completionLatchTtlMs?: number
 	/** Tool names the busy-stall path never interrupts (case-insensitive).
 	 * Default `["compress"]`: every tool gets the young-tool deferral, and
 	 * `compress` is additionally never interrupted while fresh;
@@ -560,20 +570,10 @@ export interface AutoResumeOptions {
 	 * nothing is lost to a reload. Past the ladder the session stays silent
 	 * until a genuine user turn. Default spans ~12h for overnight coverage.
 	 */
-	/**
-	 * Per-attempt cooldowns (ms) before a rate-limited session may be retried.
-	 * Gates, not timers: evaluated on each failure and each watchdog tick, so
-	 * nothing is lost to a reload. Past the ladder the session stays silent
-	 * until a genuine user turn. Default spans ~12h for overnight coverage.
-	 */
 	rateLimitCooldownsMs?: number[]
 	/** Bound (ms) on any single recovery send; see DEFAULT_SEND_TIMEOUT_MS. */
 	sendTimeoutMs?: number
 }
-
-// ---------------------------------------------------------------------------
-// Logging
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -805,7 +805,7 @@ const DONE_CLAIM_PATTERN_SOURCES = [
 	"\\bnothing\\s+(?:else\\s+)?(?:left|remaining|to do)",
 ]
 
-const DEFAULT_DONE_CLAIM_PATTERNS = [...DONE_CLAIM_PATTERN_SOURCES]
+
 
 const DEFAULT_READY_TO_CONTINUE_PATTERNS = [
 	"ready to continue with task",
@@ -962,8 +962,18 @@ const OWN_PROMPT_TIME_MS = 30_000
 
 const MAX_IDLE_SESSIONS = 50
 const IDLE_CLEANUP_MS = 10 * 60_000
-/** A compaction silent for this long without an ended/failed event is wedged — stale-clear the flag. */
-const COMPACTION_STALE_TTL_MS = 30 * 60_000
+/** A compaction silent for this long without an ended/failed event is wedged — stale-clear the flag.
+ * Compaction on a single GPU legitimately runs 5-15 min here, so the guard cannot
+ * mute the watchdog for 30: a wedged or slow compaction must not hide a dead session. */
+const COMPACTION_STALE_TTL_MS = 5 * 60_000
+/** A SOFT completion latch (a stop phrase / done claim / celebration inferred from
+ * text, with no task_complete call and no TASK COMPLETE tail) re-opens once after
+ * this long with no genuine user message. A latch that only a human turn can clear
+ * parks a working session behind one stop phrase until someone types — the exact
+ * "stood down and never came back" failure (ses_e72df2be9ffe, 2026-10-30: latched
+ * at 16:19:33 mid-turn, silent until the user wrote something 20+ min later).
+ * A HARD latch (task_complete tool, or a literal TASK COMPLETE tail) never re-opens. */
+const COMPLETION_LATCH_TTL_MS = 5 * 60_000
 /** A `permission.asked` unanswered this long is treated as abandoned — stale-clear the flag. */
 const PERMISSION_STALE_TTL_MS = 30 * 60_000
 /** An exempt tool (see `neverInterruptTools`) with no result after this long is
@@ -1344,6 +1354,8 @@ function turnEndsWithCompletionClaim(text: string): boolean {
 	return endsWithCelebration(text) || containsStopStatement(text)
 }
 
+
+
 /**
  * True when a done-claim already carries a concrete work report.
  *
@@ -1602,9 +1614,6 @@ function isUserHandoff(text: string): boolean {
 	return patterns.some((p) => p.test(last))
 }
 
-function backoffMs(attempt: number, base: number, max: number): number {
-	return Math.min(base * Math.pow(2, attempt - 1), max)
-}
 
 /** Silence-watchdog recover reasons look like "no activity for 186s". Shared
  * by the stall-text builder (idle-field dedup) and recover (episode reset):
@@ -1975,6 +1984,7 @@ export default define({
 		const checkIntervalMs = opts.checkIntervalMs ?? DEFAULT_CHECK_INTERVAL_MS
 		const gracePeriodMs = opts.gracePeriodMs ?? DEFAULT_GRACE_PERIOD_MS
 		const stuckToolAgeMs = opts.stuckToolAgeMs ?? DEFAULT_STUCK_TOOL_AGE_MS
+		const completionLatchTtlMs = opts.completionLatchTtlMs ?? COMPLETION_LATCH_TTL_MS
 		const neverInterruptTools = (opts.neverInterruptTools ?? ["compress"]).map((n) => String(n).toLowerCase())
 		// `maxRecoveryRetries` is v1's name for the same knob. Prefer the v2 name,
 		// fall back to the v1 alias so an existing v1 config ports unchanged.
@@ -2058,7 +2068,7 @@ export default define({
 			return out
 		}
 
-		const doneClaimPatterns = compilePatterns(opts.doneClaimPatterns, DEFAULT_DONE_CLAIM_PATTERNS, "im")
+		const doneClaimPatterns = compilePatterns(opts.doneClaimPatterns, DONE_CLAIM_PATTERN_SOURCES, "im")
 		const readyToContinuePatterns = compilePatterns(
 			opts.readyToContinuePatterns,
 			DEFAULT_READY_TO_CONTINUE_PATTERNS,
@@ -2071,13 +2081,7 @@ export default define({
 		)
 
 		// Options accepted but not yet acted on, because the v2 feature they tune
-		// is not ported. Listed (not warned) so an existing v1 config stays valid
-		// and the gap is documented rather than surprising.
-		//
-		// Empty: every v1 option this build understands is now applied. Kept as a
-		// list rather than deleted because the accepted-but-inert= warning is the
-		// only thing a user has to go on when an option is quietly ignored — so
-		// the next one that arrives has somewhere to be listed.
+		// is not ported. Listed (not warned) so an existing v1 config stays valid.
 		const FEATURE_GATED_OPTIONS = [] as const
 
 		// Options this build understands. Anything else in the user's config is
@@ -2085,6 +2089,7 @@ export default define({
 		// looking like a bug. (Mte90/opencode-auto-resume#33)
 		const RECOGNISED_OPTIONS = new Set<string>([
 			"chunkTimeoutMs",
+			"completionLatchTtlMs",
 			"checkIntervalMs",
 			"gracePeriodMs",
 			"maxRetries",
@@ -2258,7 +2263,6 @@ export default define({
 					providerRetryAt: 0,
 					quotaNoticedAt: 0,
 					gaveUp: false,
-					lastQuotaNoticeAt: 0,
 					paused: false,
 					lastGenuineUserAt: 0,
 					consecFailureRecovers: 0,
@@ -2292,6 +2296,8 @@ export default define({
 					intentNudgeAttempts: 0,
 					completionSignaled: false,
 					completionSignaledAt: 0,
+					completionHard: false,
+					latchReopened: false,
 					emptyIdleNudged: false,
 					todos: [],
 					todosFetchedAt: 0,
@@ -2357,25 +2363,17 @@ export default define({
 		// ---- Pause / resume (user-controlled) ---------------------------------
 		// Source of truth: a marker file listing paused session ids (one per line)
 		// or "*" for all. Written by the CLI helper and the /auto-resume command.
-		let pausedCacheMtime = 0
-		let pausedCacheSet: Set<string> = new Set()
 		function readPausedSet(): Set<string> {
 			try {
-				const st = statSync(PAUSED_MARKER_FILE)
-				if (st.mtimeMs === pausedCacheMtime) return pausedCacheSet
-				pausedCacheMtime = st.mtimeMs
 				const raw = readFileSync(PAUSED_MARKER_FILE, "utf8")
 				const s = new Set<string>()
 				for (const line of raw.split(/\r?\n/)) {
 					const t = line.trim()
 					if (t) s.add(t)
 				}
-				pausedCacheSet = s
 				return s
 			} catch {
-				pausedCacheMtime = 0
-				pausedCacheSet = new Set()
-				return pausedCacheSet
+				return new Set<string>()
 			}
 		}
 		function isPaused(sid: string): boolean {
@@ -2391,7 +2389,6 @@ export default define({
 			} catch {}
 			try {
 				writeFileSync(PAUSED_MARKER_FILE, [...s].join("\n") + (s.size ? "\n" : ""), "utf8")
-				pausedCacheMtime = 0
 			} catch (e) {
 				dbg(`${short(sid)} pause write failed: ${e instanceof Error ? e.message : String(e)}`)
 			}
@@ -2522,6 +2519,28 @@ export default define({
 		 * A `permission.asked` with no matching `permission.replied` would otherwise
 		 * stand the session down forever. Mirrors the compaction stale-guard.
 		 */
+		/** A SOFT completion latch (stop phrase / celebration / done claim inferred
+		 * from text) expires after COMPLETION_LATCH_TTL_MS with no genuine user
+		 * message: it re-opens ONCE so a working session gets a single self-check
+		 * nudge instead of sitting silent until the human types (ses_e72df2be, 2026-10-30).
+		 * HARD latches (task_complete tool, literal TASK COMPLETE) never expire, and
+		 * a latch that already re-opened once stays shut — no repeating nudges. */
+		function softLatchExpired(sid: string, w: SessionWatch, now: number): boolean {
+			if (!w.completionSignaled) return false
+			if (w.completionHard || w.latchReopened) return false
+			if (!w.completionSignaledAt) return false
+			if (now - w.completionSignaledAt < completionLatchTtlMs) return false
+			w.latchReopened = true
+			w.completionSignaled = false
+			w.completionSignaledAt = 0
+			w.pendingRecoveryArmed = true  // arms the delayed timer so self-check delivers
+			log(
+				"warn",
+				`${short(sid)} soft completion latch older than ${Math.round(completionLatchTtlMs / 1000)}s with no user message — re-opening once for a self-check`,
+			)
+			return true
+		}
+
 		function clearStalePermissionFlag(sid: string, w: SessionWatch) {
 			if (!w.permissionPending) return
 			if (w.permissionPendingAt && Date.now() - w.permissionPendingAt > PERMISSION_STALE_TTL_MS) {
@@ -2636,6 +2655,36 @@ export default define({
 			void recover(sid, `rate-limit cooldown served (rung ${rung + 1}/${ladder.length}, ${cooldownMin}m)`)
 		}
 
+		/** Shared quota guard: returns true if the session is rate-limited (caller should skip recovery). */
+		function quotaGuard(sid: string, w: SessionWatch, messages: unknown[]): boolean {
+			try {
+				const last = messages.length ? messages[messages.length - 1] : null
+				let qtype = ""
+				let qmsg = ""
+				if (last && msgRole(last) === "assistant") {
+					const qe = (last as { error?: unknown; info?: { error?: unknown } }).error ?? (last as { info?: { error?: unknown } }).info?.error
+					if (typeof qe === "string") qmsg = qe
+					else if (qe && typeof qe === "object") {
+						qtype = String((qe as { name?: unknown; type?: unknown }).name ?? (qe as { type?: unknown }).type ?? "")
+						qmsg = String((qe as { message?: unknown }).message ?? "")
+					}
+					const qtxt = lastAssistantTextFrom(messages)
+					if (qtxt) qmsg = qmsg ? `${qmsg} ${qtxt}` : qtxt
+				}
+				if (isRateLimitError(qtype, qmsg)) {
+					handleRateLimitFailure(sid, w, qtype, qmsg)
+					return true
+				}
+			} catch (e) {
+				dbg(`${short(sid)} quota guard failed: ${e instanceof Error ? e.message : String(e)}`)
+			}
+			if (w.awaitingQuotaRetry || w.rateLimitedAt > 0) {
+				dbg(`${short(sid)} quota-armed — skipping stall recover`)
+				return true
+			}
+			return false
+		}
+
 		function handleRateLimitFailure(sid: string, w: SessionWatch, errType: string, errMsg: string): void {
 			if (isPaused(sid)) {
 				dbg(`${short(sid)} paused — not arming quota ladder`)
@@ -2648,9 +2697,8 @@ export default define({
 			if (n >= ladder.length) {
 				w.awaitingQuotaRetry = false
 				log("warn", `${short(sid)} ${tag} budget exhausted (${ladder.length} attempts) — standing down until user turn`)
-				if (!w.quotaNoticedAt && Date.now() - w.lastQuotaNoticeAt > 100) {
+				if (!w.quotaNoticedAt) {
 					w.quotaNoticedAt = Date.now()
-					w.lastQuotaNoticeAt = Date.now()
 					void sendQuotaNotice(sid, `Rate limited — standing down until you return (budget exhausted after ${ladder.length} attempts).`)
 				}
 				return
@@ -2672,9 +2720,8 @@ export default define({
 			// User-visible twin of the stand-down: silence reads as dead
 			// (ses_edd3d940). One notice per episode (first arm only);
 			// resume:false so it never kicks a turn or re-arms budgets.
-			if (!w.quotaNoticedAt && Date.now() - w.lastQuotaNoticeAt > 100) {
+			if (!w.quotaNoticedAt) {
 				w.quotaNoticedAt = Date.now()
-				w.lastQuotaNoticeAt = Date.now()
 				const mins = Math.max(1, Math.round(waitMs / 60000))
 				const when = mins >= 60 ? `~${Math.floor(mins / 60)}h ${mins % 60}m` : `~${mins}m`
 				void sendQuotaNotice(sid, `Rate limited, retrying in ${when} (attempt ${n + 1}/${ladder.length}).`)
@@ -3413,7 +3460,6 @@ export default define({
 			const elapsed = w.lastActivityAt ? Math.round((Date.now() - w.lastActivityAt) / 1000) : 0
 			const hms = (n: number) =>
 				n < 60 ? `${n}s` : n < 3600 ? `${Math.floor(n / 60)}m ${n % 60}s` : `${Math.floor(n / 3600)}h ${Math.floor((n % 3600) / 60)}m`
-			const isRateLimitReason = /rate-limit/i.test(reason)
 			// Each fact exactly once: a "no activity for Ns" reason already states
 			// the silence, so adding "idle M:SS" repeats it (188s vs 3m 9s). And
 			// idle is only news for silence stalls: a dead stream is seconds old
@@ -3441,7 +3487,7 @@ export default define({
 			const retries = prospectiveRetries ?? w.workRetries
 			const head = [
 				isSilence ? null : reason,
-				isRateLimitReason ? null : `attempt ${Math.min(shown, maxRetries)}/${maxRetries} (retry #${retries})`,
+				/rate-limit/i.test(reason) ? null : `attempt ${Math.min(shown, maxRetries)}/${maxRetries} (retry #${retries})`,
 				isSilence ? `idle ${hms(elapsed)}` : null,
 				now,
 			]
@@ -3570,7 +3616,7 @@ export default define({
 			}
 			w.recovering = true
 			const attempt = providerFault ? Math.max(1, w.resumeAttempts) : w.resumeAttempts + 1
-			const delay = backoffMs(attempt, baseBackoff, maxBackoff)
+			const delay = Math.min(baseBackoff * 2 ** (attempt - 1), maxBackoff)
 			if (providerFault) {
 				log(
 					"info",
@@ -4553,6 +4599,7 @@ export default define({
 			if (w.completionSignaled) {
 				w.completionSignaled = false
 				w.completionSignaledAt = 0
+				w.latchReopened = false
 				dbg(`${short(sid)} genuine new user message — re-opening latched completion`)
 			}
 			// A genuine user message is a new episode for the stall ladder too
@@ -5044,6 +5091,7 @@ export default define({
 
 							w.completionSignaled = true
 							w.completionSignaledAt = Date.now()
+							w.completionHard = true
 							log("info", `${short(sid)} task_complete called, ${(await isSubAgentSession(sid)) ? "subagent" : "agent"} done`)
 							w.taskCompleteSignals++
 							if (w.taskCompleteSignals === 2) return { content: TASK_COMPLETE_REPEAT_WARNING }
@@ -5105,6 +5153,7 @@ export default define({
 					}
 					w.completionSignaled = true
 					w.completionSignaledAt = Date.now()
+					w.completionHard = true
 					w.taskCompleteSignals = 0
 					w.taskCompleteOverrides = 0
 					log("info", `${short(sid)} task_complete called, ${(await isSubAgentSession(sid)) ? "subagent" : "agent"} done`)
@@ -5204,6 +5253,7 @@ export default define({
 						if (open.length === 0 && !w.completionSignaled) {
 							w.completionSignaled = true
 							w.completionSignaledAt = Date.now()
+							w.completionHard = /\btask\s+complete(d)?\b[.!]*$/i.test(stripBoundaryMarkers(tailText).split("\n").map((l) => l.trim()).filter((l) => l.length > 0).pop() ?? "")
 							log("info", `${short(sid)} turn ends with a completion claim inside the activity window — latching completion, standing down`)
 						}
 					} else {
@@ -5268,6 +5318,7 @@ export default define({
 				if (!w.completionSignaled) {
 					w.completionSignaled = true
 					w.completionSignaledAt = Date.now()
+					w.completionHard = false
 					log("info", `${short(sid)} turn ends with a celebration and no open todos — latching completion, not nudging`)
 				} else {
 					dbg(`${short(sid)} completion already latched — skipping`)
@@ -5316,6 +5367,7 @@ export default define({
 				if (!w.completionSignaled) {
 					w.completionSignaled = true
 					w.completionSignaledAt = Date.now()
+					w.completionHard = /\btask\s+complete(d)?\b[.!]*$/i.test(stripBoundaryMarkers(text).split("\n").map((l) => l.trim()).filter((l) => l.length > 0).pop() ?? "")
 					log("info", `${short(sid)} turn ends with an explicit stop and no open todos — latching completion, not nudging`)
 				} else {
 					dbg(`${short(sid)} completion already latched — skipping`)
@@ -5947,7 +5999,10 @@ export default define({
 								if (w.lastGenuineUserAt > w.completionSignaledAt) {
 									w.completionSignaled = false
 									w.completionSignaledAt = 0
+									w.latchReopened = false
 									dbg(`${short(sid)} genuine new user message after latched completion — re-opening stall detection`)
+								} else if (softLatchExpired(sid, w, now)) {
+									dbg(`${short(sid)} soft completion latch expired — re-opening for one self-check`)
 								} else {
 									dbg(`${short(sid)} completion latched — skipping stall detection`)
 								}
@@ -5973,33 +6028,7 @@ export default define({
 										? Math.floor(Math.random() * STALL_JITTER_MS * 2) - STALL_JITTER_MS
 										: 0
 									if (silence >= baseInterval + jitter) {
-										// Quota guard for idle sessions: don't inject a stall nudge
-										// when the last assistant message carries a quota/usage error.
-										try {
-											const _qlast2 = history.length ? history[history.length - 1] : null
-											let _qtype2 = ""
-											let _qmsg2 = ""
-											if (_qlast2 && msgRole(_qlast2) === "assistant") {
-												const _qe2 = (_qlast2 as { error?: unknown; info?: { error?: unknown } }).error ?? (_qlast2 as { info?: { error?: unknown } }).info?.error
-												if (typeof _qe2 === "string") _qmsg2 = _qe2
-												else if (_qe2 && typeof _qe2 === "object") {
-													_qtype2 = String((_qe2 as { name?: unknown; type?: unknown }).name ?? (_qe2 as { type?: unknown }).type ?? "")
-													_qmsg2 = String((_qe2 as { message?: unknown }).message ?? "")
-												}
-												const _qtxt2 = lastAssistantTextFrom(history)
-												if (_qtxt2) _qmsg2 = _qmsg2 ? `${_qmsg2} ${_qtxt2}` : _qtxt2
-											}
-											if (isRateLimitError(_qtype2, _qmsg2)) {
-												handleRateLimitFailure(sid, w, _qtype2, _qmsg2)
-												continue
-											}
-										} catch (e) {
-											dbg(`${short(sid)} quota guard (idle) failed: ${e instanceof Error ? e.message : String(e)}`)
-										}
-										if (w.awaitingQuotaRetry || w.rateLimitedAt > 0) {
-											dbg(`${short(sid)} quota-armed — skipping stall recover`)
-											continue
-										}
+										if (quotaGuard(sid, w, history)) continue
 										await recover(sid, `no activity for ${Math.ceil(silence / 1000)}s`)
 									}
 								}
@@ -6043,7 +6072,10 @@ export default define({
 					if (w.lastGenuineUserAt > w.completionSignaledAt) {
 						w.completionSignaled = false
 						w.completionSignaledAt = 0
+						w.latchReopened = false
 						dbg(`${short(sid)} genuine new user message after latched completion — re-opening stall detection`)
+					} else if (softLatchExpired(sid, w, now)) {
+						dbg(`${short(sid)} soft completion latch expired — re-opening for one self-check`)
 					} else {
 						dbg(`${short(sid)} completion latched — skipping stall detection`)
 						continue
@@ -6218,35 +6250,8 @@ export default define({
 					// that even though the default policy refuses to.
 					await tryAbortAndResume(sid, w, true)
 				} else {
-					// Quota guard: if the last assistant message carries a quota/usage-limit
-					// error, treat it as a rate-limit failure (stand down + quota ladder)
-					// instead of injecting a stall-recovery prompt that will also fail.
-					try {
-						const _qm = await loadMessages(sid)
-						const _qlast = _qm.length ? _qm[_qm.length - 1] : null
-						let _qtype = ""
-						let _qmsg = ""
-						if (_qlast && msgRole(_qlast) === "assistant") {
-							const _qe = (_qlast as { error?: unknown; info?: { error?: unknown } }).error ?? (_qlast as { info?: { error?: unknown } }).info?.error
-							if (typeof _qe === "string") _qmsg = _qe
-							else if (_qe && typeof _qe === "object") {
-								_qtype = String((_qe as { name?: unknown; type?: unknown }).name ?? (_qe as { type?: unknown }).type ?? "")
-								_qmsg = String((_qe as { message?: unknown }).message ?? "")
-							}
-							const _qtxt = lastAssistantTextFrom(_qm)
-							if (_qtxt) _qmsg = _qmsg ? `${_qmsg} ${_qtxt}` : _qtxt
-						}
-						if (isRateLimitError(_qtype, _qmsg)) {
-							handleRateLimitFailure(sid, w, _qtype, _qmsg)
-							continue
-						}
-					} catch (e) {
-						dbg(`${short(sid)} quota guard failed: ${e instanceof Error ? e.message : String(e)}`)
-					}
-					if (w.awaitingQuotaRetry || w.rateLimitedAt > 0) {
-						dbg(`${short(sid)} quota-armed — skipping stall recover`)
-						continue
-					}
+					const _qm = await loadMessages(sid)
+					if (quotaGuard(sid, w, _qm)) continue
 					await recover(sid, `no activity for ${Math.ceil(silence / 1000)}s`)
 				}
 			}
@@ -6776,14 +6781,22 @@ export default define({
 							let ownRung = !providerRetryFresh && selfInjectFresh
 							if (ownRung) {
 								try {
-									for (const m of await loadMessages(sid)) {
-										if (
-											msgRole(m) === "user" &&
-											msgAt(m) > w.lastInjectAt
-										) {
-											ownRung = false
-											break
-										}
+									const hist = await loadMessages(sid)
+									for (const m of hist) {
+										if (msgRole(m) !== "user") continue
+										if (msgAt(m) <= w.lastInjectAt) continue
+										// Exclude our own prompts — they land
+										// shortly after the inject and must not
+										// be treated as a genuine user turn
+										// (which would reset the counter).
+										const text = messageTextOf(m)
+										const ownByText = typeof text === "string" && text.length > 0 && w.ownPromptTexts.includes(text)
+										const ownByShape = looksLikeOwnPrompt(text)
+										const ownByTime = msgAt(m) >= w.lastInjectAt && msgAt(m) - w.lastInjectAt < OWN_PROMPT_TIME_MS
+										const ownByTimeOnly = ownByTime && !(typeof text === "string" && text.length > 0)
+										if (ownByText || ownByShape || ownByTimeOnly) continue
+										ownRung = false
+										break
 									}
 								} catch {
 									// Fail closed: if the history cannot be read
