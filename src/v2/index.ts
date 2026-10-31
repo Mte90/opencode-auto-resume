@@ -207,9 +207,6 @@ interface SessionWatch {
 	 * explanation reads as broken (ses_edd3d940, 2026-10-10). */
 	quotaNoticedAt: number
 	gaveUp: boolean
-	/** Timestamp of the last quota notice sent (dedupes back-to-back duplicates
-	 * from concurrent event paths; 100ms window). */
-	lastQuotaNoticeAt: number
 	/** User-paused: auto-resume will not inject or arm quota for this session
 	 * until explicitly resumed. Persisted via the marker file + storage. */
 	paused: boolean
@@ -1357,20 +1354,7 @@ function turnEndsWithCompletionClaim(text: string): boolean {
 	return endsWithCelebration(text) || containsStopStatement(text)
 }
 
-/** A completion signal that does not depend on interpreting a stop phrase: the
- * model either called the task_complete tool, or the last line is the literal
- * TASK COMPLETE marker AGENTS.md requires. Only these may latch without a
- * self-check; every text heuristic stays soft and re-opens after
- * COMPLETION_LATCH_TTL_MS. */
-function isHardCompletionText(text: string): boolean {
-	const tail =
-		stripBoundaryMarkers(text)
-			.split("\n")
-			.map((l) => l.trim())
-			.filter((l) => l.length > 0)
-			.pop() ?? ""
-	return /\btask\s+complete(d)?\b[.!]*$/i.test(tail)
-}
+
 
 /**
  * True when a done-claim already carries a concrete work report.
@@ -2097,13 +2081,7 @@ export default define({
 		)
 
 		// Options accepted but not yet acted on, because the v2 feature they tune
-		// is not ported. Listed (not warned) so an existing v1 config stays valid
-		// and the gap is documented rather than surprising.
-		//
-		// Empty: every v1 option this build understands is now applied. Kept as a
-		// list rather than deleted because the accepted-but-inert= warning is the
-		// only thing a user has to go on when an option is quietly ignored — so
-		// the next one that arrives has somewhere to be listed.
+		// is not ported. Listed (not warned) so an existing v1 config stays valid.
 		const FEATURE_GATED_OPTIONS = [] as const
 
 		// Options this build understands. Anything else in the user's config is
@@ -2285,7 +2263,6 @@ export default define({
 					providerRetryAt: 0,
 					quotaNoticedAt: 0,
 					gaveUp: false,
-					lastQuotaNoticeAt: 0,
 					paused: false,
 					lastGenuineUserAt: 0,
 					consecFailureRecovers: 0,
@@ -2386,25 +2363,17 @@ export default define({
 		// ---- Pause / resume (user-controlled) ---------------------------------
 		// Source of truth: a marker file listing paused session ids (one per line)
 		// or "*" for all. Written by the CLI helper and the /auto-resume command.
-		let pausedCacheMtime = 0
-		let pausedCacheSet: Set<string> = new Set()
 		function readPausedSet(): Set<string> {
 			try {
-				const st = statSync(PAUSED_MARKER_FILE)
-				if (st.mtimeMs === pausedCacheMtime) return pausedCacheSet
-				pausedCacheMtime = st.mtimeMs
 				const raw = readFileSync(PAUSED_MARKER_FILE, "utf8")
 				const s = new Set<string>()
 				for (const line of raw.split(/\r?\n/)) {
 					const t = line.trim()
 					if (t) s.add(t)
 				}
-				pausedCacheSet = s
 				return s
 			} catch {
-				pausedCacheMtime = 0
-				pausedCacheSet = new Set()
-				return pausedCacheSet
+				return new Set<string>()
 			}
 		}
 		function isPaused(sid: string): boolean {
@@ -2420,7 +2389,6 @@ export default define({
 			} catch {}
 			try {
 				writeFileSync(PAUSED_MARKER_FILE, [...s].join("\n") + (s.size ? "\n" : ""), "utf8")
-				pausedCacheMtime = 0
 			} catch (e) {
 				dbg(`${short(sid)} pause write failed: ${e instanceof Error ? e.message : String(e)}`)
 			}
@@ -2565,12 +2533,7 @@ export default define({
 			w.latchReopened = true
 			w.completionSignaled = false
 			w.completionSignaledAt = 0
-			// The re-opened session must be allowed to receive the self-check: the
-			// injected nudge goes through a delayed timer whose idle-state guard
-			// drops the injection unless a recovery is armed (the same flag the
-			// failed-turn path sets before recover()). Without it the detection
-			// re-arms every tick and nothing is ever delivered.
-			w.pendingRecoveryArmed = true
+			w.pendingRecoveryArmed = true  // arms the delayed timer so self-check delivers
 			log(
 				"warn",
 				`${short(sid)} soft completion latch older than ${Math.round(completionLatchTtlMs / 1000)}s with no user message — re-opening once for a self-check`,
@@ -2692,6 +2655,36 @@ export default define({
 			void recover(sid, `rate-limit cooldown served (rung ${rung + 1}/${ladder.length}, ${cooldownMin}m)`)
 		}
 
+		/** Shared quota guard: returns true if the session is rate-limited (caller should skip recovery). */
+		function quotaGuard(sid: string, w: SessionWatch, messages: unknown[]): boolean {
+			try {
+				const last = messages.length ? messages[messages.length - 1] : null
+				let qtype = ""
+				let qmsg = ""
+				if (last && msgRole(last) === "assistant") {
+					const qe = (last as { error?: unknown; info?: { error?: unknown } }).error ?? (last as { info?: { error?: unknown } }).info?.error
+					if (typeof qe === "string") qmsg = qe
+					else if (qe && typeof qe === "object") {
+						qtype = String((qe as { name?: unknown; type?: unknown }).name ?? (qe as { type?: unknown }).type ?? "")
+						qmsg = String((qe as { message?: unknown }).message ?? "")
+					}
+					const qtxt = lastAssistantTextFrom(messages)
+					if (qtxt) qmsg = qmsg ? `${qmsg} ${qtxt}` : qtxt
+				}
+				if (isRateLimitError(qtype, qmsg)) {
+					handleRateLimitFailure(sid, w, qtype, qmsg)
+					return true
+				}
+			} catch (e) {
+				dbg(`${short(sid)} quota guard failed: ${e instanceof Error ? e.message : String(e)}`)
+			}
+			if (w.awaitingQuotaRetry || w.rateLimitedAt > 0) {
+				dbg(`${short(sid)} quota-armed — skipping stall recover`)
+				return true
+			}
+			return false
+		}
+
 		function handleRateLimitFailure(sid: string, w: SessionWatch, errType: string, errMsg: string): void {
 			if (isPaused(sid)) {
 				dbg(`${short(sid)} paused — not arming quota ladder`)
@@ -2704,9 +2697,8 @@ export default define({
 			if (n >= ladder.length) {
 				w.awaitingQuotaRetry = false
 				log("warn", `${short(sid)} ${tag} budget exhausted (${ladder.length} attempts) — standing down until user turn`)
-				if (!w.quotaNoticedAt && Date.now() - w.lastQuotaNoticeAt > 100) {
+				if (!w.quotaNoticedAt) {
 					w.quotaNoticedAt = Date.now()
-					w.lastQuotaNoticeAt = Date.now()
 					void sendQuotaNotice(sid, `Rate limited — standing down until you return (budget exhausted after ${ladder.length} attempts).`)
 				}
 				return
@@ -2728,9 +2720,8 @@ export default define({
 			// User-visible twin of the stand-down: silence reads as dead
 			// (ses_edd3d940). One notice per episode (first arm only);
 			// resume:false so it never kicks a turn or re-arms budgets.
-			if (!w.quotaNoticedAt && Date.now() - w.lastQuotaNoticeAt > 100) {
+			if (!w.quotaNoticedAt) {
 				w.quotaNoticedAt = Date.now()
-				w.lastQuotaNoticeAt = Date.now()
 				const mins = Math.max(1, Math.round(waitMs / 60000))
 				const when = mins >= 60 ? `~${Math.floor(mins / 60)}h ${mins % 60}m` : `~${mins}m`
 				void sendQuotaNotice(sid, `Rate limited, retrying in ${when} (attempt ${n + 1}/${ladder.length}).`)
@@ -3469,7 +3460,6 @@ export default define({
 			const elapsed = w.lastActivityAt ? Math.round((Date.now() - w.lastActivityAt) / 1000) : 0
 			const hms = (n: number) =>
 				n < 60 ? `${n}s` : n < 3600 ? `${Math.floor(n / 60)}m ${n % 60}s` : `${Math.floor(n / 3600)}h ${Math.floor((n % 3600) / 60)}m`
-			const isRateLimitReason = /rate-limit/i.test(reason)
 			// Each fact exactly once: a "no activity for Ns" reason already states
 			// the silence, so adding "idle M:SS" repeats it (188s vs 3m 9s). And
 			// idle is only news for silence stalls: a dead stream is seconds old
@@ -3497,7 +3487,7 @@ export default define({
 			const retries = prospectiveRetries ?? w.workRetries
 			const head = [
 				isSilence ? null : reason,
-				isRateLimitReason ? null : `attempt ${Math.min(shown, maxRetries)}/${maxRetries} (retry #${retries})`,
+				/rate-limit/i.test(reason) ? null : `attempt ${Math.min(shown, maxRetries)}/${maxRetries} (retry #${retries})`,
 				isSilence ? `idle ${hms(elapsed)}` : null,
 				now,
 			]
@@ -5263,7 +5253,7 @@ export default define({
 						if (open.length === 0 && !w.completionSignaled) {
 							w.completionSignaled = true
 							w.completionSignaledAt = Date.now()
-							w.completionHard = isHardCompletionText(tailText)
+							w.completionHard = /\btask\s+complete(d)?\b[.!]*$/i.test(stripBoundaryMarkers(tailText).split("\n").map((l) => l.trim()).filter((l) => l.length > 0).pop() ?? "")
 							log("info", `${short(sid)} turn ends with a completion claim inside the activity window — latching completion, standing down`)
 						}
 					} else {
@@ -5377,7 +5367,7 @@ export default define({
 				if (!w.completionSignaled) {
 					w.completionSignaled = true
 					w.completionSignaledAt = Date.now()
-					w.completionHard = isHardCompletionText(text)
+					w.completionHard = /\btask\s+complete(d)?\b[.!]*$/i.test(stripBoundaryMarkers(text).split("\n").map((l) => l.trim()).filter((l) => l.length > 0).pop() ?? "")
 					log("info", `${short(sid)} turn ends with an explicit stop and no open todos — latching completion, not nudging`)
 				} else {
 					dbg(`${short(sid)} completion already latched — skipping`)
@@ -6038,33 +6028,7 @@ export default define({
 										? Math.floor(Math.random() * STALL_JITTER_MS * 2) - STALL_JITTER_MS
 										: 0
 									if (silence >= baseInterval + jitter) {
-										// Quota guard for idle sessions: don't inject a stall nudge
-										// when the last assistant message carries a quota/usage error.
-										try {
-											const _qlast2 = history.length ? history[history.length - 1] : null
-											let _qtype2 = ""
-											let _qmsg2 = ""
-											if (_qlast2 && msgRole(_qlast2) === "assistant") {
-												const _qe2 = (_qlast2 as { error?: unknown; info?: { error?: unknown } }).error ?? (_qlast2 as { info?: { error?: unknown } }).info?.error
-												if (typeof _qe2 === "string") _qmsg2 = _qe2
-												else if (_qe2 && typeof _qe2 === "object") {
-													_qtype2 = String((_qe2 as { name?: unknown; type?: unknown }).name ?? (_qe2 as { type?: unknown }).type ?? "")
-													_qmsg2 = String((_qe2 as { message?: unknown }).message ?? "")
-												}
-												const _qtxt2 = lastAssistantTextFrom(history)
-												if (_qtxt2) _qmsg2 = _qmsg2 ? `${_qmsg2} ${_qtxt2}` : _qtxt2
-											}
-											if (isRateLimitError(_qtype2, _qmsg2)) {
-												handleRateLimitFailure(sid, w, _qtype2, _qmsg2)
-												continue
-											}
-										} catch (e) {
-											dbg(`${short(sid)} quota guard (idle) failed: ${e instanceof Error ? e.message : String(e)}`)
-										}
-										if (w.awaitingQuotaRetry || w.rateLimitedAt > 0) {
-											dbg(`${short(sid)} quota-armed — skipping stall recover`)
-											continue
-										}
+										if (quotaGuard(sid, w, history)) continue
 										await recover(sid, `no activity for ${Math.ceil(silence / 1000)}s`)
 									}
 								}
@@ -6286,35 +6250,8 @@ export default define({
 					// that even though the default policy refuses to.
 					await tryAbortAndResume(sid, w, true)
 				} else {
-					// Quota guard: if the last assistant message carries a quota/usage-limit
-					// error, treat it as a rate-limit failure (stand down + quota ladder)
-					// instead of injecting a stall-recovery prompt that will also fail.
-					try {
-						const _qm = await loadMessages(sid)
-						const _qlast = _qm.length ? _qm[_qm.length - 1] : null
-						let _qtype = ""
-						let _qmsg = ""
-						if (_qlast && msgRole(_qlast) === "assistant") {
-							const _qe = (_qlast as { error?: unknown; info?: { error?: unknown } }).error ?? (_qlast as { info?: { error?: unknown } }).info?.error
-							if (typeof _qe === "string") _qmsg = _qe
-							else if (_qe && typeof _qe === "object") {
-								_qtype = String((_qe as { name?: unknown; type?: unknown }).name ?? (_qe as { type?: unknown }).type ?? "")
-								_qmsg = String((_qe as { message?: unknown }).message ?? "")
-							}
-							const _qtxt = lastAssistantTextFrom(_qm)
-							if (_qtxt) _qmsg = _qmsg ? `${_qmsg} ${_qtxt}` : _qtxt
-						}
-						if (isRateLimitError(_qtype, _qmsg)) {
-							handleRateLimitFailure(sid, w, _qtype, _qmsg)
-							continue
-						}
-					} catch (e) {
-						dbg(`${short(sid)} quota guard failed: ${e instanceof Error ? e.message : String(e)}`)
-					}
-					if (w.awaitingQuotaRetry || w.rateLimitedAt > 0) {
-						dbg(`${short(sid)} quota-armed — skipping stall recover`)
-						continue
-					}
+					const _qm = await loadMessages(sid)
+					if (quotaGuard(sid, w, _qm)) continue
 					await recover(sid, `no activity for ${Math.ceil(silence / 1000)}s`)
 				}
 			}
