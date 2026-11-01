@@ -3486,8 +3486,8 @@ export default define({
 			const shown = providerFault ? attempt : attempt
 			const retries = prospectiveRetries ?? w.workRetries
 			const head = [
-				isSilence ? null : reason,
 				/rate-limit/i.test(reason) ? null : `attempt ${Math.min(shown, maxRetries)}/${maxRetries} (retry #${retries})`,
+				isSilence ? null : reason,
 				isSilence ? `idle ${hms(elapsed)}` : null,
 				now,
 			]
