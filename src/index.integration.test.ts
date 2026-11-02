@@ -1529,7 +1529,7 @@ describe("WP-10: Fault Injection Tests - Edge Cases & Race Conditions", () => {
             expect(logCalls.filter((l) => l.message.includes("-> busy")).length).toBeGreaterThanOrEqual(2)
         })
 
-        test("abort fails during escalation - resumeAttempts untouched, gaveUp not set", async () => {
+        test("abort fails during escalation - gaveUp latches and blocks further recovery", async () => {
             const { ctx, logCalls, promptCalls, abortCalls } = createFaultContext({ abortFails: true })
             const hooks = await AutoResumePlugin(ctx, { ...FAULT_FAST, toolTextCheckDelayMs: 40, maxRecoveryRetries: 1 } as any)
             const sid = "ses_escal"
@@ -1541,17 +1541,18 @@ describe("WP-10: Fault Injection Tests - Edge Cases & Race Conditions", () => {
             const failed = await waitFor(() => hasLog(logCalls, "warn", "abort failed"), 3000)
             expect(failed).toBe(true)
             expect(hasLog(logCalls, "warn", "Recovery exhausted on")).toBe(true)
-            expect(hasLog(logCalls, "warn", "gaveUp")).toBe(false)
             expect(hasLog(logCalls, "warn", "orphan retries exhausted")).toBe(false)
             expect(hasLog(logCalls, "warn", "all 3 retries exhausted")).toBe(false)
 
-            // gaveUp was NOT set: a fresh recovery cycle still triggers
+            // gaveUp is latched true after abort+resume fails. A busy transition does NOT reset it
+            // (Bug 2 fix: resetBusyFlags no longer clears gaveUp). So a fresh recovery cycle
+            // should be blocked by the gaveUp guard in sendContinuePrompt.
             await busy(hooks, sid)
             await streamFail(hooks, sid)
             await idle(hooks, sid)
             const before = promptCalls.length
-            const second = await waitFor(() => promptCalls.length > before, 3000)
-            expect(second).toBe(true)
+            await wait(1000) // Wait for any potential recovery
+            expect(promptCalls.length).toBe(before) // No second prompt sent
             expect(abortCalls.length).toBe(1)
         })
     })

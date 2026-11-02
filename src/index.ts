@@ -67,6 +67,13 @@ export interface SessionWatch {
     pendingRecoveryReason: string | null
     pendingRecoveryAt: number
     recoveryAttempts: number
+    // True between sending a recovery "continue" (pending-recovery or
+    // watchdog-retry path) and the resulting busy event. sendContinuePrompt's
+    // finally clears w.continuing before the busy event lands, so this flag
+    // survives it and marks a successful recovery: the busy handler resets
+    // recoveryAttempts only then. abort+resume continues set it false, so the
+    // counter accumulates toward maxRecoveryRetries (WP-10).
+    recoveryContinueInFlight: boolean
     watchdogRetryGuard: boolean
     unknownToolErrors: Map<string, number>
     unknownToolSuggestionSent: boolean
@@ -708,6 +715,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 pendingRecoveryReason: null,
                 pendingRecoveryAt: 0,
                 recoveryAttempts: 0,
+                recoveryContinueInFlight: false,
                 watchdogRetryGuard: false,
                 unknownToolErrors: new Map(),
                 unknownToolSuggestionSent: false,
@@ -883,8 +891,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         // Hard stop (choke point): once this session's recovery cycle has given up,
         // refuse to send ANY further continue prompt, from any code path. This
         // guarantees the jinja/ECONNREFUSED continue-loop cannot run from any
-        // entry point. Re-arms only on a genuine new user message
-        // (resetSessionFlags / resetBusyFlags clear gaveUp).
+        // entry point. Re-arms only on a genuine new user message (resetSessionFlags clears gaveUp).
         if (w.gaveUp) {
             await log("debug", `${short(sid)} - gaveUp latched, refusing further continue prompts`)
             return
@@ -1012,6 +1019,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         const retryBackoffMs = backoffMs(w.recoveryAttempts, baseBackoffMs, maxBackoffMs)
                         await log("info", `Retrying recovery on ${short(sid)}: attempt=${w.recoveryAttempts}, backoffMs=${retryBackoffMs}`)
                         dbg(`Retrying recovery on ${short(sid)}: recoveryAttempts=${w.recoveryAttempts}, backoffMs=${retryBackoffMs}, pendingRecoveryReason=${w.pendingRecoveryReason}`)
+                        w.recoveryContinueInFlight = true
                         try {
                             await sendContinuePrompt(sid, continuePrompt, w)
                         } catch (err) {
@@ -1552,15 +1560,14 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         w.pendingRecoveryReason = null
         w.pendingRecoveryAt = 0
         w.recoveryAttempts = 0
+        w.recoveryContinueInFlight = false
         w.watchdogRetryGuard = false
     }
 
     function resetBusyFlags(w: SessionWatch) {
-        w.resumeAttempts = 0
         w.lastRetryAt = 0
         w.pendingTools = 0
         w.pendingCommands = 0
-        w.gaveUp = false
         w.orphanWatchStartAt = null
         w.aborting = false
         w.toolTextRecovered = false
@@ -1575,11 +1582,15 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         w.pendingRecovery = false
         w.pendingRecoveryReason = null
         w.pendingRecoveryAt = 0
-        w.recoveryAttempts = 0
+        w.recoveryContinueInFlight = false
         w.watchdogRetryGuard = false
         if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
         // Reset nudge budget on each genuine new busy→work cycle (user prompt or agent re-engagement after nudge)
         w.todoNudgeAttempts = 0
+        // PRESERVE: resumeAttempts, gaveUp, recoveryAttempts — these accumulate
+        // across busy transitions until maxRetries/maxRecoveryRetries is hit,
+        // then latch gaveUp=true to hard-stop the loop. Reset only on genuine
+        // user messages (resetSessionFlags clears them).
         // PRESERVE doneClaimNoTodosAttempts: re-armed only by an inbound user
         // message (genuine new work cycle). Resetting it here let the
         // done-claim-no-todos prompt refire unboundedly across cycles (#26).
@@ -2028,6 +2039,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         if (w.userCancelled || w.completionSignaled) return false
         if (w.aborting) return false
         if (w.oocLocked) return false
+        w.aborting = true
 
         const idleSec = Math.round((Date.now() - (w.orphanWatchStartAt ?? w.lastActivityAt)) / 1000)
         await log("info", `Abort+Resume on ${short(sid)} (${idleSec}s idle). Aborting...`)
@@ -2060,6 +2072,10 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         }
 
         try {
+            // abort+resume is NOT a recovery continue: the counter must
+            // accumulate toward maxRecoveryRetries, not reset on the next
+            // busy event (WP-10).
+            w.recoveryContinueInFlight = false
             await sendContinuePrompt(sid, continuePrompt, w)
             await log("info", `${short(sid)} - abort+continue done`)
             w.orphanWatchStartAt = null
@@ -2340,6 +2356,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     dbg(`State transition on ${short(sid)}: recoveryAttempts=${w.recoveryAttempts - 1} -> ${w.recoveryAttempts}`)
                     // Keep pendingRecovery armed: the deferred watchdog (WP-05)
                     // verifies this recovery and retries/escalates on failure.
+                    w.recoveryContinueInFlight = true
                     try {
                         await sendContinuePrompt(sid, continuePrompt, w)
                     } catch (err) {
@@ -2450,12 +2467,22 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     if (w.pendingRecovery) {
                         dbg(`Pending recovery cleared on ${short(sid)}: reason=session-busy`)
                     }
-                    // A recovery "continue" prompt accepted by the server flips the
-                    // session to busy while w.continuing is latched. Resetting the
-                    // resume counter here (old behavior) zeroed resumeAttempts on
-                    // every recovery, so a session that kept failing (e.g. an
-                    // unfixable OOC 400) recovered forever. Preserve the counter
-                    // when this busy transition is caused by our own recovery prompt.
+                    // A recovery "continue" prompt accepted by the server flips
+                    // the session to busy. sendContinuePrompt's finally clears
+                    // w.continuing before this event lands, so the flag is
+                    // already false here. recoveryContinueInFlight survives
+                    // the finally: it is latched by the pending-recovery and
+                    // watchdog-retry paths (NOT by abort+resume), so a busy
+                    // transition caused by a successful recovery continue
+                    // resets recoveryAttempts and lets a future independent
+                    // failure start a new cycle (WP-09). abort+resume
+                    // continues leave the flag false, so the counter
+                    // accumulates toward maxRecoveryRetries (WP-10).
+                    if (w.recoveryContinueInFlight) {
+                        w.recoveryAttempts = 0
+                        w.recoveryContinueInFlight = false
+                        dbg(`Recovery succeeded on ${short(sid)}: recoveryAttempts reset to 0`)
+                    }
                     if (w.continuing) {
                         dbg(`busy on ${short(sid)} via recovery prompt - preserving resumeAttempts=${w.resumeAttempts} gaveUp=${w.gaveUp}`)
                     } else {
