@@ -4,6 +4,20 @@ import { capturePluginLogs } from "./v2/test-utils"
 import pkg from "./../package.json"
 
 describe("dispatch.ts — dual-shape plugin entry", () => {
+    function createServiceCtx(): any {
+        return {
+            options: {},
+            agent: { transform: () => {}, reload: async () => {} },
+            aisdk: { sdk: () => {}, language: () => {} },
+            catalog: { transform: () => {}, reload: async () => {} },
+            command: { transform: () => {}, reload: async () => {} },
+            integration: { transform: () => {}, reload: async () => {} },
+            plugin: { add: async () => {}, remove: async () => {} },
+            reference: { transform: () => {}, reload: async () => {} },
+            skill: { transform: () => {}, reload: async () => {} },
+        }
+    }
+
     describe("shape contract", () => {
         test("dispatcher.id is a string", () => {
             expect(typeof dispatcher.id).toBe("string")
@@ -17,6 +31,36 @@ describe("dispatch.ts — dual-shape plugin entry", () => {
         test("dispatcher.setup is a function", () => {
             expect(typeof dispatcher.setup).toBe("function")
         })
+    })
+
+    describe("service-only setup context (opencode 1.19.x dual loader)", () => {
+        // Runs before any v1-shaped test in this file, so v1LoaderRan is
+        // still false and the deferred check must fire exactly once.
+        test("setup() with a service-only ctx warns NOT active after the check window when no server() loader ran", async () => {
+            const capture = capturePluginLogs()
+            const disposed = await (dispatcher.setup as any)(createServiceCtx())
+            disposed()
+
+            const leftOpen = await (dispatcher.setup as any)(createServiceCtx())
+            expect(typeof leftOpen).toBe("function")
+
+            await new Promise((r) => setTimeout(r, 5600))
+
+            try {
+                const notes = capture.lines.filter((l: string) =>
+                    l.includes("config-plugin API detected"),
+                )
+                expect(notes.length).toBe(0)
+
+                const warns = capture.warns.filter((l: string) =>
+                    l.includes("auto-resume is NOT active"),
+                )
+                expect(warns.length).toBe(1)
+                expect(warns[0]).toContain(`v${pkg.version}`)
+            } finally {
+                capture.stop()
+            }
+        }, 12000)
     })
 
     describe(".server delegates to the v1 build", () => {
@@ -319,46 +363,26 @@ describe("dispatch.ts — dual-shape plugin entry", () => {
             }
         })
 
-        test("setup() with the opencode 1.19.5 v2 config-plugin ctx stays inert without claiming the plugin is disabled", async () => {
+        test("setup() with the opencode 1.19.x service ctx stays silent while the v1 server() loader is active", async () => {
             const capture = capturePluginLogs()
 
-            // opencode 1.19.5 calls setup() with the v2 config-plugin context
-            // (service domains only: no event stream, no client) *in addition
-            // to* the legacy server() loader that runs the v1 build.
-            const ctx: any = {
-                options: {},
-                agent: { transform: () => {}, reload: async () => {} },
-                aisdk: { sdk: () => {}, language: () => {} },
-                catalog: { transform: () => {}, reload: async () => {} },
-                command: { transform: () => {}, reload: async () => {} },
-                integration: { transform: () => {}, reload: async () => {} },
-                plugin: { add: async () => {}, remove: async () => {} },
-                reference: { transform: () => {}, reload: async () => {} },
-                skill: { transform: () => {}, reload: async () => {} },
-            }
+            // The v1-shaped tests above already ran the v1 path, so
+            // v1LoaderRan is true — mirroring a real 1.19.x host where both
+            // loaders run in one process. No line of any kind may appear,
+            // even after the deferred check window closes.
+            const cleanup = await (dispatcher.setup as any)(createServiceCtx())
+            expect(typeof cleanup).toBe("function")
 
-            const cleanup = await (dispatcher.setup as any)(ctx)
+            await new Promise((r) => setTimeout(r, 5600))
 
             try {
-                expect(typeof cleanup).toBe("function")
                 expect(() => cleanup()).not.toThrow()
-
-                const disabled = capture.warns.filter((l: string) =>
-                    l.includes("unrecognised host context") || l.includes("Plugin disabled"),
-                )
-                expect(disabled.length).toBe(0)
+                expect(capture.lines.length).toBe(0)
                 expect(capture.warns.length).toBe(0)
-
-                const notes = capture.lines.filter((l: string) =>
-                    l.includes("v2 config-plugin API detected"),
-                )
-                expect(notes.length).toBe(1)
-                expect(notes[0]).toContain(`v${pkg.version}`)
-                expect(notes[0]).toContain("server() loader")
             } finally {
                 capture.stop()
             }
-        })
+        }, 12000)
 
         test("setup() with an unrecognised ctx warns and returns an inert dispose", async () => {
             const capture = capturePluginLogs()
