@@ -238,6 +238,10 @@ _Motivated by:_
 - [#33050](https://github.com/anomalyco/opencode/issues/33050) — orphaned sessions continue looping after abort, causing sustained high CPU
 - [#32335](https://github.com/anomalyco/opencode/issues/32335) — opencode run processes don't exit after completing scheduled work, causing memory leak
 
+#### Subagent dead response
+
+A child that finishes idle with a provider error, or with an empty finish (no text, no tool call), leaves its parent waiting on a result that will never arrive. The plugin detects the dead child on its own idle event and sends one targeted recovery prompt to that child, then hands back to the parent-side orphan watch. This applies to both builds: v1 reads the child's message history through the SDK; v2 reads the graph messages on the child session. Handling is suppressed when the child was cancelled by the user, already signalled completion, gave up, is waiting on a permission, is compacting, is mid-recovery, or when the plugin itself aborted it. Only the current turn counts — an error or empty finish before a newer user message is history, not a dead child. One prompt per episode; a genuine new user message re-arms it. Log line: `subagent error <reason> — sending one recovery prompt` or `subagent empty finish=<reason> — sending one recovery prompt` (v1 prefixes the short id with ` - `).
+
 #### Subagent stuck detection
 
 Detects when a subagent hasn't received new text for >1 minute (or >3 minutes if a tool call is in progress). If stuck, sends a recovery prompt to the subagent before triggering abort+resume on the parent. This avoids killing a parent that merely has a slow child.
@@ -404,7 +408,7 @@ All recovery paths fall into three families. Which family fires determines what 
 
 Fire only after OpenCode reports the session **idle** — the runner has exited. The prompt starts a new run.
 
-Paths: todo nudges, tool-call-as-text recovery, thinking-tool recovery, action-intent nudge, ready-to-continue, done-claim verification, streaming-failure recovery, silent dead-stream recovery, context-saturation routing (magic-context-gated; parent sessions use `session.command`, subagents use opt-in native `session.summarize`).
+Paths: todo nudges, tool-call-as-text recovery, thinking-tool recovery, action-intent nudge, ready-to-continue, done-claim verification, streaming-failure recovery, silent dead-stream recovery, subagent dead-response recovery, context-saturation routing (magic-context-gated; parent sessions use `session.command`, subagents use opt-in native `session.summarize`).
 
 ### 2. Busy-silence continue (stream stall)
 
@@ -424,7 +428,6 @@ Aborts the active run, then continues. The only family that can unblock a live r
 
 Paths: orphan parent, subagent stuck (parent side), hallucination loop, streaming-failure escalation. All aborts pass the active-tool guards first, and plugin-initiated aborts are marked so they are not mistaken for user ESC (`session.error` → `MessageAbortedError` race).
 
-<<<<<<< HEAD
 ## Architecture
 
 
@@ -433,6 +436,8 @@ Paths: orphan parent, subagent stuck (parent side), hallucination loop, streamin
 To verify the plugin is loaded, run `/status` inside OpenCode — it lists all loaded plugins and their versions. You should see `opencode-auto-resume` in the list.
 
 On v2 a clean load writes nothing at startup: warnings and recovery lines go to the server process output, not a file, and there is no ready banner. To confirm the config reached the plugin, trigger any recovery — every action is logged to the process output.
+
+On v1 every startup line carries the loaded build version (`opencode-auto-resume ready (vX.Y.Z)`, `opencode-auto-resume config OK (vX.Y.Z)`), and diagnostics are prefixed `[auto-resume vX.Y.Z]`. opencode 1.19.5 and later run two plugin loaders: the v1 `server()` loader and the v2 config-plugin `setup()` loader. The setup context has service domains only — no event stream and no client — so the plugin cannot recover sessions from it. The dispatcher detects that shape, logs `opencode v2 config-plugin API detected ... this setup() call is inert`, and leaves the v1 copy loaded through `server()` active. The `ready (vX.Y.Z)` line is the proof the active copy is running.
 
 | Problem | Solution |
 |---|---|
@@ -446,6 +451,7 @@ On v2 a clean load writes nothing at startup: warnings and recovery lines go to 
 | Long-running tool killed | Should not happen — active-tool guard prevents it. Report a bug. |
 | No plugin activity in the log | The entry is not in a location opencode scans, or not listed in `plugins`; fix the config and restart opencode. |
 | Log says `ctx.app.version is missing` (or `ctx.serverUrl is missing` on v1) | The build was loaded on the wrong server generation. The plugin disables itself with this diagnostic instead of crashing. Update the npm package (the universal entry auto-selects the branch by context shape) or match the build file to the server. |
+| Log says `opencode v2 config-plugin API detected` or `this setup() call is inert` | Expected on opencode 1.19.5+. Its second loader calls `setup()` with a service-only context; the v1 `server()` copy still handles recovery. Confirm the `opencode-auto-resume ready (vX.Y.Z)` startup line. If you instead see `unrecognised host context`, the host shape is unsupported. |
 | Never recovers a parent waiting on a subagent | Intentional: parent sessions blocked on a running subagent are left alone. |
 | Never recovers while a permission dialog is open | Intentional: recovery is held until the permission is answered. |
 | Recovers but you don't see a notice (v2) | Your model/provider may reject `session.synthetic()`; the plugin falls back to `session.prompt()` (no TUI banner). |

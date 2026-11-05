@@ -1,5 +1,6 @@
 import { describe, test, expect, mock } from "bun:test"
 import { AutoResumePlugin } from "./index"
+import pkg from "../package.json"
 
 type PromptCall = { sid: string; body: string }
 
@@ -100,6 +101,7 @@ describe("build/server mismatch guard", () => {
             // Assert the warning was emitted with the exact substring
             expect(warns.length).toBe(1)
             expect(warns[0]).toContain("ctx.serverUrl is missing")
+            expect(warns[0]).toContain(`v${pkg.version}`)
             expect(warns[0]).toContain("opencode v1")
             expect(warns[0]).toContain("README")
 

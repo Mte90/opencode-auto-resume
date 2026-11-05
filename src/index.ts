@@ -6,6 +6,9 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import type { SessionPromptResponses } from "@opencode-ai/sdk"
+import pkg from "../package.json"
+
+const PLUGIN_VERSION = pkg.version
 
 interface Todo {
     content: string
@@ -49,6 +52,9 @@ export interface SessionWatch {
     contextWrapupAttempts: number
     toolLoopAttempts: number
     isSubagent: boolean
+    // One targeted recovery prompt per dead subagent episode. Reset only by a
+    // genuine new user/task message, never by the busy transition it triggers.
+    subagentRecoveryTried: boolean
     completionSignaled: boolean
     todoNudgeAttempts: number
     taskCompleteOverrides: number
@@ -527,7 +533,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     // surfaces only an opaque API error, so the warning goes straight to the
     // console and cannot depend on log().
     if (!(ctx as any).serverUrl) {
-        console.warn("[auto-resume] this looks like the opencode v1 build running on the wrong server: ctx.serverUrl is missing. The v1 bundle requires opencode v1 — update the plugin package (the npm build auto-selects per server) or load the build matching your server; see the README on npm (opencode-auto-resume).")
+        console.warn(`[auto-resume v${PLUGIN_VERSION}] this looks like the opencode v1 build running on the wrong server: ctx.serverUrl is missing. The v1 bundle requires opencode v1 — update the plugin package (the npm build auto-selects per server) or load the build matching your server; see the README on npm (opencode-auto-resume).`)
         // Abort inertly instead of wiring the recovery pipeline against a
         // foreign server: hooks exist and are callable, but nothing listens
         // (no task_complete tool, no ready log, no handlers).
@@ -703,6 +709,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 contextWrapupAttempts: 0,
                 toolLoopAttempts: 0,
                 isSubagent: false,
+                subagentRecoveryTried: false,
                 completionSignaled: false,
                 todoNudgeAttempts: 0,
                 taskCompleteOverrides: 0,
@@ -1214,6 +1221,61 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         return (msg.role as string) ?? ((msg.info as Record<string, unknown> | undefined)?.role as string)
     }
 
+    /**
+     * The failure shape a dead subagent leaves behind: an explicit error on its
+     * newest assistant message, or a finished turn that delivered no text and
+     * no tool call. The token floor used for parents does not apply here — a
+     * child that finished with zero output has nothing to report either way.
+     */
+    function getSubagentResponseFailure(
+        messages: Array<Record<string, unknown>>,
+    ): { kind: "error" | "empty"; detail: string } | null {
+        // Only the current turn counts: an error or empty finish from an older
+        // turn is already history once a newer user message arrived.
+        let lastUser = -1
+        for (let i = messages.length - 1; i >= 0; i--) {
+            if (roleOf(messages[i]) === "user") {
+                lastUser = i
+                break
+            }
+        }
+        const turn = lastUser >= 0 ? messages.slice(lastUser + 1) : messages
+
+        const error = getLastAssistantError(turn)
+        if (error) {
+            const detail = [error.name, error.message].filter(Boolean).join(": ") || "error"
+            return { kind: "error", detail }
+        }
+
+        for (let i = turn.length - 1; i >= 0; i--) {
+            const msg = turn[i]
+            if (roleOf(msg) !== "assistant") continue
+
+            const info = msg.info as Record<string, unknown> | undefined
+            const finish =
+                (msg.finish as string) ??
+                (info?.finish as string) ??
+                (info?.finishReason as string)
+            if (!finish) return null
+
+            const parts = (msg.parts as Array<Record<string, unknown>> | undefined) ?? []
+            const hasText = parts.some(
+                (p) => p.type === "text" && typeof p.text === "string" && p.text.length > 0,
+            )
+            const hasToolCall =
+                parts.some((p) => {
+                    const type = typeof p.type === "string" ? p.type : ""
+                    return type.startsWith("tool")
+                }) ||
+                msg.toolCall !== undefined ||
+                ((msg.tool_calls as unknown[] | undefined)?.length ?? 0) > 0
+            if (hasText || hasToolCall) return null
+
+            return { kind: "empty", detail: finish }
+        }
+        return null
+    }
+
     // Timestamp of a message, tolerant of both server shapes (flat `time` or
     // `info.time`). Undefined when the message carries no usable timestamp.
     function messageTimeOf(msg: Record<string, unknown> | undefined): number | undefined {
@@ -1559,6 +1621,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         w.pendingRecovery = false
         w.pendingRecoveryReason = null
         w.pendingRecoveryAt = 0
+        w.subagentRecoveryTried = false
         w.recoveryAttempts = 0
         w.recoveryContinueInFlight = false
         w.watchdogRetryGuard = false
@@ -2563,6 +2626,49 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         }
                     }
 
+                    // Subagent dead-response recovery: a child whose provider
+                    // returned an error, or finished without any text or tool
+                    // call, would otherwise sit idle while its parent waits for
+                    // a result that is never coming. One targeted prompt per
+                    // episode; the parent-side orphan watch remains the fallback
+                    // when the child cannot be woken.
+                    if (
+                        w.isSubagent &&
+                        !w.subagentRecoveryTried &&
+                        !w.userCancelled &&
+                        !w.completionSignaled &&
+                        !w.aborting &&
+                        !w.gaveUp &&
+                        !w.pendingRecovery &&
+                        !w.continuing
+                    ) {
+                        try {
+                            const subMessages = await getSessionMessages(sid)
+                            const failure = getSubagentResponseFailure(subMessages)
+                            if (
+                                failure &&
+                                !hasPendingUserInput(subMessages) &&
+                                !userRecentlyActive(w)
+                            ) {
+                                w.subagentRecoveryTried = true
+                                const reason =
+                                    failure.kind === "error"
+                                        ? `error ${failure.detail}`
+                                        : `empty finish=${failure.detail}`
+                                await log(
+                                    "info",
+                                    `${short(sid)} - subagent ${reason} — sending one recovery prompt`,
+                                )
+                                await recoverSubagent(sid)
+                            }
+                        } catch (e) {
+                            const errMsg = e instanceof Error ? e.message : String(e)
+                            dbg(
+                                `session.idle sid=${short(sid)}: subagent dead-response check error: ${errMsg}`,
+                            )
+                        }
+                    }
+
                     if (!w.isSubagent) {
                         // Awaiting-input gate: trailing pending tool_use (e.g. an
                         // open question) means the user holds the ball — skip the
@@ -2932,6 +3038,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     if (w) {
                         w.doneClaimNoTodosAttempts = 0
                         w.lastUserMessageAt = Date.now()
+                        w.subagentRecoveryTried = false
                         w.unknownToolErrors.clear()
                         w.unknownToolSuggestionSent = false
                         // Deliberately NOT clearing checkedToolPartIDs: a genuine new
@@ -3140,7 +3247,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         event: async ({ event }) => {
             if (!initialised) {
                 initialised = true
-                log("info", `opencode-auto-resume ready. timeout=${chunkTimeoutMs}ms, orphan=${subagentWaitMs}ms, loop=${loopMaxContinues}x/${loopWindowMs / 1000}s`)
+                log("info", `opencode-auto-resume ready (v${PLUGIN_VERSION}). timeout=${chunkTimeoutMs}ms, orphan=${subagentWaitMs}ms, loop=${loopMaxContinues}x/${loopWindowMs / 1000}s`)
             }
             handleEvent(event as Record<string, unknown>).catch((e) => {
                 const msg = e instanceof Error ? e.message : String(e)
@@ -3150,7 +3257,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         },
 
         config: async () => {
-            log("info", `opencode-auto-resume config OK`)
+            log("info", `opencode-auto-resume config OK (v${PLUGIN_VERSION})`)
         },
         tool: {
             "task_complete": taskCompleteTool,

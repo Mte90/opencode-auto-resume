@@ -687,3 +687,67 @@ describe("v2: the orphan watch yields to the user and does not loop on one dead 
 		await teardown(h)
 	})
 })
+
+describe("v2: dead subagent responses", () => {
+	test("a finished child with no text or tool call gets one recovery prompt", async () => {
+		const now = Date.now()
+		const h = await setup({
+			history: {
+				[SID]: [userMessage("go", now - 60_000)],
+				[CHILD]: [
+					userMessage("do the task", now - 5_000),
+					{
+						type: "assistant",
+						id: "msg_dead",
+						time: { created: now - 1_000 },
+						finish: "unknown",
+						content: [],
+						tokens: { output: 0 },
+					},
+				],
+			},
+			active: [],
+			sessions: { [CHILD]: { parentID: SID } },
+		})
+
+		push(h, "session.idle", CHILD)
+		await wait(150)
+		const toChild = h.injected.filter((i: any) => i.sid === CHILD)
+		expect(toChild).toHaveLength(1)
+		expect(toChild[0].text).toContain("stalled or timed out")
+
+		// One attempt per episode.
+		push(h, "session.idle", CHILD)
+		await wait(100)
+		expect(h.injected.filter((i: any) => i.sid === CHILD)).toHaveLength(1)
+		await teardown(h)
+	})
+
+	test("a child error response gets one recovery prompt without the parent watch", async () => {
+		const now = Date.now()
+		const h = await setup({
+			history: {
+				[SID]: [userMessage("go", now - 60_000)],
+				[CHILD]: [
+					userMessage("do the task", now - 5_000),
+					{
+						type: "assistant",
+						id: "msg_error",
+						time: { created: now - 1_000 },
+						error: { type: "invalid-idle-time", message: "invalid-idle-time" },
+						content: [],
+					},
+				],
+			},
+			active: [],
+			sessions: { [CHILD]: { parentID: SID } },
+		})
+
+		push(h, "session.idle", CHILD)
+		await wait(150)
+		const toChild = h.injected.filter((i: any) => i.sid === CHILD)
+		expect(toChild).toHaveLength(1)
+		expect(toChild[0].text).toContain("stalled or timed out")
+		await teardown(h)
+	})
+})

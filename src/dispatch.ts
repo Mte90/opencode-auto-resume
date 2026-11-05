@@ -18,8 +18,19 @@
 
 import { AutoResumePlugin } from "./index"
 import v2 from "./v2/index"
+import pkg from "../package.json"
 
+const PLUGIN_VERSION = pkg.version
 const noopDispose = () => {}
+
+// opencode 1.19.5+ runs two plugin loaders: the legacy `server()` loader and the
+// v2 config-plugin `setup()` loader. The setup context carries only service
+// domains (no event stream, no client), so auto-resume cannot run there; the
+// v1 copy loaded through `server()` stays active.
+const isV2ServiceContext = (ctx: any): boolean =>
+    typeof ctx?.plugin?.add === "function" &&
+    typeof ctx?.agent?.transform === "function" &&
+    typeof ctx?.skill?.transform === "function"
 
 const dispatcher = {
     id: "auto-resume.v2",
@@ -34,7 +45,11 @@ const dispatcher = {
         if (ctx?.serverUrl || ctx?.client?.session) {
             return AutoResumePlugin(ctx, ctx.options)
         }
-        console.warn("[auto-resume] unrecognised host context — no ctx.app.version (opencode v2), no ctx.event.subscribe (v2 loader), no ctx.serverUrl/client (opencode v1). Plugin disabled; see the README on npm (opencode-auto-resume).")
+        if (isV2ServiceContext(ctx)) {
+            console.log(`[auto-resume v${PLUGIN_VERSION}] opencode v2 config-plugin API detected; auto-resume runs through the v1 server() loader on hosts that provide it — this setup() call is inert.`)
+            return noopDispose
+        }
+        console.warn(`[auto-resume v${PLUGIN_VERSION}] unrecognised host context — no ctx.app.version (opencode v2), no ctx.event.subscribe (v2 loader), no ctx.serverUrl/client (opencode v1). Plugin disabled; see the README on npm (opencode-auto-resume).`)
         return noopDispose
     },
 }

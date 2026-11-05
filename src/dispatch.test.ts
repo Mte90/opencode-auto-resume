@@ -1,6 +1,7 @@
 import { describe, test, expect, mock } from "bun:test"
 import dispatcher from "./dispatch"
 import { capturePluginLogs } from "./v2/test-utils"
+import pkg from "./../package.json"
 
 describe("dispatch.ts — dual-shape plugin entry", () => {
     describe("shape contract", () => {
@@ -304,9 +305,56 @@ describe("dispatch.ts — dual-shape plugin entry", () => {
 
                 await hooks.event({ event: { type: "session.idle", properties: {} } } as any)
                 const readyCalls = appLog.mock.calls.filter((c: any[]) =>
-                    JSON.stringify(c).includes("opencode-auto-resume ready"),
+                    JSON.stringify(c).includes(`opencode-auto-resume ready (v${pkg.version})`),
                 )
                 expect(readyCalls.length).toBe(1)
+
+                await hooks.config()
+                const configCalls = appLog.mock.calls.filter((c: any[]) =>
+                    JSON.stringify(c).includes(`opencode-auto-resume config OK (v${pkg.version})`),
+                )
+                expect(configCalls.length).toBe(1)
+            } finally {
+                capture.stop()
+            }
+        })
+
+        test("setup() with the opencode 1.19.5 v2 config-plugin ctx stays inert without claiming the plugin is disabled", async () => {
+            const capture = capturePluginLogs()
+
+            // opencode 1.19.5 calls setup() with the v2 config-plugin context
+            // (service domains only: no event stream, no client) *in addition
+            // to* the legacy server() loader that runs the v1 build.
+            const ctx: any = {
+                options: {},
+                agent: { transform: () => {}, reload: async () => {} },
+                aisdk: { sdk: () => {}, language: () => {} },
+                catalog: { transform: () => {}, reload: async () => {} },
+                command: { transform: () => {}, reload: async () => {} },
+                integration: { transform: () => {}, reload: async () => {} },
+                plugin: { add: async () => {}, remove: async () => {} },
+                reference: { transform: () => {}, reload: async () => {} },
+                skill: { transform: () => {}, reload: async () => {} },
+            }
+
+            const cleanup = await (dispatcher.setup as any)(ctx)
+
+            try {
+                expect(typeof cleanup).toBe("function")
+                expect(() => cleanup()).not.toThrow()
+
+                const disabled = capture.warns.filter((l: string) =>
+                    l.includes("unrecognised host context") || l.includes("Plugin disabled"),
+                )
+                expect(disabled.length).toBe(0)
+                expect(capture.warns.length).toBe(0)
+
+                const notes = capture.lines.filter((l: string) =>
+                    l.includes("v2 config-plugin API detected"),
+                )
+                expect(notes.length).toBe(1)
+                expect(notes[0]).toContain(`v${pkg.version}`)
+                expect(notes[0]).toContain("server() loader")
             } finally {
                 capture.stop()
             }
@@ -326,6 +374,7 @@ describe("dispatch.ts — dual-shape plugin entry", () => {
                     l.includes("unrecognised host context"),
                 )
                 expect(diag.length).toBe(1)
+                expect(diag[0]).toContain(`v${pkg.version}`)
                 expect(diag[0]).toContain("ctx.app.version")
                 expect(diag[0]).toContain("ctx.serverUrl")
                 expect(diag[0]).toContain("README")

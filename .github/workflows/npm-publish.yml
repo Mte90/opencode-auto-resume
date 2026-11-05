@@ -7,15 +7,38 @@ on:
 
 permissions:
   id-token: write  # Required for Trusted Publishing (OIDC)
-  contents: read
+  contents: write  # Required to push the version-bump commit to master
 
 jobs:
   publish:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Sync package.json version from release tag
+        if: github.event.release.tag_name != ''
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          VERSION="${VERSION#V}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+].+)?$ ]]; then
+            echo "Tag '$RELEASE_TAG' does not contain a valid semver version"
+            exit 1
+          fi
+          CURRENT=$(node -p "require('./package.json').version")
+          npm pkg set "version=$VERSION"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          if [ "$CURRENT" = "$VERSION" ]; then
+            echo "VERSION_CHANGED=false" >> "$GITHUB_ENV"
+            echo "package.json already at $VERSION — no commit needed"
+          else
+            echo "VERSION_CHANGED=true" >> "$GITHUB_ENV"
+            echo "package.json $CURRENT -> $VERSION"
+          fi
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v1
@@ -39,3 +62,26 @@ jobs:
 
       - name: Publish to npm (Trusted Publishing)
         run: npm publish --access public --provenance
+
+      - name: Checkout master for the version commit
+        if: env.RELEASE_TAG != '' && env.VERSION_CHANGED == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: master
+
+      - name: Commit version bump to master
+        if: env.RELEASE_TAG != '' && env.VERSION_CHANGED == 'true'
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          npm pkg set "version=${VERSION}"
+          git add package.json
+          if git diff --cached --quiet; then
+            echo "master already at ${VERSION} — nothing to commit"
+            exit 0
+          fi
+          git commit -m "Set package.json version to ${VERSION} from release tag ${RELEASE_TAG} [skip ci]"
+          git push origin HEAD:master

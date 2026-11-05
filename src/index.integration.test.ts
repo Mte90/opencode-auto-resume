@@ -1193,6 +1193,68 @@ describe("WP-09: Integration Tests - Streaming Failure Recovery", () => {
         expectRecoveryPromptSent(promptCalls, subSid, 1)
         expect(promptCalls.length).toBe(1)
     })
+
+    test("dead subagent response with no text or tool call gets one recovery prompt", async () => {
+        const { ctx, promptCalls } = createRecoveryContext()
+        const hooks = await AutoResumePlugin(ctx, { ...RECOVERY_FAST } as any)
+        const parentSid = "ses_parent_dead_sub"
+        const subSid = "ses_sub_dead_sub"
+
+        // Mark the child as a subagent through the busy-count transition.
+        await busyEvent(hooks, parentSid)
+        await busyEvent(hooks, subSid)
+        await idleEvent(hooks, subSid)
+        await wait(100)
+
+        const deadMessages = [
+            { role: "user", time: { created: Date.now() - 1000 }, parts: [{ type: "text", text: "do the task" }] },
+            { role: "assistant", time: { created: Date.now() }, finish: "unknown", tokens: { output: 0 }, parts: [] },
+        ]
+        ;(ctx.client.session.messages as any).mockImplementation(async (config: { path: { id: string } }) =>
+            config.path.id === subSid ? deadMessages : [],
+        )
+
+        await idleEvent(hooks, subSid)
+        const sent = await waitFor(() => promptCalls.some((p) => p.sid === subSid), 3000)
+        expect(sent).toBe(true)
+        expect(promptCalls.filter((p) => p.sid === subSid)).toHaveLength(1)
+        expect(promptCalls.find((p) => p.sid === subSid)?.body).toContain("stalled or timed out")
+
+        // One attempt per episode: a second idle must not nudge the child again.
+        await idleEvent(hooks, subSid)
+        await wait(100)
+        expect(promptCalls.filter((p) => p.sid === subSid)).toHaveLength(1)
+    })
+
+    test("subagent error response is recovered without waiting for the parent watch", async () => {
+        const { ctx, promptCalls } = createRecoveryContext()
+        const hooks = await AutoResumePlugin(ctx, { ...RECOVERY_FAST } as any)
+        const parentSid = "ses_parent_error_sub"
+        const subSid = "ses_sub_error_sub"
+
+        await busyEvent(hooks, parentSid)
+        await busyEvent(hooks, subSid)
+        await idleEvent(hooks, subSid)
+        await wait(100)
+
+        const errorMessages = [
+            { role: "user", time: { created: Date.now() - 1000 }, parts: [{ type: "text", text: "do the task" }] },
+            {
+                role: "assistant",
+                time: { created: Date.now() },
+                error: { name: "Error", data: { message: "invalid-idle-time" } },
+                parts: [],
+            },
+        ]
+        ;(ctx.client.session.messages as any).mockImplementation(async (config: { path: { id: string } }) =>
+            config.path.id === subSid ? errorMessages : [],
+        )
+
+        await idleEvent(hooks, subSid)
+        const sent = await waitFor(() => promptCalls.some((p) => p.sid === subSid), 3000)
+        expect(sent).toBe(true)
+        expect(promptCalls.filter((p) => p.sid === subSid)).toHaveLength(1)
+    })
 })
 
 // ---------------------------------------------------------------------------

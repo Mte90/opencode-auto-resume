@@ -59,6 +59,9 @@ import { homedir } from "node:os"
 import { dirname, isAbsolute, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { readFile } from "node:fs/promises"
+import pkg from "../../package.json"
+
+const PLUGIN_VERSION = pkg.version
 
 /**
  * The subset of the v2 plugin input this plugin actually consumes. Typed
@@ -415,6 +418,9 @@ interface SessionWatch {
 	 * `parentID` for this session, i.e. it is a child and must never be injected
 	 * into or interrupted. `undefined` = not yet resolved. */
 	isSubAgent?: boolean
+	/** One targeted wake per dead subagent episode. Reset only by a genuine
+	 * user/task message, never by the busy transition the wake itself causes. */
+	subagentRecoveryTried?: boolean
 	idleSince: number | null
 	/** Last time the silent-reasoning sweep examined this session. Bounds the
 	 * history read to ~one per stall window per idle session. */
@@ -2149,7 +2155,7 @@ export default define({
 		// plugin input exposes `app.version`. A v1 server omits `ctx.app` entirely;
 		// without this check setup crashes later with an opaque API error.
  		if (typeof (ctx as any).app?.version !== "string") {
- 			log("warn", "this looks like the opencode v1 build running on the wrong server: ctx.app.version is missing. The v2 bundle requires opencode v2 — update the plugin package (the npm build auto-selects per server) or load the build matching your server; see the README on npm (opencode-auto-resume).")
+ 			log("warn", `v${PLUGIN_VERSION} — this looks like the opencode v1 build running on the wrong server: ctx.app.version is missing. The v2 bundle requires opencode v2 — update the plugin package (the npm build auto-selects per server) or load the build matching your server; see the README on npm (opencode-auto-resume).`)
  			// Abort inertly: no state, no timers, and above all no event pump —
  			// a v1-shaped host must never reach ctx.event.subscribe, whose
  			// absence crashes with an opaque error. Callers get a callable
@@ -2240,6 +2246,7 @@ export default define({
 			// sharing began needs a default here, not just in the constructor below.
 			if (w) {
 				w.emptyIdleNudged ??= false
+				w.subagentRecoveryTried ??= false
 				w.workRetries ??= 0
 				w.recoverGeneration ??= 0
 				w.lifetimeContinues ??= 0
@@ -2299,6 +2306,7 @@ export default define({
 					completionHard: false,
 					latchReopened: false,
 					emptyIdleNudged: false,
+					subagentRecoveryTried: false,
 					todos: [],
 					todosFetchedAt: 0,
 					taskCompleteSignals: 0,
@@ -4156,6 +4164,78 @@ export default define({
 			return null
 		}
 
+		/** The newest assistant message's error, if it carries one. */
+		function lastAssistantError(messages: unknown[]): string | null {
+			for (let i = messages.length - 1; i >= 0; i--) {
+				const msg = messages[i] as {
+					role?: string
+					type?: string
+					info?: { error?: unknown }
+					error?: unknown
+				}
+				if (msgRole(msg) !== "assistant") continue
+				const err = msg.error ?? msg.info?.error
+				if (err === undefined || err === null) return null
+				if (typeof err === "object") {
+					const e = err as { type?: unknown; message?: unknown; data?: { message?: unknown } }
+					return String(e.type ?? e.data?.message ?? e.message ?? "error")
+				}
+				return String(err)
+			}
+			return null
+		}
+
+		/**
+		 * A subagent that died without a result leaves its parent waiting forever.
+		 * The general injection path deliberately refuses children, so this is the
+		 * one exception: one targeted synthetic prompt per episode, then the
+		 * parent-side orphan watch takes over. Covers an explicit provider error
+		 * (including terminal-gate reasons such as `invalid-idle-time`) and a turn
+		 * that finished with no text, no tool call, and no reply at all.
+		 */
+		async function recoverSubagentResponse(
+			sid: string,
+			w: SessionWatch,
+			messages: unknown[],
+		): Promise<boolean> {
+			if (w.subagentRecoveryTried) return false
+			if (!(await isSubAgentSession(sid))) return false
+
+			// Only the current turn counts: an older error or empty finish is
+			// history once a newer user message arrived.
+			let lastUser = -1
+			for (let i = messages.length - 1; i >= 0; i--) {
+				if (msgRole(messages[i]) === "user") {
+					lastUser = i
+					break
+				}
+			}
+			const turn = lastUser >= 0 ? messages.slice(lastUser + 1) : messages
+			const error = lastAssistantError(turn)
+			const dead = lastSilentDeadStream(turn)
+			if (!error && !dead) return false
+
+			if (
+				w.userCancelled ||
+				w.gaveUp ||
+				w.completionSignaled ||
+				w.permissionPending ||
+				w.compacting ||
+				w.recovering ||
+				selfAbortActive(w)
+			) {
+				return false
+			}
+
+			w.subagentRecoveryTried = true
+			const reason = error
+				? `error ${error}`
+				: `empty finish=${dead?.finish ?? "unknown"}`
+			log("info", `${short(sid)} subagent ${reason} — sending one recovery prompt`)
+			await recoverStuckSubagent(sid)
+			return true
+		}
+
 		/**
 		 * Recover a stream that finished without ever delivering text.
 		 *
@@ -4634,6 +4714,7 @@ export default define({
 			// the observable-episode sites, never in markBusy (which also runs
 			// on our own recovery injections and would re-arm on its own send).
 			w.emptyIdleNudged = false
+			w.subagentRecoveryTried = false
 			// Deliberately NOT clearing checkedToolPartIDs: already-reported
 			// errors must never be recounted. Clearing it made every genuine
 			// user message re-suggest the same stale errors (2026-10-04: one
@@ -5196,6 +5277,11 @@ export default define({
 			const w = ensureWatch(sid)
 			const messages = await loadMessages(sid)
 			noteInboundUserMessage(sid, w, messages)
+
+			// Dead subagent responses are handled before the parent detectors: the
+			// general injection path refuses children, so `recoverSilentDeadStream`
+			// below would arm a recovery that can never be sent.
+			if (await recoverSubagentResponse(sid, w, messages)) return
 
 			// Judged first, and before anything that needs text: a stream that died
 			// before delivering any text is precisely the case where every
