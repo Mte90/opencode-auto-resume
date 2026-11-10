@@ -1827,6 +1827,11 @@ const OWN_PROMPT_SHAPES: RegExp[] = [
 	/^You tried to use the tool "/,
 ]
 
+function isSyntheticInterrupt(text: string | undefined): boolean {
+	if (typeof text !== "string" || text.length === 0) return false
+	return /^The previous response was interrupted\./.test(text)
+}
+
 function looksLikeOwnPrompt(text: string | undefined): boolean {
 	if (typeof text !== "string" || text.length === 0) return false
 	return OWN_PROMPT_SHAPES.some((re) => re.test(text))
@@ -4619,6 +4624,15 @@ export default define({
 				dbg(`${short(sid)} newest user message is our own prompt — not re-arming budgets`)
 				return
 			}
+			if (isSyntheticInterrupt(latest.text)) {
+				if (w.userCancelled) {
+					w.userCancelledAt = typeof latest.at === "number" ? latest.at : Date.now()
+				} else if (typeof latest.at === "number" && latest.at > w.userCancelledAt) {
+					w.userCancelledAt = latest.at
+				}
+				dbg(`${short(sid)} synthetic interruption-recovery message — keeping userCancelled latched`)
+				return
+			}
 			if (w.doneClaimAttempts > 0 || w.doneClaimOpenTodosAttempts > 0) {
 				dbg(`${short(sid)} new user message — re-arming the done-claim budgets`)
 			}
@@ -6863,7 +6877,8 @@ export default define({
 						// it never trips this.
 						void (async () => {
 							const selfInjectFresh =
-								w.lastInjectAt > 0 && w.lastInjectAt >= w.lastGenuineUserAt
+								w.lastInjectAt > 0 &&
+								w.lastInjectAt + OWN_PROMPT_TIME_MS >= w.lastGenuineUserAt
 							let ownRung = !providerRetryFresh && selfInjectFresh
 							if (ownRung) {
 								try {
@@ -6897,9 +6912,11 @@ export default define({
 								// is new work, not our nudge looping. Own recovery
 								// rungs skip the wipe entirely, so they keep counting.
 								w.lifetimeContinues = 0
-								// The retry count rides that budget (see the user-message
-								// site): it is bounded by lifetimeMaxContinues.
-								w.workRetries = 0
+								// NOTE: workRetries (the retry # shown to the user) is
+								// reset ONLY on a confirmed genuine user message (see
+								// the user-message site), NOT here. Resetting it on
+								// this fallback path caused false drops when ownRung
+								// was misclassified mid-episode.
 								w.emptyIdleNudged = false
 								if (ctx.storage?.remove) {
 									ctx.storage.remove(`${COUNTER_STATE_PREFIX}${sid}`).catch(() => {})
@@ -7017,6 +7034,14 @@ export default define({
 					w.compacting = false
 					w.compactionStartedAt = null
 					w.recovering = false
+					// Cancel any queued/delayed nudge: a pre-armed recovery must
+					// not fire after a user stop.
+					if (w.recoverTimer) {
+						clearTimeout(w.recoverTimer)
+						w.recoverTimer = null
+					}
+					w.pendingRecoveryArmed = false
+					w.recoverGeneration++
 					markIdle(sid)
 					return
 				}
