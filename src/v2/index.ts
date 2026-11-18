@@ -54,7 +54,7 @@ type AutoResumePlugin = {
 
 const define = <T>(plugin: T): T => plugin
 
-import { appendFileSync, readFileSync, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs"
+import { appendFileSync, readFileSync, existsSync, mkdirSync, statSync, writeFileSync, unlinkSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, isAbsolute, join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -2176,9 +2176,10 @@ export default define({
 		}
 		function isPaused(sid: string): boolean {
 			const s = readPausedSet()
-			return s.has("*") || s.has(sid)
+			return s.has(sid)
 		}
 		function setPaused(sid: string, on: boolean): void {
+			if (!sid || !sid.startsWith("ses_")) return
 			const s = readPausedSet()
 			if (on) s.add(sid)
 			else s.delete(sid)
@@ -7275,7 +7276,7 @@ export default define({
 
 		// Pause is process-lifetime only: a restart re-arms auto-resume so a
 		// forgotten pause cannot silently disable it forever.
-		try { writeFileSync(PAUSED_MARKER_FILE, "", "utf8") } catch {}
+		try { unlinkSync(PAUSED_MARKER_FILE) } catch {}
 
 		if (gatedInUse.length > 0) {
 			log("warn", `accepted-but-inert=${gatedInUse.join(",")} — this v2 build recognises these option(s) but does not act on them yet.`)
