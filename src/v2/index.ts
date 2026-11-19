@@ -60,6 +60,59 @@ import { dirname, isAbsolute, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { readFile } from "node:fs/promises"
 import pkg from "../../package.json"
+import {
+	DEFAULT_CHUNK_TIMEOUT_MS,
+	DEFAULT_CHECK_INTERVAL_MS,
+	DEFAULT_ACTIVE_USER_WINDOW_MS,
+	DEFAULT_GRACE_PERIOD_MS,
+	DEFAULT_MAX_RETRIES,
+	DEFAULT_MAX_BACKOFF_MS,
+	DEFAULT_BASE_BACKOFF_MS,
+	DEFAULT_DISCOVERY_DELAY_MS,
+	DEFAULT_SUBAGENT_WAIT_MS,
+	DEFAULT_LOOP_MAX_CONTINUES,
+	DEFAULT_LOOP_WINDOW_MS,
+	DEFAULT_TOOL_TEXT_CHECK_DELAY_MS,
+	DEFAULT_MAX_RECOVERY_RETRIES,
+	DEFAULT_MIN_ACTIVITY_GAP_MS,
+	DEFAULT_WARMUP_MS,
+	DEFAULT_SILENT_DEAD_STREAM_MIN_TOKENS,
+	DEFAULT_DEBUG,
+	MAX_IDLE_SESSIONS,
+	IDLE_CLEANUP_MS,
+	SESSION_DISCOVERY_INTERVAL_MS,
+	CTX_WRAPUP_TRIGGER,
+	UNKNOWN_TOOL_THRESHOLD,
+	TOOL_IDS_CACHE_MS,
+	OOC_ERROR_RE,
+	DEFAULT_STREAMING_FAILURE_ERROR_NAMES,
+	DEFAULT_STREAMING_FAILURE_MESSAGE_PATTERNS,
+	TOOL_TEXT_PATTERNS,
+	TRUNCATED_XML_PATTERNS,
+	READY_TO_CONTINUE_PATTERNS,
+	OWN_PROMPT_SHAPES,
+	DONE_CLAIM_PATTERNS,
+	TOOL_TEXT_RECOVERY_PROMPT,
+	THINKING_TOOL_RECOVERY_PROMPT,
+	TOOL_LOOP_RECOVERY_PROMPT,
+	TASK_COMPLETE_ACK,
+	TASK_COMPLETE_REPEAT_WARNING,
+	TASK_COMPLETE_REPEAT_ERROR,
+	DONE_WITHOUT_WORK_PROMPT,
+	DONE_WITHOUT_DETAILS_PROMPT,
+	CONTINUE_PROMPT,
+	containsToolCallAsText,
+	getOpenTodos,
+	isOpenTodo,
+	suggestClosestTool,
+	levenshtein,
+	stripCodeBlocks,
+	containsDoneClaimPattern,
+	containsActionIntent,
+	containsWorkDescription,
+	buildOpenTodosReminder,
+	Todo,
+} from "../recovery/shared"
 
 const PLUGIN_VERSION = pkg.version
 
@@ -128,6 +181,8 @@ interface AutoResumePluginInput {
 	/** Application logger, when the host provides one. */
 	app?: { name?: string; version?: string; channel?: string }
 }
+
+const TASK_TOOL_HINTS = ["task", "agent", "subagent", "dispatch"]
 
 // ---------------------------------------------------------------------------
 // Types
@@ -619,8 +674,6 @@ export async function configMentionsTaskComplete(cfgPath: string): Promise<boole
  * Sent through `session.command` rather than as prompt text, because prompt text is
  * not expanded into a command.
  */
-const CTX_WRAPUP_TRIGGER = "ctx-wrapup"
-
 // ---------------------------------------------------------------------------
 // Constants & defaults
 // ---------------------------------------------------------------------------
@@ -631,9 +684,6 @@ const CTX_WRAPUP_TRIGGER = "ctx-wrapup"
 // the principled fix — that is positive hang detection (a tool call stuck in
 // running/pending is a real hang; model generation is not), which changes
 // recovery semantics and is still an open decision.
-const DEFAULT_CHUNK_TIMEOUT_MS = 180_000
-const DEFAULT_CHECK_INTERVAL_MS = 5_000
-const DEFAULT_GRACE_PERIOD_MS = 3_000
 /** How old an unanswered tool part must be before the stuck-tool pass acts.
  * Deliberately far shorter than the stall window: an idle session with an
  * unfinished call is not 'maybe still working' — the turn already ended, so
@@ -660,7 +710,6 @@ const LONG_RUNNING_TOOLS = ["shell"]
  * Nudges on exact 3-min boundaries all show the same display minute.
  * Seeded by session ID for deterministic behavior across reloads and tests. */
 const STALL_JITTER_MS = 60_000
-const DEFAULT_MAX_RETRIES = 3
 /** Providers known to be local (run on user's hardware). */
 const LOCAL_PROVIDERS = new Set([
 	"llama-server",
@@ -705,30 +754,19 @@ const FAILURE_LOOP_MAX = 3
  * backoff-plus-retry cycle: the prod still fires inside it, only the ladder
  * escalation is held. */
 const PROVIDER_RETRY_GRACE_MS = 120_000
-const DEFAULT_BASE_BACKOFF_MS = 1_000
-const DEFAULT_MAX_BACKOFF_MS = 8_000
-const DEFAULT_LOOP_MAX_CONTINUES = 3
-const DEFAULT_LOOP_WINDOW_MS = 10 * 60_000
 const DEFAULT_LIFETIME_MAX_CONTINUES = 9
-const DEFAULT_DEBUG = false
 // Mirrors v1 (Mte90 e1b8374): an inbound user message this recent means the
 // user is engaged (likely composing), so idle nudges stand down. Was 15min here.
-const DEFAULT_ACTIVE_USER_WINDOW_MS = 5 * 60_000
 
 // ---- Defaults ported from v1 (Mte90/opencode-auto-resume#33) ----
 // v1 keeps SESSION_DISCOVERY_INTERVAL_MS as an internal constant rather than an
 // option, so it is not configurable here either. 60s matches v1.
-const DEFAULT_DISCOVERY_DELAY_MS = 5_000
-const DEFAULT_SESSION_DISCOVERY_INTERVAL_MS = 60_000
-const DEFAULT_WARMUP_MS = 15_000
 // Off by default: bun runs every test file in one process, so unconditional
 // sharing leaks watch state across tests (165 failures on record). Prod opts
 // in to sharing — sequential setups in one server process must inherit stall
 // memory, or every session attach restores amnesia (2026-10-09).
 const DEFAULT_SHARE_WATCH_STATE = false
-const DEFAULT_MIN_ACTIVITY_GAP_MS = 1_000
-const DEFAULT_TOOL_TEXT_CHECK_DELAY_MS = 3_000
-const DEFAULT_SUBAGENT_WAIT_MS = 15_000
+
 /** How long a busy subagent may go without producing anything before it counts
  * as stuck. v1 used the same number, and a tool call still outstanding triples
  * it, because a long tool is not a hung model. */
@@ -741,7 +779,6 @@ const SUBAGENT_STUCK_MS = 60_000
 const DEFAULT_SUBAGENT_DEAD_MS = 60 * 60_000
 const SUBAGENT_RECOVERY_PROMPT =
 	"It looks like you may have stalled or timed out. Please retry the last operation or continue with the task."
-const DEFAULT_SILENT_DEAD_STREAM_MIN_TOKENS = 200
 const DEFAULT_CONTEXT_SATURATION_THRESHOLD = 0.85
 /** How long a fetched todo list is trusted before being re-read. */
 /** Cap on the remembered tool-part ids. Bounds a set that is otherwise fed one
@@ -759,25 +796,8 @@ const PAUSED_MARKER_FILE = `${process.env.HOME ?? ""}/.config/opencode/auto-resu
 const QUOTA_STATE_MAX_AGE_MS = 48 * 3600_000
 
 const TODO_CACHE_TTL_MS = 3_000
-const DEFAULT_MAX_RECOVERY_RETRIES = 2
 // Referenced from FEATURE_GATED_OPTIONS docs; kept so the intended v1 default is
 // recorded next to the gate that explains why it is not applied yet.
-
-const DEFAULT_STREAMING_FAILURE_ERROR_NAMES = [
-	"ProviderError",
-	"APIError",
-	"StreamError",
-	"ConnectionError",
-	"TimeoutError",
-]
-
-const DEFAULT_STREAMING_FAILURE_MESSAGE_PATTERNS = [
-	"streaming response failed",
-	"stream.*fail",
-	"connection.*reset",
-	"connection.*closed",
-	"aborted due to timeout",
-]
 
 /**
  * Canonical done-claim sources — single source of truth for the "task claims
@@ -813,28 +833,6 @@ const DONE_CLAIM_PATTERN_SOURCES = [
 
 
 
-const DEFAULT_READY_TO_CONTINUE_PATTERNS = [
-	"ready to continue with task",
-	"continuing with task",
-	"continue with task",
-	"proceeding with task",
-	"ready to proceed with task",
-	"will continue with task",
-	"moving on to task",
-]
-
-const THINKING_TOOL_RECOVERY_PROMPT =
-	"I noticed you have a tool call generated in your thinking/reasoning. " +
-	"Please execute it using the proper tool calling mechanism instead of keeping it in reasoning."
-
-const DONE_WITHOUT_DETAILS_PROMPT =
-	"Your last response claimed the task is complete but contained no work description. This is not acceptable. " +
-	"You MUST respond now with a full, detailed report of everything you did: " +
-	"for each file you modified, state the full path and the exact changes; " +
-	"list every command you ran to verify and its result; state the final outcome. " +
-	"Do NOT reply with 'done', 'task completed', or any short acknowledgment — " +
-	"your ONLY acceptable response right now is this detailed report. Write it now."
-
 /**
  * Upper bound on how long a `shell.created` → `shell.exited` pair is trusted
  * to mean "this session is busy". A shell that never reports an exit (session
@@ -844,8 +842,6 @@ const DONE_WITHOUT_DETAILS_PROMPT =
 const SHELL_OPEN_MAX_MS = 30 * 60_000
 
 
-/** OOC (out-of-context) errors that `continue` can never clear — recovery is locked out on these. */
-const OOC_ERROR_RE = /exceeds the available context size|context size \(\d+\)|too large to compact|too many tokens|prompt is too long/i
 /** Exact `error.type` values a `continue` can never clear. These ARE opencode's
  * own taxonomy (packages/llm/src/schema/errors.ts), read off the running binary's
  * type->tag switch — not guesses. Each maps to a reason class whose
@@ -966,8 +962,6 @@ const DEFAULT_INJECT_INTERVAL_MS = 15_000
  * budgets — no loop — versus the recount loop this prevents. */
 const OWN_PROMPT_TIME_MS = 30_000
 
-const MAX_IDLE_SESSIONS = 50
-const IDLE_CLEANUP_MS = 10 * 60_000
 /** A compaction silent for this long without an ended/failed event is wedged — stale-clear the flag.
  * Compaction on a single GPU legitimately runs 5-15 min here, so the guard cannot
  * mute the watchdog for 30: a wedged or slow compaction must not hide a dead session. */
@@ -1023,10 +1017,6 @@ const TOOL_STATE_COMPLETED = "completed"
  */
 const AWAITING_USER_TOOLS = new Set(["question", "permission", "ask", "confirm"])
 
-/** The literal bare continue. Kept for `richContinuePrompt: false` (an explicit
- * opt-out) and for v1 parity. Not the default — see SAFE_CONTINUE_PROMPT. */
-const CONTINUE_PROMPT = "continue"
-
 /**
  * The default for every synthetic continue that has no richer prompt of its own.
  *
@@ -1076,26 +1066,8 @@ const SAFE_EMPTY_IDLE_PROMPT =
  * therefore carries an explicit stop instruction, the second warns, and the third
  * throws so the turn is forced to end.
  */
-const TASK_COMPLETE_ACK =
-	"Task completion acknowledged. No further continuation will be sent. " +
-	"End your turn now with a brief text reply — do not call task_complete or any other tool again " +
-	"unless the user sends a new message."
-
-const TASK_COMPLETE_REPEAT_WARNING =
-	"Task completion acknowledged already on your previous call — completion is recorded. " +
-	"End your turn now with a brief text reply. Do not call task_complete again; " +
-	"further repeat calls are rejected as errors."
-
-const TASK_COMPLETE_REPEAT_ERROR =
-	"task_complete already acknowledged twice with no new user message or tool work since — " +
-	"completion is recorded. End your turn with text and make no further tool calls."
-
 /** How many times a model must call a tool that does not exist before we name a
  * replacement. One is a typo; two is a model that will not correct itself. */
-const UNKNOWN_TOOL_THRESHOLD = 2
-/** The tool list changes only when a plugin reloads, so a short cache is enough
- * and it keeps the check off the registry on every idle. */
-const TOOL_IDS_CACHE_MS = 5 * 60_000
 /** Cap on the tool list quoted back to the model. A full dump of every tool on
  * the box is itself a way to fill the context. */
 const UNKNOWN_TOOL_LIST_LIMIT = 20
@@ -1104,67 +1076,9 @@ const UNKNOWN_TOOL_LIST_LIMIT = 20
 const TASK_COMPLETE_DESCRIPTION =
 	"Signal that all work is complete and stop automatic continuation prompts. Call this ONLY after finishing everything requested. Call exactly once per completed round of work — repeat calls with no new user message in between are rejected."
 
-const TOOL_TEXT_RECOVERY_PROMPT =
-	"Your last message contained a raw tool call printed as text instead of being executed. " +
-	"Please use the proper tool calling mechanism to execute it."
-
-const DONE_WITHOUT_WORK_PROMPT =
-	"I need you to verify more carefully that you have actually completed all the required tasks. " +
-	"Your response indicated you're done, but no work was detected. Please check your todo list " +
-	"and complete any remaining work."
-
-const TOOL_LOOP_RECOVERY_PROMPT =
-	"I notice you've been calling the same tool multiple times in a row without making progress. " +
-	"Please step back and reassess your approach. Consider: " +
-	"1) Are you stuck in a loop? 2) Do you need different information first? " +
-	"3) Should you try a different tool or break the task into smaller steps? " +
-	"Take a moment to think about what's blocking you and propose a different strategy."
-
-const TASK_TOOL_HINTS = ["task", "agent", "subagent", "dispatch"]
-
 // ---------------------------------------------------------------------------
 // Pattern lists (ported verbatim from upstream where pure)
 // ---------------------------------------------------------------------------
-
-const TOOL_TEXT_PATTERNS = [
-	/<function\s*=/i,
-	/<function>/i,
-	/<\/function>/i,
-	/<parameter\s*=/i,
-	/<parameter>/i,
-	/<\/parameter>/i,
-	/<tool_call[\s>]/i,
-	/<\/tool_call>/i,
-	/<tool[\s_]name\s*=/i,
-	/<invoke\s+/i,
-	/<func(?:t|ti|tio|tion)?$/im,
-	/<par(?:a|am|ame|amet|amete|ameter)?$/im,
-	/<(?:edit|write|read|bash|grep|glob|search|replace|execute|run)\s*(?:\s[^>]*)?\s*(?:\/>|>)/i,
-	/{"type":\s*"function"/i,
-	/{"name":\s*"[a-zA-Z_]/i,
-	/\{\s*"type"\s*:?$/im,
-	/\{\s*"name"\s*:?$/im,
-]
-
-const TRUNCATED_XML_PATTERNS = [
-	{ open: /<function[^>]*>/i, close: /<\/function>/i },
-	{ open: /<parameter[^>]*>/i, close: /<\/parameter>/i },
-	{ open: /<tool_call[^>]*>/i, close: /<\/tool_call>/i },
-	{ open: /\{\s*"type"\s*:/i, close: /}/ },
-	{ open: /\{\s*"name"\s*:/i, close: /}/ },
-]
-
-const READY_TO_CONTINUE_PATTERNS = [
-	/ready to continue with task/i,
-	/continuing with task/i,
-	/continue with task/i,
-	/proceeding with task/i,
-	/ready to proceed with task/i,
-	/will continue with task/i,
-	/moving on to task/i,
-]
-
-const DONE_CLAIM_PATTERNS = DONE_CLAIM_PATTERN_SOURCES.map((s) => new RegExp(s, "im"))
 
 // Error signatures that indicate a transient streaming/provider failure worth retrying
 const STREAMING_FAILURE_MESSAGE_PATTERNS = [
@@ -1186,10 +1100,6 @@ const STREAMING_FAILURE_MESSAGE_PATTERNS = [
 // Pure helpers
 // ---------------------------------------------------------------------------
 
-function stripCodeBlocks(text: string): string {
-	return text.replace(/```[\s\S]*?```/g, "").replace(/`[^`\n]+`/g, "")
-}
-
 /**
  * Trailing environment boundary markers (`@12@`-style ids the harness
  * appends to stored message text) are metadata, not model prose. Left in
@@ -1203,27 +1113,13 @@ function stripBoundaryMarkers(text: string): string {
 	return text.replace(/(?:\s*@\d+@)+\s*$/, "")
 }
 
-function containsToolCallAsText(text: string): boolean {
-	if (text.length <= 10) return false
-	const stripped = stripCodeBlocks(text)
-	if (TOOL_TEXT_PATTERNS.some((pat) => pat.test(stripped))) return true
-	for (const { open, close } of TRUNCATED_XML_PATTERNS) {
-		if (open.test(stripped) && !close.test(stripped)) return true
-	}
-	return false
-}
-
 function containsReadyToContinuePattern(text: string, patterns: RegExp[] = READY_TO_CONTINUE_PATTERNS): boolean {
 	const lines = text.split("\n")
 	const lastLines = lines.slice(-3).join("\n")
 	return patterns.some((pat) => pat.test(lastLines))
 }
 
-function containsDoneClaimPattern(text: string, patterns: RegExp[] = DONE_CLAIM_PATTERNS): boolean {
-	const lines = text.split("\n")
-	const lastLines = lines.slice(-5).join("\n")
-	return patterns.some((pat) => pat.test(lastLines))
-}
+
 
 /**
  * Explicit stop statements: the model stating it is stopping, distinct from
@@ -1376,20 +1272,7 @@ function turnEndsWithCompletionClaim(text: string): boolean {
  *   - a bare path with a slash and a dotted extension: /a/b.py
  *   - a report header: changed / verification / results / commands run
  */
-function containsWorkDescription(text: string): boolean {
-	// Backticked span mentioning a dotted filename.
-	if (/`[^`\n]*\.[a-zA-Z0-9]{1,8}[^`\n]*`/.test(text)) return true
-	// Bare path with a slash and a dotted extension.
-	if (/[\w\-~.][\w\-.~\/]*\/[\w\-.~]*\.[a-zA-Z]{1,8}\b/.test(text)) return true
-	// Report section headers.
-	if (
-		/^(changed|modified|deleted|created|updated|renamed|moved|files?\s+changed|verification|verified|tests?(?:\s+run|\s+passing|\s+pass)?|results?|outcome|commands?\s+(?:run|executed))/im.test(
-			text,
-		)
-	)
-		return true
-	return false
-}
+
 
 /**
  * True when the last assistant turn closes with a celebration emoji.
@@ -1409,46 +1292,20 @@ function endsWithCelebration(text: string): boolean {
 }
 
 /**
- * One entry of a session's todo list.
- *
- * Read from the todo tool that is already installed, not from a list this
- * plugin keeps. The record shape is the one `todowrite` writes —
- * `storage.set("todos/<sessionID>", {todos, updatedAt})` — so whatever todo
- * tool the session uses is what this sees, and auto-resume never has to own a
- * second copy that can drift.
+ * Names models invent for tools that exist under another name. Edit distance
+ * cannot bridge these ("bash"→"shell" is 4 against a threshold of 2), so the
+ * map is consulted before the fuzzy matcher. The target must be registered —
+ * an unguarded guess names a second nonexistent tool and teaches the model
+ * the registry lies.
  */
-interface Todo {
-	content: string
-	status: "pending" | "in_progress" | "completed" | "cancelled"
-	priority: "high" | "medium" | "low"
+const TOOL_NAME_ALIASES: Record<string, string> = {
+	bash: "shell",
 }
 
-function isOpenTodo(t: Todo): boolean {
-	return t.status === "pending" || t.status === "in_progress"
-}
-
-function getOpenTodos(todos: Todo[]): Todo[] {
-	if (!Array.isArray(todos)) return []
-	return todos.filter(isOpenTodo)
-}
-
-/**
- * The prompt for a turn that claims to be finished with work still listed.
- *
- * Names the open items rather than saying "continue", because the model has
- * already decided it is done — a bare continuation prompt gets answered with
- * another done-claim. Falls back to a plain "continue" when the list is
- * unusable, which is strictly better than sending an empty reminder.
- */
-function buildOpenTodosReminder(todos: Todo[]): string {
-	if (!Array.isArray(todos)) return "continue"
-	const open = todos.filter(isOpenTodo)
-	if (open.length === 0) return "continue"
-	const list = open.map((t, i) => `${i + 1}. [${t.status}] ${t.content}`).join("\n")
-	const plural = open.length > 1 ? "s" : ""
-	const taskWord = open.length > 1 ? "tasks" : "task"
-	const thisWord = open.length > 1 ? "these" : "this"
-	return `You have ${open.length} unfinished task${plural}:\n${list}\n\nPlease continue working on ${thisWord} ${taskWord}.`
+function resolveToolSuggestion(wrongName: string, available: string[]): string | null {
+	const alias = TOOL_NAME_ALIASES[wrongName.toLowerCase()]
+	if (alias && available.includes(alias)) return alias
+	return suggestClosestTool(wrongName, available)
 }
 
 
@@ -1575,19 +1432,7 @@ function todosFromMessages(messages: unknown): Todo[] | undefined {
 }
 
 /** Model ends with ":" announcing intent without executing. */
-function containsActionIntent(text: string): boolean {
-	if (text.length <= 15) return false
-	const cleaned = text.replace(/<[a-zA-Z/?][^>]*>/g, "").trim()
-	const lines = cleaned.split("\n")
-	let lastLine = ""
-	for (let i = lines.length - 1; i >= 0; i--) {
-		if (lines[i].trim().length > 0) {
-			lastLine = lines[i].trim()
-			break
-		}
-	}
-	return lastLine.endsWith(":") && lastLine.length > 5 && lastLine.length < 500
-}
+
 
 /**
  * True when a turn cleanly ends by handing control back to the user — a
@@ -1671,68 +1516,9 @@ function detectPatternLoop(recentTools: string[]): boolean {
 	return false
 }
 
-/** Edit distance, v1's implementation. Kept byte-for-byte in behaviour: the
- * suggestion is only useful if it picks the same tool v1 would have. */
-function levenshtein(a: string, b: string): number {
-	const m = a.length
-	const n = b.length
-	if (m === 0) return n
-	if (n === 0) return m
-	let prev = new Array<number>(n + 1)
-	let curr = new Array<number>(n + 1)
-	for (let j = 0; j <= n; j++) prev[j] = j
-	for (let i = 1; i <= m; i++) {
-		curr[0] = i
-		for (let j = 1; j <= n; j++) {
-			const cost = a[i - 1] === b[j - 1] ? 0 : 1
-			curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
-		}
-		const tmp = prev
-		prev = curr
-		curr = tmp
-	}
-	return prev[n]
-}
 
-/**
- * The closest registered tool name to one the model invented, or null.
- *
- * The threshold scales with the length of the wrong name — `max(2, len/2)` — so a
- * short name is held to a near-exact match while a long one is allowed to be
- * sloppy. Without that, a two-letter name would match almost anything and the
- * suggestion would be noise.
- */
-/**
- * Names models invent for tools that exist under another name. Edit distance
- * cannot bridge these ("bash"→"shell" is 4 against a threshold of 2), so the
- * map is consulted before the fuzzy matcher. The target must be registered —
- * an unguarded guess names a second nonexistent tool and teaches the model
- * the registry lies.
- */
-const TOOL_NAME_ALIASES: Record<string, string> = {
-	bash: "shell",
-}
 
-function resolveToolSuggestion(wrongName: string, available: string[]): string | null {
-	const alias = TOOL_NAME_ALIASES[wrongName.toLowerCase()]
-	if (alias && available.includes(alias)) return alias
-	return suggestClosestTool(wrongName, available)
-}
 
-function suggestClosestTool(wrongName: string, available: string[]): string | null {
-	const lower = wrongName.toLowerCase()
-	let best: string | null = null
-	let bestDist = Infinity
-	for (const id of available) {
-		const dist = levenshtein(lower, id.toLowerCase())
-		const threshold = Math.max(2, Math.floor(lower.length / 2))
-		if (dist < bestDist && dist <= threshold) {
-			bestDist = dist
-			best = id
-		}
-	}
-	return best
-}
 
 function trackToolCall(w: SessionWatch, toolName: string): boolean {
 	const now = Date.now()
@@ -1816,16 +1602,6 @@ function messageTextOf(m: unknown): string | undefined {
  * The prompt body carries its own signature, so the message itself is the
  * durable record of who wrote it.
  */
-const OWN_PROMPT_SHAPES: RegExp[] = [
-	/^continue\s*\u2014\s*stalled\s*\(/,
-	/^continue\s*\nOnly continue work already in progress\./,
-	/^continue\s*\nIf work was already in progress,/,
-	// The unknown-tool suggestion travels the visible channel when
-	// quietCorrections is off; a reload loses the in-memory record, and the
-	// suggestion read as new instructions re-armed the budget it had just
-	// spent (user report 2026-10-30).
-	/^You tried to use the tool "/,
-]
 
 function isSyntheticInterrupt(text: string | undefined): boolean {
 	if (typeof text !== "string" || text.length === 0) return false
@@ -2060,6 +1836,15 @@ export default define({
 		// listed gets this prompt instead of the details prompt.
 		const doneWithoutWorkPrompt = opts.doneWithoutWorkPrompt ?? DONE_WITHOUT_WORK_PROMPT
 		const thinkingToolRecoveryPrompt = opts.thinkingToolRecoveryPrompt ?? THINKING_TOOL_RECOVERY_PROMPT
+		const DEFAULT_READY_TO_CONTINUE_PATTERNS = [
+			"ready to continue with task",
+			"continuing with task",
+			"continue with task",
+			"proceeding with task",
+			"ready to proceed with task",
+			"will continue with task",
+			"moving on to task",
+		]
 
 		/** Compile a user-supplied regex-source list, skipping anything invalid. */
 		function compilePatterns(
@@ -6404,7 +6189,7 @@ export default define({
 			discoverSessions().catch((e) =>
 				log("error", `discovery failed: ${e instanceof Error ? e.message : String(e)}`),
 			)
-		}, DEFAULT_SESSION_DISCOVERY_INTERVAL_MS)
+		}, SESSION_DISCOVERY_INTERVAL_MS)
 		const initialDiscovery = setTimeout(() => {
 			discoverSessions().catch(() => {})
 		}, discoveryDelayMs)

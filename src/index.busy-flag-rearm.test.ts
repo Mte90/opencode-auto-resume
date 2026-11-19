@@ -2,6 +2,7 @@ import { describe, test, expect, mock } from "bun:test"
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
 import { AutoResumePlugin } from "./index"
+import { DONE_CLAIM_PATTERNS } from "./recovery/shared"
 
 const SOURCE = readFileSync(join(import.meta.dir, "index.ts"), "utf8")
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
@@ -86,8 +87,11 @@ describe("busy-flag rearm: contract assertions on source", () => {
     })
 
     test("FIX A6: DONE_CLAIM_PATTERNS includes broadened patterns", () => {
-        expect(SOURCE).toMatch(/done\\s\+with/i)
-        expect(SOURCE).toMatch(/nothing/i)
+        // DONE_CLAIM_PATTERNS moved to the shared module; assert the real
+        // patterns match representative text rather than scanning source text.
+        const matches = (text: string) => DONE_CLAIM_PATTERNS.some((re) => re.test(text))
+        expect(matches("done with the task")).toBe(true)
+        expect(matches("nothing else left")).toBe(true)
     })
 
     test("FIX B1: fetchSessionTodos function exists", () => {

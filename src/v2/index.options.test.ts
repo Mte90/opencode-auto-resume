@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs"
 import { join } from "node:path"
 import plugin from "./index"
 import { capturePluginLogs } from "./test-utils"
+import { DEFAULT_ACTIVE_USER_WINDOW_MS } from "../recovery/shared"
 
 /** Unique per test FILE: bun runs every file in one process, so two files
  *  starting their counters at 0 derive the SAME tmpdir log path and read each
@@ -463,6 +464,7 @@ describe("v2: contract assertions on source", () => {
 	})
 
 	test("the v2 active-user window matches v1 (5 min), not the 15 min the port shipped with", () => {
-		expect(SOURCE).toMatch(/DEFAULT_ACTIVE_USER_WINDOW_MS = 5 \* 60_000/)
+		// The constant now lives in the shared module; assert the value itself.
+		expect(DEFAULT_ACTIVE_USER_WINDOW_MS).toBe(5 * 60_000)
 	})
 })

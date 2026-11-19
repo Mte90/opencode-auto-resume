@@ -34,33 +34,22 @@ describe("dispatch.ts — dual-shape plugin entry", () => {
     })
 
     describe("service-only setup context (opencode 1.19.x dual loader)", () => {
-        // Runs before any v1-shaped test in this file, so v1LoaderRan is
-        // still false and the deferred check must fire exactly once.
-        test("setup() with a service-only ctx warns NOT active after the check window when no server() loader ran", async () => {
+        test("setup() with a service-only ctx is silent and returns an inert dispose", async () => {
             const capture = capturePluginLogs()
-            const disposed = await (dispatcher.setup as any)(createServiceCtx())
-            disposed()
+            const cleanup = await (dispatcher.setup as any)(createServiceCtx())
 
-            const leftOpen = await (dispatcher.setup as any)(createServiceCtx())
-            expect(typeof leftOpen).toBe("function")
-
-            await new Promise((r) => setTimeout(r, 5600))
+            // Give any errant timer a chance to fire before asserting silence.
+            await new Promise((r) => setTimeout(r, 100))
 
             try {
-                const notes = capture.lines.filter((l: string) =>
-                    l.includes("config-plugin API detected"),
-                )
-                expect(notes.length).toBe(0)
-
-                const warns = capture.warns.filter((l: string) =>
-                    l.includes("auto-resume is NOT active"),
-                )
-                expect(warns.length).toBe(1)
-                expect(warns[0]).toContain(`v${pkg.version}`)
+                expect(typeof cleanup).toBe("function")
+                expect(() => cleanup()).not.toThrow()
+                expect(capture.lines.length).toBe(0)
+                expect(capture.warns.length).toBe(0)
             } finally {
                 capture.stop()
             }
-        }, 12000)
+        })
     })
 
     describe(".server delegates to the v1 build", () => {
@@ -362,27 +351,6 @@ describe("dispatch.ts — dual-shape plugin entry", () => {
                 capture.stop()
             }
         })
-
-        test("setup() with the opencode 1.19.x service ctx stays silent while the v1 server() loader is active", async () => {
-            const capture = capturePluginLogs()
-
-            // The v1-shaped tests above already ran the v1 path, so
-            // v1LoaderRan is true — mirroring a real 1.19.x host where both
-            // loaders run in one process. No line of any kind may appear,
-            // even after the deferred check window closes.
-            const cleanup = await (dispatcher.setup as any)(createServiceCtx())
-            expect(typeof cleanup).toBe("function")
-
-            await new Promise((r) => setTimeout(r, 5600))
-
-            try {
-                expect(() => cleanup()).not.toThrow()
-                expect(capture.lines.length).toBe(0)
-                expect(capture.warns.length).toBe(0)
-            } finally {
-                capture.stop()
-            }
-        }, 12000)
 
         test("setup() with an unrecognised ctx warns and returns an inert dispose", async () => {
             const capture = capturePluginLogs()

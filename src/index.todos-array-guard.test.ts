@@ -1,5 +1,6 @@
 import { describe, test, expect, mock } from "bun:test"
 import { AutoResumePlugin } from "./index"
+import { getOpenTodos, buildOpenTodosReminder } from "./recovery/shared"
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
 
@@ -65,15 +66,15 @@ describe("REGRESSION: todo.updated with non-array todos must not crash the plugi
     })
 
     test("REGRESSION CONTRACT: getOpenTodos must guard against non-array input", () => {
-        const m = SOURCE.match(/function getOpenTodos[\s\S]*?\n\}/)
-        expect(m, "getOpenTodos function not found").not.toBeNull()
-        expect(m![0]).toContain("Array.isArray")
+        // Moved to the shared module; assert the behaviour, not the source text.
+        expect(getOpenTodos(undefined as any)).toEqual([])
+        expect(getOpenTodos({} as any)).toEqual([])
+        expect(getOpenTodos("nope" as any)).toEqual([])
     })
 
     test("REGRESSION CONTRACT: buildOpenTodosReminder must guard against non-array input", () => {
-        const m = SOURCE.match(/function buildOpenTodosReminder[\s\S]*?\n\}/)
-        expect(m, "buildOpenTodosReminder function not found").not.toBeNull()
-        expect(m![0]).toContain("Array.isArray")
+        expect(buildOpenTodosReminder(undefined as any)).toBe("continue")
+        expect(buildOpenTodosReminder({} as any)).toBe("continue")
     })
     test("todo.updated with properties = {} (missing todos field) does not throw", async () => {
         const { ctx } = createMockContext()

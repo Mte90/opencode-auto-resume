@@ -430,6 +430,11 @@ Paths: orphan parent, subagent stuck (parent side), hallucination loop, streamin
 
 ## Architecture
 
+The plugin is one dispatcher (`src/dispatch.ts`) that selects a build from the host context's shape: the v1 build (`src/index.ts`) for opencode 1.x, the v2 build (`src/v2/index.ts`) for 2.x. A shared module (`src/recovery/shared.ts`) is the single source of truth for the values both builds use — constants, thresholds, detection patterns, recovery prompt text, and the pure text helpers. Both builds import from it, so one of those values can only be changed in one place.
+
+The two builds are deliberately not merged: their inputs differ. The v1 build consumes opencode 1.x's coarse event stream (`session.status`, `message.updated`, …) and its `client` API; the v2 build consumes 2.x's typed event stream (`session.step.*`, `session.tool.*`, `session.compaction.*`, …) plus its own HTTP and filesystem access. Their session-state records, stall windows, and recovery budgets also diverged in the field. Merging them behind feature flags would cost more than it saves, so only the genuinely identical parts are shared — where a value differs by design (the continue-prompt formatting, the loop-detection windows, the lifetime cap), each build keeps its own.
+
+A drift guard (`src/recovery/shared.test.ts`) fails the suite if either build re-declares a shared value locally, so a fix can no longer land in one build only.
 
 ## Verification & troubleshooting
 
@@ -437,7 +442,7 @@ To verify the plugin is loaded, run `/status` inside OpenCode — it lists all l
 
 On v2 a clean load writes nothing at startup: warnings and recovery lines go to the server process output, not a file, and there is no ready banner. To confirm the config reached the plugin, trigger any recovery — every action is logged to the process output.
 
-On v1 every startup line carries the loaded build version (`opencode-auto-resume ready (vX.Y.Z)`, `opencode-auto-resume config OK (vX.Y.Z)`), and diagnostics are prefixed `[auto-resume vX.Y.Z]`. opencode 1.19.5 and later run two plugin loaders: the v1 `server()` loader and the v2 config-plugin `setup()` loader. The setup context has service domains only — no event stream and no client — so the plugin cannot recover sessions from it. The dispatcher detects that shape and stays silent — the setup() call is inert by design and the v1 copy loaded through `server()` keeps running; the `ready (vX.Y.Z)` line is the proof it is active. Only when no `server()` loader has run does the dispatcher warn `auto-resume is NOT active on this host`, which means the host offers no loader the plugin can use.
+On v1 every startup line carries the loaded build version (`opencode-auto-resume ready (vX.Y.Z)`, `opencode-auto-resume config OK (vX.Y.Z)`), and diagnostics are prefixed `[auto-resume vX.Y.Z]`. opencode 1.19.5 and later run two plugin loaders: the v1 `server()` loader and a v2 config-plugin `setup()` loader. The setup context has service domains only — no event stream and no client — so the plugin cannot recover sessions from it. The dispatcher detects that shape and stays completely silent: the `setup()` call is inert by design, the v1 copy loaded through `server()` keeps running, and the `ready (vX.Y.Z)` line is the proof it is active.
 
 | Problem | Solution |
 |---|---|
@@ -451,7 +456,7 @@ On v1 every startup line carries the loaded build version (`opencode-auto-resume
 | Long-running tool killed | Should not happen — active-tool guard prevents it. Report a bug. |
 | No plugin activity in the log | The entry is not in a location opencode scans, or not listed in `plugins`; fix the config and restart opencode. |
 | Log says `ctx.app.version is missing` (or `ctx.serverUrl is missing` on v1) | The build was loaded on the wrong server generation. The plugin disables itself with this diagnostic instead of crashing. Update the npm package (the universal entry auto-selects the branch by context shape) or match the build file to the server. |
-| Log says `opencode v2 config-plugin API detected` or `this setup() call is inert` | Expected on opencode 1.19.5+. Its second loader calls `setup()` with a service-only context; the v1 `server()` copy still handles recovery. Confirm the `opencode-auto-resume ready (vX.Y.Z)` startup line. If you instead see `unrecognised host context`, the host shape is unsupported. |
+| Nothing appears on opencode 1.19.5+ | Expected. Its second loader calls `setup()` with a service-only context; the plugin stays silent there and the v1 `server()` copy handles recovery. Confirm the `opencode-auto-resume ready (vX.Y.Z)` startup line. If you instead see `unrecognised host context`, the host shape is unsupported. |
 | Never recovers a parent waiting on a subagent | Intentional: parent sessions blocked on a running subagent are left alone. |
 | Never recovers while a permission dialog is open | Intentional: recovery is held until the permission is answered. |
 | Recovers but you don't see a notice (v2) | Your model/provider may reject `session.synthetic()`; the plugin falls back to `session.prompt()` (no TUI banner). |

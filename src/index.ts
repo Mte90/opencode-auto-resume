@@ -7,14 +7,61 @@ import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import type { SessionPromptResponses } from "@opencode-ai/sdk"
 import pkg from "../package.json"
+import {
+    DEFAULT_CHUNK_TIMEOUT_MS,
+    DEFAULT_CHECK_INTERVAL_MS,
+    DEFAULT_DISCOVERY_DELAY_MS,
+    DEFAULT_ACTIVE_USER_WINDOW_MS,
+    DEFAULT_GRACE_PERIOD_MS,
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_MAX_BACKOFF_MS,
+    DEFAULT_BASE_BACKOFF_MS,
+    DEFAULT_SUBAGENT_WAIT_MS,
+    DEFAULT_LOOP_MAX_CONTINUES,
+    DEFAULT_LOOP_WINDOW_MS,
+    DEFAULT_TOOL_TEXT_CHECK_DELAY_MS,
+    DEFAULT_MAX_RECOVERY_RETRIES,
+    DEFAULT_MIN_ACTIVITY_GAP_MS,
+    DEFAULT_WARMUP_MS,
+    DEFAULT_SILENT_DEAD_STREAM_MIN_TOKENS,
+    DEFAULT_DEBUG,
+    MAX_IDLE_SESSIONS,
+    IDLE_CLEANUP_MS,
+    SESSION_DISCOVERY_INTERVAL_MS,
+    CTX_WRAPUP_TRIGGER,
+    UNKNOWN_TOOL_THRESHOLD,
+    TOOL_IDS_CACHE_MS,
+    OOC_ERROR_RE,
+    DEFAULT_STREAMING_FAILURE_ERROR_NAMES,
+    DEFAULT_STREAMING_FAILURE_MESSAGE_PATTERNS,
+    TOOL_TEXT_PATTERNS,
+    TRUNCATED_XML_PATTERNS,
+    READY_TO_CONTINUE_PATTERNS,
+    OWN_PROMPT_SHAPES,
+    DONE_CLAIM_PATTERNS,
+    TOOL_TEXT_RECOVERY_PROMPT,
+    THINKING_TOOL_RECOVERY_PROMPT,
+    TOOL_LOOP_RECOVERY_PROMPT,
+    TASK_COMPLETE_ACK,
+    TASK_COMPLETE_REPEAT_WARNING,
+    TASK_COMPLETE_REPEAT_ERROR,
+    DONE_WITHOUT_WORK_PROMPT,
+    DONE_WITHOUT_DETAILS_PROMPT,
+    CONTINUE_PROMPT,
+    containsToolCallAsText,
+    getOpenTodos,
+    isOpenTodo,
+    suggestClosestTool,
+    levenshtein,
+    stripCodeBlocks,
+    containsDoneClaimPattern,
+    containsActionIntent,
+    containsWorkDescription,
+    buildOpenTodosReminder,
+    Todo,
+} from "./recovery/shared"
 
 const PLUGIN_VERSION = pkg.version
-
-interface Todo {
-    content: string
-    status: "pending" | "in_progress" | "completed" | "cancelled"
-    priority: "high" | "medium" | "low"
-}
 
 interface ToolCallRecord {
     toolName: string
@@ -86,153 +133,10 @@ export interface SessionWatch {
     checkedToolPartIDs: Set<string>
 }
 
-const DEFAULT_CHUNK_TIMEOUT_MS = 180_000
-const DEFAULT_CHECK_INTERVAL_MS = 5_000
-const DEFAULT_DISCOVERY_DELAY_MS = 5_000
-// Active-user window: an inbound user message this recent means the user is
-// engaged (likely composing) — idle open-todos nudges stand down.
-const DEFAULT_ACTIVE_USER_WINDOW_MS = 5 * 60_000
-const DEFAULT_GRACE_PERIOD_MS = 3_000
-const DEFAULT_MAX_RETRIES = 3
-const DEFAULT_MAX_BACKOFF_MS = 8_000
-const DEFAULT_BASE_BACKOFF_MS = 1_000
-const DEFAULT_SUBAGENT_WAIT_MS = 15_000
 const ABORT_CONTINUE_DELAY_MS = 2_000
-const DEFAULT_LOOP_MAX_CONTINUES = 3
-const DEFAULT_LOOP_WINDOW_MS = 10 * 60_000
-const DEFAULT_TOOL_TEXT_CHECK_DELAY_MS = 3_000
-const DEFAULT_MAX_RECOVERY_RETRIES = 2
-const DEFAULT_MIN_ACTIVITY_GAP_MS = 1_000
-const DEFAULT_WARMUP_MS = 15_000
-const DEFAULT_SILENT_DEAD_STREAM_MIN_TOKENS = 200
-const DEFAULT_DEBUG = false
-// Context-overflow (OOC) errors that a "continue" prompt can never clear: the
-// request simply exceeds the model's context window. Latching on these stops
-// the recovery loop that would otherwise retry forever (incident
-// ses_f239075d3ffeRK43uZ: 193 auto-resume continuations, session unusable).
-const OOC_ERROR_RE = /exceeds the available context size|context size \(\d+\)|too large to compact|too many tokens|prompt is too long/i
 
-const DEFAULT_STREAMING_FAILURE_ERROR_NAMES = [
-    "ProviderError",
-    "APIError",
-    "StreamError",
-    "ConnectionError",
-    "TimeoutError",
-]
 
-const DEFAULT_STREAMING_FAILURE_MESSAGE_PATTERNS = [
-    "streaming response failed",
-    "stream.*fail",
-    "connection.*reset",
-    "connection.*closed",
-    "aborted due to timeout",
-]
 
-const MAX_IDLE_SESSIONS = 50
-const IDLE_CLEANUP_MS = 10 * 60_000
-const SESSION_DISCOVERY_INTERVAL_MS = 60_000
-
-const TOOL_TEXT_RECOVERY_PROMPT =
-    "Your last message contained a raw tool call printed as text instead of being executed. " +
-    "Please use the proper tool calling mechanism to execute it."
-
-const THINKING_TOOL_RECOVERY_PROMPT =
-    "I noticed you have a tool call generated in your thinking/reasoning. " +
-    "Please execute it using the proper tool calling mechanism instead of keeping it in reasoning."
-
-const TOOL_LOOP_RECOVERY_PROMPT =
-    "I notice you've been calling the same tool multiple times in a row without making progress. " +
-    "Please step back and reassess your approach. Consider: " +
-    "1) Are you stuck in a loop? 2) Do you need different information first? " +
-    "3) Should you try a different tool or break the task into smaller steps? " +
-    "Take a moment to think about what's blocking you and propose a different strategy."
-
-// task_complete acknowledgement texts. The ack tool-result is fed back into
-// the model's turn, so a stuck model re-emits task_complete instead of ending
-// with text (observed in production: 27 consecutive acked calls, zero new
-// user input). The first ack therefore carries an explicit stop instruction;
-// repeats escalate to a thrown error so the turn is forced to end.
-const TASK_COMPLETE_ACK =
-    "Task completion acknowledged. No further continuation will be sent. " +
-    "End your turn now with a brief text reply — do not call task_complete or any other tool again " +
-    "unless the user sends a new message."
-
-const TASK_COMPLETE_REPEAT_WARNING =
-    "Task completion acknowledged already on your previous call — completion is recorded. " +
-    "End your turn now with a brief text reply. Do not call task_complete again; " +
-    "further repeat calls are rejected as errors."
-
-const TASK_COMPLETE_REPEAT_ERROR =
-    "task_complete already acknowledged twice with no new user message or tool work since — " +
-    "completion is recorded. End your turn with text and make no further tool calls."
-
-const CTX_WRAPUP_TRIGGER = "ctx-wrapup"
-const UNKNOWN_TOOL_THRESHOLD = 2
-const TOOL_IDS_CACHE_MS = 5 * 60_000
-// Prompt bodies this plugin itself injects through the visible channel. The
-// server records them as user messages, so the user-message re-arm must not
-// treat them as a genuine new request — otherwise the suggestion re-arms the
-// budget it just spent and the plugin loops (user report 2026-10-30).
-const OWN_PROMPT_SHAPES: RegExp[] = [
-	/^continue\s*\u2014\s*stalled\s*\(/,
-	/^continue\s*\nOnly continue work already in progress\./,
-	/^continue\s*\nIf work was already in progress,/,
-	/^You tried to use the tool "/,
-]
-
-const TOOL_TEXT_PATTERNS = [
-    /<function\s*=/i,
-    /<function>/i,
-    /<\/function>/i,
-    /<parameter\s*=/i,
-    /<parameter>/i,
-    /<\/parameter>/i,
-    /<tool_call[\s>]/i,
-    /<\/tool_call>/i,
-    /<tool[\s_]name\s*=/i,
-    /<invoke\s+/i,
-    /<func(?:t|ti|tio|tion)?$/im,
-    /<par(?:a|am|ame|amet|amete|ameter)?$/im,
-    /<(?:edit|write|read|bash|grep|glob|search|replace|execute|run)\s*(?:\s[^>]*)?\s*(?:\/>|>)/i,
-    /{"type":\s*"function"/i,
-    /{"name":\s*"[a-zA-Z_]/i,
-    /\{\s*"type"\s*:?$/im,
-    /\{\s*"name"\s*:?$/im,
-]
-
-const TRUNCATED_XML_PATTERNS = [
-    { open: /<function[^>]*>/i, close: /<\/function>/i },
-    { open: /<parameter[^>]*>/i, close: /<\/parameter>/i },
-    { open: /<tool_call[^>]*>/i, close: /<\/tool_call>/i },
-    { open: /\{\s*"type"\s*:/i, close: /}/ },
-    { open: /\{\s*"name"\s*:/i, close: /}/ },
-]
-
-const READY_TO_CONTINUE_PATTERNS = [
-    /ready to continue with task/i,
-    /continuing with task/i,
-    /continue with task/i,
-    /proceeding with task/i,
-    /ready to proceed with task/i,
-    /will continue with task/i,
-    /moving on to task/i,
-]
-
-function stripCodeBlocks(text: string): string {
-    return text
-        .replace(/```[\s\S]*?```/g, "")
-        .replace(/`[^`\n]+`/g, "")
-}
-
-function containsToolCallAsText(text: string): boolean {
-    if (text.length <= 10) return false
-    const stripped = stripCodeBlocks(text)
-    if (TOOL_TEXT_PATTERNS.some((pat) => pat.test(stripped))) return true
-    for (const { open, close } of TRUNCATED_XML_PATTERNS) {
-        if (open.test(stripped) && !close.test(stripped)) return true
-    }
-    return false
-}
 
 function containsReadyToContinuePattern(text: string, patterns: RegExp[] = READY_TO_CONTINUE_PATTERNS): boolean {
     const lines = text.split('\n')
@@ -242,86 +146,15 @@ function containsReadyToContinuePattern(text: string, patterns: RegExp[] = READY
     return patterns.some((pat) => pat.test(lastLines))
 }
 
-const DONE_CLAIM_PATTERNS = [
-    /^task\s+done[.!]*$/im,
-    /^done[.!]*$/im,
-    /^all\s+done[.!]*$/im,
-    /^finished[.!]*$/im,
-    /^complete[.!]*$/im,
-    /^task\s+complete[.!]*$/im,
-    /^task\s+completed[.!]*$/im,
-    /^all\s+tasks?\s+complete[.!]*$/im,
-    /^all\s+tasks?\s+completed[.!]*$/im,
-    /^(?:i['']?m\s+)?done\s+with\s+task/im,
-    /\bdone\s+with\s+(?:the\s+)?(?:task|work|implementation)/im,
-    /\bfinished\s+(?:the\s+)?(?:task|work|implementation)/im,
-    /\b(?:all|everything)\s+(?:is\s+)?(?:complete|done|finished)/im,
-    /\bnothing\s+(?:else\s+)?(?:left|remaining|to do)/im,
-]
 
-const DONE_WITHOUT_WORK_PROMPT =
-    "I need you to verify more carefully that you have actually completed all the required tasks. " +
-    "Your response indicated you're done, but no work was detected. Please check your todo list " +
-    "and complete any remaining work."
 
-const DONE_WITHOUT_DETAILS_PROMPT =
-    "Your last response claimed the task is complete but contained no work description. This is not acceptable. " +
-    "You MUST respond now with a full, detailed report of everything you did: " +
-    "for each file you modified, state the full path and the exact changes; " +
-    "list every command you ran to verify and its result; state the final outcome. " +
-    "Do NOT reply with 'done', 'task completed', or any short acknowledgment — " +
-    "your ONLY acceptable response right now is this detailed report. Write it now."
-
-function containsDoneClaimPattern(text: string, patterns: RegExp[] = DONE_CLAIM_PATTERNS): boolean {
-    const lines = text.split('\n')
-    const lastLines = lines.slice(-5).join('\n')
-    return patterns.some((pat) => pat.test(lastLines))
-}
 
 // A done-claim that already carries a concrete work report satisfies the
 // details demand on its own — prompting again would loop forever (#26).
-function containsWorkDescription(text: string): boolean {
-    // Backticked span mentioning a dotted filename: `src/index.ts`
-    if (/`[^`\n]*\.[a-zA-Z0-9]{1,8}[^`\n]*`/.test(text)) return true
-    // Bare path with a slash and a dotted extension: src/index.ts, /a/b.py
-    if (/[\w\-~.][\w\-.~\/]*\/[\w\-.~]*\.[a-zA-Z]{1,8}\b/.test(text)) return true
-    // Report section headers: files changed, verification, results, ...
-    if (/^(changed|modified|deleted|created|updated|renamed|moved|files?\s+changed|verification|verified|tests?(?:\s+run|\s+passing|\s+pass)?|results?|outcome|commands?\s+(?:run|executed))/im.test(text)) return true
-    return false
-}
 
-function levenshtein(a: string, b: string): number {
-    const m = a.length, n = b.length
-    if (m === 0) return n
-    if (n === 0) return m
-    let prev = new Array<number>(n + 1)
-    let curr = new Array<number>(n + 1)
-    for (let j = 0; j <= n; j++) prev[j] = j
-    for (let i = 1; i <= m; i++) {
-        curr[0] = i
-        for (let j = 1; j <= n; j++) {
-            const cost = a[i - 1] === b[j - 1] ? 0 : 1
-            curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
-        }
-        const tmp = prev; prev = curr; curr = tmp
-    }
-    return prev[n]
-}
 
-function suggestClosestTool(wrongName: string, available: string[]): string | null {
-    const lower = wrongName.toLowerCase()
-    let best: string | null = null
-    let bestDist = Infinity
-    for (const id of available) {
-        const dist = levenshtein(lower, id.toLowerCase())
-        const threshold = Math.max(2, Math.floor(lower.length / 2))
-        if (dist < bestDist && dist <= threshold) {
-            bestDist = dist
-            best = id
-        }
-    }
-    return best
-}
+
+
 
 function isStreamingFailure(
     errorName: string,
@@ -479,28 +312,9 @@ function backoffMs(
  * Detect an "action intent" — the model ends with `:` announcing intent
  * (e.g. "Voy a editar el archivo:") without executing. Used to nudge.
  */
-function containsActionIntent(text: string): boolean {
-    if (text.length <= 15) return false
-    const cleaned = text.replace(/<[a-zA-Z/?][^>]*>/g, "").trim()
-    const lines = cleaned.split('\n')
-    let lastLine = ""
-    for (let i = lines.length - 1; i >= 0; i--) {
-        if (lines[i].trim().length > 0) {
-            lastLine = lines[i].trim()
-            break
-        }
-    }
-    return lastLine.endsWith(":") && lastLine.length > 5 && lastLine.length < 500
-}
 
-function isOpenTodo(t: Todo): boolean {
-    return t.status === "pending" || t.status === "in_progress"
-}
 
-function getOpenTodos(todos: Todo[]): Todo[] {
-    if (!Array.isArray(todos)) return []
-    return todos.filter(isOpenTodo)
-}
+
 
 // `stopPatterns` option → RegExp list (invalid patterns are skipped).
 function parseStopPatterns(raw: unknown): RegExp[] {
@@ -515,16 +329,7 @@ function endsWithStopLine(parts: Array<Record<string, unknown>>, patterns: RegEx
     return patterns.some(re => re.test(text))
 }
 
-function buildOpenTodosReminder(todos: Todo[]): string {
-    if (!Array.isArray(todos)) return "continue"
-    const open = todos.filter(t => t.status === "pending" || t.status === "in_progress")
-    if (open.length === 0) return "continue"
-    const list = open.map((t, i) => `${i + 1}. [${t.status}] ${t.content}`).join("\n")
-    const plural = open.length > 1 ? "s" : ""
-    const taskWord = open.length > 1 ? "tasks" : "task"
-    const thisWord = open.length > 1 ? "these" : "this"
-    return `You have ${open.length} unfinished task${plural}:\n${list}\n\nPlease continue working on ${thisWord} ${taskWord}.`
-}
+
 
 export const AutoResumePlugin: Plugin = async (ctx, options) => {
     // Build/server version guard: this bundle only works on opencode v1, whose
@@ -579,7 +384,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     const resumeOnActionIntent: boolean =
     (options?.resumeOnActionIntent as boolean) !== false
     const continuePrompt: string =
-    (options?.continuePrompt as string) ?? "continue"
+    (options?.continuePrompt as string) ?? CONTINUE_PROMPT
     const actionIntentPrompt: string =
     (options?.actionIntentPrompt as string) ?? continuePrompt
     const toolTextRecoveryPrompt: string =
