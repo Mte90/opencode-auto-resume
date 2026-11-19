@@ -372,6 +372,10 @@ interface SessionWatch {
 	 * a new turn (markBusy) re-arms it. Without the flag every repeat idle
 	 * would nag a session that is legitimately quiet. */
 	emptyIdleNudged: boolean
+	/** One-shot guard for the instant resume fired on a non-user interruption.
+	 * Reset only by a genuine user message (a new episode), never by lifecycle
+	 * transitions — a repeated non-user interrupt must not stack continues. */
+	instantInterruptResumeFired: boolean
 	/** The session's todo list, read from the todo tool's storage key. */
 	todos: Todo[]
 	todosFetchedAt: number
@@ -2096,6 +2100,7 @@ export default define({
 					completionHard: false,
 					latchReopened: false,
 					emptyIdleNudged: false,
+					instantInterruptResumeFired: false,
 					subagentRecoveryTried: false,
 					todos: [],
 					todosFetchedAt: 0,
@@ -4164,6 +4169,59 @@ export default define({
 		}
 
 		/**
+		 * A non-user interruption (reason `shutdown`/`superseded`/`inactivity`)
+		 * leaves the session idle with no recovery armed, so it would sit until
+		 * the stall timeout (180s/600s). Try ONE immediate continue before that
+		 * wait. Deliberately narrow: an unknown or missing reason is treated as
+		 * a user stop (no continue), user interrupts never resume, and a genuine
+		 * user message re-arms the one-shot for the next episode.
+		 *
+		 * This is the runtime mechanism behind the operator request "one instant
+		 * continue before enabling the timeouts, without conflicting with user
+		 * interrupts". 2026-11-19.
+		 */
+		async function instantResumeAfterNonUserInterrupt(sid: string, reason: string, interruptedAt: number): Promise<void> {
+			if (reason !== "shutdown" && reason !== "superseded" && reason !== "inactivity") return
+			const w = ensureWatch(sid)
+			if (w.instantInterruptResumeFired) return
+			if (w.userCancelled || w.gaveUp || w.permissionPending || w.failureLoopLatched) return
+			if (w.completionSignaled || w.completionHard) return
+			if (w.recovering) return
+			{
+				const kind = lockKind(w)
+				if (kind) {
+					dbg(`${short(sid)} locked (${kind}) — refusing instant resume after interruption`)
+					return
+				}
+			}
+			if (w.compacting || selfAbortActive(w)) return
+			// Refresh the genuine-user clock from history before checking takeover.
+			const messages = await loadMessages(sid)
+			noteInboundUserMessage(sid, w, messages)
+			if (w.userCancelled || w.lastGenuineUserAt >= interruptedAt) return
+			if (isWaitingOnUser(sid, w, messages)) return
+			// A turn that ended with a completion claim is done, not interrupted
+			// mid-work — never restart it. Check the literal last line explicitly
+			// so a trailing TASK COMPLETE cannot slip through the pattern check.
+			const tail = w.lastAssistantText || lastAssistantTextFrom(messages)
+			if (tail && turnEndsWithCompletionClaim(tail)) return
+			const lastLine = stripBoundaryMarkers(tail).split("\n").map((l) => l.trim()).filter((l) => l.length > 0).pop() ?? ""
+			if (/\btask\s+complete(d)?\b[.!]*$/i.test(lastLine)) return
+			// Budget: this instant continue is the episode's first, so it counts
+			// toward the shared loop window and lifetime cap like any other.
+			if (continuesInWindow(w) >= baseLoopMaxContinues || lifetimeExhausted(sid, w)) return
+			w.instantInterruptResumeFired = true
+			recordContinue(sid)
+			syncCounters(sid, w)
+			log("info", `${short(sid)} instant resume after interruption (${reason}) — one-shot before stall timeout`)
+			const ok = await injectOnce(sid, opts.continuePrompt ?? SAFE_EMPTY_IDLE_PROMPT, "interruption — instant resume")
+			if (ok) {
+				touch(sid)
+				markBusy(sid)
+			}
+		}
+
+		/**
 		 * True when any assistant message exists after the newest user message.
 		 * Anything the model said or did — text, reasoning, tool calls — counts:
 		 * the instant nudge is only for a turn with literally no reply.
@@ -4466,6 +4524,9 @@ export default define({
 				dbg(`${short(sid)} new user message — restarting the stall ladder`)
 			}
 			w.resumeAttempts = 0
+			// A genuine user message starts a new episode: re-arm the one-shot
+			// instant resume so the next non-user interrupt can try once again.
+			w.instantInterruptResumeFired = false
 			// The user owns the turn now: a retry scheduled before their message
 			// no longer describes what a stall after it means.
 			w.providerRetryAt = 0
@@ -6792,6 +6853,14 @@ export default define({
 				if (!mine) {
 					w.userCancelled = reason === undefined || reason === "user"
 					if (w.userCancelled) w.userCancelledAt = Date.now()
+				}
+				// A non-user interruption (shutdown/superseded/inactivity) must
+				// not leave the session sitting idle for the whole stall timeout.
+				// Fire one immediate, fully-guarded continue before that wait.
+				// Fire-and-forget: the event pump must not block on the history
+				// read; the helper re-checks every guard before injecting.
+				if (!mine && !w.userCancelled && reason) {
+					void instantResumeAfterNonUserInterrupt(sid, reason, Date.now())
 				}
 					// A user interrupt also ends any in-flight compaction.
 					w.compacting = false
