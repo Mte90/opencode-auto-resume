@@ -378,9 +378,9 @@ _Motivated by:_
 
 Long-running quota blocks (or any delicate work) can be paused without deleting the session:
 
-- Slash command: `/auto-resume off` pauses the current session, `/auto-resume on` resumes, `/auto-resume` (or `/auto-resume status`) reports state. While paused, auto-resume will not inject a continue nudge and will not arm the quota ladder.
-- CLI helper (works without opening the chat): `auto-resume-toggle <sessionID> off|on|status`, plus `auto-resume-toggle --all off|on` to pause/resume every session.
-- Pause is sticky within a run: it stays off until an explicit `on`, so a forgotten pause won't silently re-arm. A restart of opencode/OpenChamber clears all pauses (re-arms auto-resume), so a stale pause can never outlive a session. (The marker file is `~/.config/opencode/auto-resume.paused`.)
+- Slash command (v2): `/auto-resume off` pauses **only the current session**, `/auto-resume on` resumes it, and `/auto-resume` (or `/auto-resume status`) reports that session's state. The command is strictly session-scoped — there is no global/all-session form. While paused, auto-resume does not inject a continue nudge or arm the quota ladder for that session; other sessions are unaffected.
+- CLI helper (works without opening the chat): `auto-resume-toggle <sessionID> off|on|status`. The old `auto-resume-toggle --all` form writes a global `*` wildcard that the v2 build ignores — use a session ID instead.
+- A pause lasts only for the current opencode process. At startup the v2 plugin deletes the marker file (`~/.config/opencode/auto-resume.paused`), re-arming auto-resume for every session. A stale pause can never survive a restart.
 
 #### Todo list nudges
 

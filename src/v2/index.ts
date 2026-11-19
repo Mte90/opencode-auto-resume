@@ -2159,8 +2159,9 @@ export default define({
 		}
 
 		// ---- Pause / resume (user-controlled) ---------------------------------
-		// Source of truth: a marker file listing paused session ids (one per line)
-		// or "*" for all. Written by the CLI helper and the /auto-resume command.
+		// Source of truth: a marker file listing paused session ids (one per line).
+		// Only real `ses_*` ids count — the old global "*" wildcard is ignored, so
+		// pause is strictly per-session. Written by the CLI helper and the /auto-resume command.
 		function readPausedSet(): Set<string> {
 			try {
 				const raw = readFileSync(PAUSED_MARKER_FILE, "utf8")
