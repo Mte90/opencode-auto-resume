@@ -21,6 +21,9 @@
   "author": "Daniele \"mte90\" Scasciafratte",
   "type": "module",
   "main": "dist/index.js",
+  "exports": {
+    ".": "./dist/index.js"
+  },
   "scripts": {
     "build": "bun run build:v1 && bun run build:v2",
     "build:v1": "bun build src/dispatch.ts --outfile dist/index.js --target bun",
