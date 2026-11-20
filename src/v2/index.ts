@@ -327,8 +327,6 @@ interface SessionWatch {
 	indeterminateStrikes: number
 	/** True while one of our own recovery continues is in flight — distinguishes a self-caused execution.started from a genuine turn. */
 	selfRecovery: boolean
-	/** True when a recovery prompt was sent while the session was already busy. Used by parked detection to escalate instead of firing another prod. */
-	recoverySentWhileBusy: boolean
 
 	// Assistant text accumulation (v2 replacement for session.messages())
 	textParts: Map<string, string> // assistantMessageID -> accumulated text
@@ -2044,7 +2042,6 @@ export default define({
 				w.lifetimeContinues ??= 0
 				w.inflightTools ??= new Map()
 				w.lastStuckToolCheck ??= 0
-				w.recoverySentWhileBusy ??= false
 				return w
 			}
 			if (!w) {
@@ -2084,7 +2081,6 @@ export default define({
 					permLockReason: null,
 					indeterminateStrikes: 0,
 					selfRecovery: false,
-					recoverySentWhileBusy: false,
 					textParts: new Map(),
 					lastAssistantText: "",
 					lastAssistantMessageID: null,
@@ -2958,13 +2954,7 @@ export default define({
 		}
 
 		async function notifyAndPrompt(sid: string, text: string, notification: string, resume = true, forceSynthetic = false): Promise<boolean> {
-			const w = ensureWatch(sid)
-			w.selfRecovery = true
-			// Track if the recovery prompt was sent while the session was already busy.
-			// This is the key discriminator for parked detection: if the session was
-			// busy when we sent the prompt, and it's still busy with no activity since,
-			// the prompt was parked and we should escalate.
-			w.recoverySentWhileBusy = w.status === "busy"
+			ensureWatch(sid).selfRecovery = true
 			if (visibleContinue && !forceSynthetic) {
 				// Cattleprod-style: a real user message in session history, so the
 				// intervention — and any loop — is self-evident in the transcript.
@@ -4169,10 +4159,7 @@ export default define({
 			// concurrently, whose claim is not ours to clear.
 			const wasSelfRecovery = w.selfRecovery
 			const sent = await notifyAndPrompt(sid, opts.continuePrompt ?? SAFE_EMPTY_IDLE_PROMPT, "empty-idle nudge")
-			if (!wasSelfRecovery) {
-				w.selfRecovery = false
-				w.recoverySentWhileBusy = false
-			}
+			if (!wasSelfRecovery) w.selfRecovery = false
 			return sent
 		}
 
@@ -6126,47 +6113,9 @@ export default define({
 					// that even though the default policy refuses to.
 					await tryAbortAndResume(sid, w, true)
 				} else {
-					// PARKED detection (v2 adaptation of v1's ab1a083 fix):
-					// A continue prompt sent into an already-busy session is parked
-					// by the host and never dispatched. When the session is busy
-					// with stale activity (no events since before this check), the
-					// previous recovery send did not resume it → escalate to
-					// abort+resume instead of firing another prod that will also park.
-					// Discriminator: w.recoverySentWhileBusy === true && w.status === "busy" means
-					// "recovery prompt sent while busy AND session still busy" (the exact
-					// parked condition; recoverySentWhileBusy is set by notifyAndPrompt).
-					const isParked = w.recoverySentWhileBusy === true && w.status === "busy"
-					if (
-						isParked &&
-						!w.userCancelled &&
-						!w.completionSignaled &&
-						!w.gaveUp &&
-						!w.aborting &&
-						!w.compacting &&
-						!w.permissionPending &&
-						!selfAbortActive(w)
-					) {
-						// Budgeted: do not escalate a permanently wedged runner on
-						// every check interval. Exhausting the ladder latches gaveUp
-						// (re-armed only by a genuine new user message).
-						if (w.resumeAttempts < maxRetries) {
-							log(
-								"warn",
-								`${short(sid)} prompt parked (busy with no activity) — escalating via abort+resume (attempt ${w.resumeAttempts + 1}/${maxRetries})`,
-							)
-							await tryAbortAndResume(sid, w, true)
-						} else {
-							log(
-								"warn",
-								`${short(sid)} prompt parked but abort+resume budget exhausted (${w.resumeAttempts}/${maxRetries}) — standing down (gaveUp)`,
-							)
-							w.gaveUp = true
-						}
-					} else {
-						const _qm = await loadMessages(sid)
-						if (quotaGuard(sid, w, _qm)) continue
-						await recover(sid, `no activity for ${Math.ceil(silence / 1000)}s`)
-					}
+					const _qm = await loadMessages(sid)
+					if (quotaGuard(sid, w, _qm)) continue
+					await recover(sid, `no activity for ${Math.ceil(silence / 1000)}s`)
 				}
 			}
 			// Rate-limit gate: sessions stood down on quota get one attempt per
@@ -6647,7 +6596,6 @@ export default define({
 					const w = ensureWatch(sid)
 					if (w.selfRecovery) {
 						w.selfRecovery = false
-						w.recoverySentWhileBusy = false
 					} else {
 						// A provider retry that opencode schedules itself starts a
 						// turn without the user asking. It is not a new episode: it
@@ -6797,7 +6745,6 @@ export default define({
 					const w = ensureWatch(sid)
 					w.pendingRecoveryArmed = false
 					w.selfRecovery = false // stale — no in-flight recovery prompt by the time we idle
-					w.recoverySentWhileBusy = false // also clear when idling
 					// Never run the idle heuristics on top of our own abort: the idle
 					// transition caused by interrupt() would otherwise trigger a second,
 					// independent injection.
