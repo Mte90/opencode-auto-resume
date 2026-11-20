@@ -58,6 +58,7 @@ import {
     containsActionIntent,
     containsWorkDescription,
     buildOpenTodosReminder,
+    TASK_COMPLETE_BLOCK_PREFIX,
     Todo,
 } from "./recovery/shared"
 
@@ -724,6 +725,10 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         let agent: string | undefined
         let model: { providerID: string; modelID: string } | undefined
         
+        // Capture pre-send state to detect parked prompts (session was already busy)
+        const wasBusyAtSend = w.status === "busy"
+        const sentAt = Date.now()
+        
         try {
             const msgs = await getSessionMessages(sid)
 
@@ -811,6 +816,55 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         // If this was a streaming-failure recovery (pendingRecovery armed),
         // retry up to maxRecoveryRetries and then escalate to abort+resume.
         setTimeout(async () => {
+            // PARKED detection: session was already busy at send, still busy now,
+            // and produced no activity after the send → the prompt is parked.
+            const now = Date.now()
+            const isParked = wasBusyAtSend && w.status === "busy" && w.lastActivityAt <= sentAt
+            
+            if (isParked) {
+                // Do NOT report success. Log warning and escalate.
+                await log("warn", `${short(sid)} - prompt parked: session was already busy and produced no activity after the send`)
+
+                // Guard like neighbouring escalations: skip if cancelled/completed/aborting/gaveUp
+                if (w.userCancelled || w.completionSignaled || w.aborting || w.gaveUp) {
+                    return
+                }
+
+                // Parked deliveries are budgeted: a permanently stuck runner must not
+                // be abort+resumed on every check interval. Each escalation consumes
+                // the same recovery budget as the other paths, and exhausting it latches
+                // gaveUp (re-armed only by a genuine new user message).
+                if (w.recoveryAttempts >= maxRecoveryRetries) {
+                    w.gaveUp = true
+                    w.pendingRecovery = false
+                    w.pendingRecoveryReason = null
+                    await log("warn", `Parked prompt exhausted on ${short(sid)}: attempts=${w.recoveryAttempts}, maxRetries=${maxRecoveryRetries} — GAVE UP (re-arms on next user message)`)
+                    dbg(`Parked prompt on ${short(sid)}: status=${w.status} -> GAVE_UP (latched)`)
+                    if (w.pendingRecoveryAt > 0) {
+                        dbg(`Total recovery cycle on ${short(sid)} (failed): totalCycleMs=${now - w.pendingRecoveryAt}`)
+                    }
+                    return
+                }
+
+                w.recoveryAttempts++
+                dbg(`State transition on ${short(sid)}: recoveryAttempts=${w.recoveryAttempts - 1} -> ${w.recoveryAttempts}`)
+                await log("warn", `Parked prompt on ${short(sid)}: attempt=${w.recoveryAttempts}/${maxRecoveryRetries}, nextAction=abort-resume`)
+                dbg(`Parked prompt on ${short(sid)}: wasBusyAtSend=true, lastActivityAt=${w.lastActivityAt}, sentAt=${sentAt} -> ABORT_RESUME`)
+                const resumed = await tryAbortAndResume(sid, w)
+                if (!resumed && !w.aborting) {
+                    // Hard stop: abort+resume ALSO failed
+                    w.gaveUp = true
+                    w.pendingRecovery = false
+                    w.pendingRecoveryReason = null
+                    await log("warn", `Parked prompt exhausted on ${short(sid)}: attempts=${w.recoveryAttempts}, lastError=abort+resume failed — GAVE UP (re-arms on next user message)`)
+                    dbg(`Parked prompt on ${short(sid)}: status=${w.status} -> GAVE_UP (latched)`)
+                    if (w.pendingRecoveryAt > 0) {
+                        dbg(`Total recovery cycle on ${short(sid)} (failed): totalCycleMs=${now - w.pendingRecoveryAt}`)
+                    }
+                }
+                return
+            }
+            
             if (w.status !== "busy") {
                 if (w.pendingRecovery) {
                     // Disarm on ESC/completion: without this the retry burns an
@@ -2842,6 +2896,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     const w = sessions.get(sid)
                     if (w) {
                         w.doneClaimNoTodosAttempts = 0
+                        w.taskCompleteOverrides = 0 // completion-override budget is per work cycle
                         w.lastUserMessageAt = Date.now()
                         w.subagentRecoveryTried = false
                         w.unknownToolErrors.clear()
@@ -3003,7 +3058,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         // reset the repeat-signal counter.
                         w.taskCompleteSignals = 0
                         const reminder = buildOpenTodosReminder(w.todos)
-                        const blockMsg = `Mark any finished todos complete and do not redo completed work.\n${reminder}`
+                        const blockMsg = `${TASK_COMPLETE_BLOCK_PREFIX}\n${reminder}`
                         await log("info", `${short(ctx.sessionID)} - task_complete blocked: ${openTodos.length} open todos remain (override ${w.taskCompleteOverrides}/${maxRetries})`)
                         // Fire a visible nudge naming the blocking todos so the model sees
                         // exactly what is still open, even if this tool result collapses to
@@ -3049,7 +3104,11 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     // -----------------------------------------------------------------------
 
     return {
-        event: async ({ event }) => {
+        // Test-only: expose sendContinuePrompt for behavioral tests
+        __sendContinuePromptForTest: sendContinuePrompt,
+        // Test-only: expose sessions map for behavioral tests
+        __sessionsForTest: sessions,
+        event: async ({ event }: { event: unknown }) => {
             if (!initialised) {
                 initialised = true
                 log("info", `opencode-auto-resume ready (v${PLUGIN_VERSION}). timeout=${chunkTimeoutMs}ms, orphan=${subagentWaitMs}ms, loop=${loopMaxContinues}x/${loopWindowMs / 1000}s`)
@@ -3068,7 +3127,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             "task_complete": taskCompleteTool,
         },
 
-        "chat.message": async (input) => {
+        "chat.message": async (input: any) => {
             const sid = input?.sessionID
             if (!sid) return
             const w = ensureWatch(sid)
@@ -3095,7 +3154,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             }
         },
 
-        "tool.execute.before": async (input, hookArgs) => {
+        "tool.execute.before": async (input: any, hookArgs: any) => {
             if (!input?.sessionID) return
             const w = ensureWatch(input.sessionID)
             w.pendingTools++
@@ -3140,14 +3199,14 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             })()
         },
 
-        "command.execute.before": async (input) => {
+        "command.execute.before": async (input: any) => {
             if (!input?.sessionID) return
             const w = ensureWatch(input.sessionID)
             w.pendingCommands++
             w.lastActivityAt = Date.now()
         },
 
-        "tool.execute.after": async (input) => {
+        "tool.execute.after": async (input: any) => {
             if (!input?.sessionID) return
             const w = ensureWatch(input.sessionID)
             w.pendingTools = Math.max(0, w.pendingTools - 1)

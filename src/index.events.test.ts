@@ -750,7 +750,7 @@ describe("task_complete tool", () => {
         expect(result).toContain("Add tests for the new endpoint")
         expect(result).toContain("Update the README")
         // Must include the instruction to mark finished todos complete
-        expect(result).toContain("Mark any finished todos complete")
+        expect(result).toContain("You are NOT done")
         // Must not be the old generic one-liner
         expect(result).not.toContain("Please complete all remaining work before signaling completion")
     })
@@ -781,7 +781,7 @@ describe("task_complete tool", () => {
         // The nudge body must match the returned tool result
         const nudgeBody = promptCalls[0].body
         expect(nudgeBody).toContain("Implement login")
-        expect(nudgeBody).toContain("Mark any finished todos complete")
+        expect(nudgeBody).toContain("You are NOT done")
         // The nudge targets the same session
         expect(promptCalls[0].sid).toBe("ses_parent")
     })

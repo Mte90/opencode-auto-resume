@@ -54,7 +54,7 @@ type AutoResumePlugin = {
 
 const define = <T>(plugin: T): T => plugin
 
-import { appendFileSync, readFileSync, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs"
+import { appendFileSync, readFileSync, existsSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, isAbsolute, join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -111,6 +111,7 @@ import {
 	containsActionIntent,
 	containsWorkDescription,
 	buildOpenTodosReminder,
+	TASK_COMPLETE_BLOCK_PREFIX,
 	Todo,
 } from "../recovery/shared"
 
@@ -326,6 +327,8 @@ interface SessionWatch {
 	indeterminateStrikes: number
 	/** True while one of our own recovery continues is in flight — distinguishes a self-caused execution.started from a genuine turn. */
 	selfRecovery: boolean
+	/** True when a recovery prompt was sent while the session was already busy. Used by parked detection to escalate instead of firing another prod. */
+	recoverySentWhileBusy: boolean
 
 	// Assistant text accumulation (v2 replacement for session.messages())
 	textParts: Map<string, string> // assistantMessageID -> accumulated text
@@ -790,7 +793,6 @@ const CHECKED_TOOL_PART_IDS_MAX = 500
  * cap plus a fixed 3000-line tail can drop a live arm. */
 const QUOTA_STATE_PREFIX = "resume-quota/"
 const COUNTER_STATE_PREFIX = "resume-counters/"
-const PAUSED_MARKER_FILE = `${process.env.HOME ?? ""}/.config/opencode/auto-resume.paused`
 /** Generous ceiling on a stored arm. The ladder horizon is minutes; this only
  * exists so an abandoned record cannot haunt a session days later. */
 const QUOTA_STATE_MAX_AGE_MS = 48 * 3600_000
@@ -2042,6 +2044,7 @@ export default define({
 				w.lifetimeContinues ??= 0
 				w.inflightTools ??= new Map()
 				w.lastStuckToolCheck ??= 0
+				w.recoverySentWhileBusy ??= false
 				return w
 			}
 			if (!w) {
@@ -2081,6 +2084,7 @@ export default define({
 					permLockReason: null,
 					indeterminateStrikes: 0,
 					selfRecovery: false,
+					recoverySentWhileBusy: false,
 					textParts: new Map(),
 					lastAssistantText: "",
 					lastAssistantMessageID: null,
@@ -2159,37 +2163,11 @@ export default define({
 		}
 
 		// ---- Pause / resume (user-controlled) ---------------------------------
-		// Source of truth: a marker file listing paused session ids (one per line)
-		// or "*" for all. Written by the CLI helper and the /auto-resume command.
-		function readPausedSet(): Set<string> {
-			try {
-				const raw = readFileSync(PAUSED_MARKER_FILE, "utf8")
-				const s = new Set<string>()
-				for (const line of raw.split(/\r?\n/)) {
-					const t = line.trim()
-					if (t) s.add(t)
-				}
-				return s
-			} catch {
-				return new Set<string>()
-			}
-		}
+		// Pause lives in memory for this opencode instance only: nothing is written
+		// to disk, so two instances never share or clobber pause state, and a
+		// restart clears every pause.
 		function isPaused(sid: string): boolean {
-			const s = readPausedSet()
-			return s.has("*") || s.has(sid)
-		}
-		function setPaused(sid: string, on: boolean): void {
-			const s = readPausedSet()
-			if (on) s.add(sid)
-			else s.delete(sid)
-			try {
-				mkdirSync(dirname(PAUSED_MARKER_FILE), { recursive: true })
-			} catch {}
-			try {
-				writeFileSync(PAUSED_MARKER_FILE, [...s].join("\n") + (s.size ? "\n" : ""), "utf8")
-			} catch (e) {
-				dbg(`${short(sid)} pause write failed: ${e instanceof Error ? e.message : String(e)}`)
-			}
+			return sessions.get(sid)?.paused === true
 		}
 
 		function touch(sid: string) {
@@ -2232,6 +2210,10 @@ export default define({
 				// same thing.
 				w.todoNudgeAttempts = 0
 				w.intentNudgeAttempts = 0
+				// contextWrapupAttempts re-arms per turn: the saturation intervention
+				// comment says "one-shot per turn" (line 462), so it must reset
+				// when a fresh turn begins, or the guard goes dead after first use.
+				w.contextWrapupAttempts = 0
 				// NOTE: emptyIdleNudged is deliberately NOT reset here. The
 				// flag is single-shot per observable episode, and markBusy runs
 				// on our own recovery injections too: resetting it here would
@@ -2976,7 +2958,13 @@ export default define({
 		}
 
 		async function notifyAndPrompt(sid: string, text: string, notification: string, resume = true, forceSynthetic = false): Promise<boolean> {
-			ensureWatch(sid).selfRecovery = true
+			const w = ensureWatch(sid)
+			w.selfRecovery = true
+			// Track if the recovery prompt was sent while the session was already busy.
+			// This is the key discriminator for parked detection: if the session was
+			// busy when we sent the prompt, and it's still busy with no activity since,
+			// the prompt was parked and we should escalate.
+			w.recoverySentWhileBusy = w.status === "busy"
 			if (visibleContinue && !forceSynthetic) {
 				// Cattleprod-style: a real user message in session history, so the
 				// intervention — and any loop — is self-evident in the transcript.
@@ -4181,7 +4169,10 @@ export default define({
 			// concurrently, whose claim is not ours to clear.
 			const wasSelfRecovery = w.selfRecovery
 			const sent = await notifyAndPrompt(sid, opts.continuePrompt ?? SAFE_EMPTY_IDLE_PROMPT, "empty-idle nudge")
-			if (!wasSelfRecovery) w.selfRecovery = false
+			if (!wasSelfRecovery) {
+				w.selfRecovery = false
+				w.recoverySentWhileBusy = false
+			}
 			return sent
 		}
 
@@ -4945,7 +4936,7 @@ export default define({
 									// override feed the escalation.
 									w.taskCompleteSignals = 0
 									const reminder = buildOpenTodosReminder(open)
-									const blockMsg = `Mark any finished todos complete and do not redo completed work.\n${reminder}`
+									const blockMsg = `${TASK_COMPLETE_BLOCK_PREFIX}\n${reminder}`
 									log(
 										"info",
 										`${short(sid)} task_complete blocked: ${open.length} open todos remain (override ${w.taskCompleteOverrides}/${maxRetries})`,
@@ -6135,9 +6126,47 @@ export default define({
 					// that even though the default policy refuses to.
 					await tryAbortAndResume(sid, w, true)
 				} else {
-					const _qm = await loadMessages(sid)
-					if (quotaGuard(sid, w, _qm)) continue
-					await recover(sid, `no activity for ${Math.ceil(silence / 1000)}s`)
+					// PARKED detection (v2 adaptation of v1's ab1a083 fix):
+					// A continue prompt sent into an already-busy session is parked
+					// by the host and never dispatched. When the session is busy
+					// with stale activity (no events since before this check), the
+					// previous recovery send did not resume it → escalate to
+					// abort+resume instead of firing another prod that will also park.
+					// Discriminator: w.recoverySentWhileBusy === true && w.status === "busy" means
+					// "recovery prompt sent while busy AND session still busy" (the exact
+					// parked condition; recoverySentWhileBusy is set by notifyAndPrompt).
+					const isParked = w.recoverySentWhileBusy === true && w.status === "busy"
+					if (
+						isParked &&
+						!w.userCancelled &&
+						!w.completionSignaled &&
+						!w.gaveUp &&
+						!w.aborting &&
+						!w.compacting &&
+						!w.permissionPending &&
+						!selfAbortActive(w)
+					) {
+						// Budgeted: do not escalate a permanently wedged runner on
+						// every check interval. Exhausting the ladder latches gaveUp
+						// (re-armed only by a genuine new user message).
+						if (w.resumeAttempts < maxRetries) {
+							log(
+								"warn",
+								`${short(sid)} prompt parked (busy with no activity) — escalating via abort+resume (attempt ${w.resumeAttempts + 1}/${maxRetries})`,
+							)
+							await tryAbortAndResume(sid, w, true)
+						} else {
+							log(
+								"warn",
+								`${short(sid)} prompt parked but abort+resume budget exhausted (${w.resumeAttempts}/${maxRetries}) — standing down (gaveUp)`,
+							)
+							w.gaveUp = true
+						}
+					} else {
+						const _qm = await loadMessages(sid)
+						if (quotaGuard(sid, w, _qm)) continue
+						await recover(sid, `no activity for ${Math.ceil(silence / 1000)}s`)
+					}
 				}
 			}
 			// Rate-limit gate: sessions stood down on quota get one attempt per
@@ -6618,6 +6647,7 @@ export default define({
 					const w = ensureWatch(sid)
 					if (w.selfRecovery) {
 						w.selfRecovery = false
+						w.recoverySentWhileBusy = false
 					} else {
 						// A provider retry that opencode schedules itself starts a
 						// turn without the user asking. It is not a new episode: it
@@ -6767,6 +6797,7 @@ export default define({
 					const w = ensureWatch(sid)
 					w.pendingRecoveryArmed = false
 					w.selfRecovery = false // stale — no in-flight recovery prompt by the time we idle
+					w.recoverySentWhileBusy = false // also clear when idling
 					// Never run the idle heuristics on top of our own abort: the idle
 					// transition caused by interrupt() would otherwise trigger a second,
 					// independent injection.
@@ -7254,11 +7285,9 @@ export default define({
 							const w = ensureWatch(sessionID)
 							const msg = (text: string) => ctx.session.prompt({ sessionID, text } as any)
 							if (verb === "off" || verb === "pause") {
-								setPaused(sessionID, true)
 								w.paused = true
 								await msg("auto-resume paused for this session. Run /auto-resume on to resume.")
 							} else if (verb === "on" || verb === "resume") {
-								setPaused(sessionID, false)
 								w.paused = false
 								await msg("auto-resume resumed for this session.")
 							} else {
@@ -7272,10 +7301,6 @@ export default define({
 				log("warn", `auto-resume command registration failed: ${e instanceof Error ? e.message : String(e)}`)
 			}
 		}
-
-		// Pause is process-lifetime only: a restart re-arms auto-resume so a
-		// forgotten pause cannot silently disable it forever.
-		try { writeFileSync(PAUSED_MARKER_FILE, "", "utf8") } catch {}
 
 		if (gatedInUse.length > 0) {
 			log("warn", `accepted-but-inert=${gatedInUse.join(",")} — this v2 build recognises these option(s) but does not act on them yet.`)

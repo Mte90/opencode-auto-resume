@@ -154,6 +154,11 @@ export const TASK_COMPLETE_REPEAT_ERROR =
     "task_complete already acknowledged twice with no new user message or tool work since — " +
     "completion is recorded. End your turn with text and make no further tool calls."
 
+export const TASK_COMPLETE_BLOCK_PREFIX =
+    "You are NOT done. You called task_complete but you still have open todos. " +
+    "Update your todo list (mark finished items complete), then continue the remaining work. " +
+    "Do not call task_complete again until every todo is completed."
+
 // ---- Done validation prompts ----
 export const DONE_WITHOUT_WORK_PROMPT =
     "I need you to verify more carefully that you have actually completed all the required tasks. " +

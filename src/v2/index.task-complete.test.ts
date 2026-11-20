@@ -307,7 +307,7 @@ describe("v2: task_complete respects the todo list", () => {
 		const res = await call(h)
 		expect(res.content).toContain("Write the migration guide")
 		expect(res.content).toContain("Delete the temp fixtures")
-		expect(res.content).toContain("Mark any finished todos complete")
+		expect(res.content).toContain("You are NOT done")
 		// Not an ack: the model has not been told its work is recorded.
 		expect(res.content).not.toContain("No further continuation will be sent")
 		await teardown(h)

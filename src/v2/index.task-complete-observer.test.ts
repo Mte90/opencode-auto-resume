@@ -194,7 +194,7 @@ describe("v2: auto-resume observes the task_complete tool", () => {
 		// so auto-resume injects it too.
 		const h = await setup()
 		await h.hooks.get("execute.after")?.(
-			toolCall({ completed: false, content: "Mark any finished todos complete.\n1. [pending] Write the guide" }),
+			toolCall({ completed: false, content: "You are NOT done. You called task_complete but you still have open todos.\n1. [pending] Write the guide" }),
 		)
 		expect(h.injected.length).toBeGreaterThan(0)
 		expect(h.injected[0].text).toContain("Write the guide")
