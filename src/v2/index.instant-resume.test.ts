@@ -149,8 +149,17 @@ describe("instant resume after non-user interruption", () => {
 		}
 	})
 
-	test("a user interrupt never sends an instant continue", async () => {
+	test("a user-reason interrupt with no new user message still resumes", async () => {
 		const h = await setup()
+		h.push("session.execution.interrupted", { reason: "user" })
+		expect(await waitFor(() => nudges(h) >= 1, 1500)).toBe(true)
+		expect(nudges(h)).toBe(1)
+		await teardown(h)
+	})
+
+	test("a user message at the interruption still stands down", async () => {
+		const h = await setup()
+		h.history[SID].push(userMessage("stop please", Date.now() + 5000, "msg_u2"))
 		h.push("session.execution.interrupted", { reason: "user" })
 		await wait(600)
 		expect(nudges(h)).toBe(0)

@@ -161,7 +161,7 @@ describe("v2: genuine user message re-arms after user interrupt", () => {
 		await teardown(h)
 	})
 
-	test("CONTROL: interrupt with no new user message stays stood down", async () => {
+	test("user-reason interrupt resumes even without a newer user message", async () => {
 		const now = Date.now()
 		const history: Record<string, unknown[]> = {
 			[SID]: [userMessage("go", now - 60_000, "msg_u1")],
@@ -175,7 +175,7 @@ describe("v2: genuine user message re-arms after user interrupt", () => {
 		await wait(10)
 		push(h, "session.step.started", SID)
 		await wait(900)
-		expect(h.injected.filter((i: any) => i.sid === SID)).toHaveLength(0)
+		expect(h.injected.filter((i: any) => i.sid === SID).length).toBeGreaterThan(0)
 		await teardown(h)
 	})
 

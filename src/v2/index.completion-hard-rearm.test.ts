@@ -224,7 +224,7 @@ describe("completionHard re-armed by a genuine user message", () => {
 		await teardown(h)
 	})
 
-	test("a user interrupt still stands down after the latch is re-opened", async () => {
+	test("a user-reason interrupt resumes after the latch is re-opened", async () => {
 		const h = await setup()
 		await h.call()
 		h.history[SID] = [
@@ -235,7 +235,7 @@ describe("completionHard re-armed by a genuine user message", () => {
 		await wait(80)
 		h.push("session.execution.interrupted", { reason: "user" })
 		await wait(400)
-		expect(nudges(h)).toBe(0)
+		expect(nudges(h)).toBeGreaterThan(0)
 		await teardown(h)
 	})
 

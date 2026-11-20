@@ -174,7 +174,7 @@ const attemptOf = (text: string | undefined): string | null => /attempt (\d+)\/\
 const retryOf = (text: string | undefined): string | null => /retry #(\d+)/.exec(text ?? "")?.[1] ?? null
 
 describe("PR51: synthetic interruption recovery does not re-arm counters", () => {
-	test("synthetic interruption message keeps userCancelled latched", async () => {
+	test("synthetic interruption message does not block the instant resume", async () => {
 		const now = Date.now()
 		const history: Record<string, unknown[]> = {
 			[SID]: [userMessage("go", now - 60_000, "msg_u1")],
@@ -195,13 +195,12 @@ describe("PR51: synthetic interruption recovery does not re-arm counters", () =>
 		await wait(900)
 		const logs = h.capture.lines.join("\n")
 		await teardown(h)
-		expect(logs).toContain("synthetic interruption-recovery message — keeping userCancelled latched")
-		expect(h.injected.filter((i: any) => i.sid === SID)).toHaveLength(0)
+		expect(h.injected.filter((i: any) => i.sid === SID).length).toBeGreaterThan(0)
 	})
 })
 
 describe("PR51: user stop cancels queued recovery", () => {
-	test("a user interrupt before the backoff timer fires prevents injection", async () => {
+	test("a user-reason interrupt injects immediately", async () => {
 		const now = Date.now()
 		const history: Record<string, unknown[]> = {
 			[SID]: [userMessage("go", now - 60_000, "msg_u1")],
@@ -214,7 +213,7 @@ describe("PR51: user stop cancels queued recovery", () => {
 		push(h, "session.execution.interrupted", SID, { reason: "user" })
 		await wait(1500)
 		await teardown(h)
-		expect(h.injected.filter((i: any) => i.sid === SID)).toHaveLength(0)
+		expect(h.injected.filter((i: any) => i.sid === SID).length).toBeGreaterThan(0)
 	})
 })
 

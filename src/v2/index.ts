@@ -4181,10 +4181,10 @@ export default define({
 		 * interrupts". 2026-11-19.
 		 */
 		async function instantResumeAfterNonUserInterrupt(sid: string, reason: string, interruptedAt: number): Promise<void> {
-			if (reason !== "shutdown" && reason !== "superseded" && reason !== "inactivity") return
+			if (reason !== "shutdown" && reason !== "superseded" && reason !== "inactivity" && reason !== "user") return
 			const w = ensureWatch(sid)
 			if (w.instantInterruptResumeFired) return
-			if (w.userCancelled || w.gaveUp || w.permissionPending || w.failureLoopLatched) return
+			if ((reason !== "user" && w.userCancelled) || w.gaveUp || w.permissionPending || w.failureLoopLatched) return
 			if (w.completionSignaled || w.completionHard) return
 			if (w.recovering) return
 			{
@@ -4195,10 +4195,19 @@ export default define({
 				}
 			}
 			if (w.compacting || selfAbortActive(w)) return
+			// This host labels its own interrupts "user". A genuine user stop
+			// message can arrive just after the event; recheck after a brief window.
+			// The stall ladder is minutes, so 200ms is still instant.
+			if (reason === "user") await new Promise((resolve) => setTimeout(resolve, 200))
 			// Refresh the genuine-user clock from history before checking takeover.
 			const messages = await loadMessages(sid)
 			noteInboundUserMessage(sid, w, messages)
-			if (w.userCancelled || w.lastGenuineUserAt >= interruptedAt) return
+			if ((reason !== "user" && w.userCancelled) || w.lastGenuineUserAt >= interruptedAt) return
+			if (reason === "user") {
+				w.userCancelled = false
+				w.userCancelledAt = 0
+				markIdle(sid)
+			}
 			if (isWaitingOnUser(sid, w, messages)) return
 			// A turn that ended with a completion claim is done, not interrupted
 			// mid-work — never restart it. Check the literal last line explicitly
@@ -4216,6 +4225,10 @@ export default define({
 			log("info", `${short(sid)} instant resume after interruption (${reason}) — one-shot before stall timeout`)
 			const ok = await injectOnce(sid, opts.continuePrompt ?? SAFE_EMPTY_IDLE_PROMPT, "interruption — instant resume")
 			if (ok) {
+				if (reason === "user") {
+					w.userCancelled = false
+					w.userCancelledAt = 0
+				}
 				touch(sid)
 				markBusy(sid)
 			}
@@ -6874,13 +6887,15 @@ export default define({
 				// Fire one immediate, fully-guarded continue before that wait.
 				// Fire-and-forget: the event pump must not block on the history
 				// read; the helper re-checks every guard before injecting.
-				if (!mine && !w.userCancelled && reason) {
-					void instantResumeAfterNonUserInterrupt(sid, reason, Date.now())
-				}
 					// A user interrupt also ends any in-flight compaction.
 					w.compacting = false
 					w.compactionStartedAt = null
 					w.recovering = false
+					// This host labels its own interrupts "user"; the helper checks
+					// history before deciding whether a genuine user stop occurred.
+					if (!mine && (!w.userCancelled || reason === "user") && reason) {
+						void instantResumeAfterNonUserInterrupt(sid, reason, Date.now())
+					}
 					// Cancel any queued/delayed nudge: a pre-armed recovery must
 					// not fire after a user stop.
 					if (w.recoverTimer) {
