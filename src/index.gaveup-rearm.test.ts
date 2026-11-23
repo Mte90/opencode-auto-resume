@@ -150,7 +150,10 @@ describe("gaveUp re-arm on genuine user message", () => {
     })
 
     test("an echoed own prompt does NOT re-arm the budget (loop guard)", async () => {
-        const { hooks, logCalls, promptCalls } = await setup({ failFirstPrompts: 3 })
+        // failFirstPrompts 6 = 3 attempts × (send + catch-retry): every
+        // delivery path fails, so ownSentAt stays 0 and the drive latches
+        // gaveUp with zero successful sends.
+        const { hooks, logCalls, promptCalls } = await setup({ failFirstPrompts: 6 })
         const sid = "ses_echo"
 
         await busy(hooks, sid)
@@ -161,10 +164,12 @@ describe("gaveUp re-arm on genuine user message", () => {
         await wait(200)
         const countWhenMuted = promptCalls.length
 
-        // The server echoes our own "continue" back as a user message. It
-        // must be recognized as ours: re-arming on it would turn the gaveUp
-        // hard-stop into an infinite continue loop (the echo re-arms, the
-        // stall sends again, the new echo re-arms...).
+        // Model a successful recent injection: the server echoes our own
+        // "continue" back as a user message seconds after we sent it. The
+        // echo must be recognized as ours — re-arming on it would turn the
+        // gaveUp hard-stop into an infinite continue loop.
+        const sessions = (hooks as any).__sessionsForTest as Map<string, { ownSentAt: number }>
+        sessions.get(sid)!.ownSentAt = Date.now()
         await hooks.event!({
             event: {
                 type: "message.updated",
@@ -174,5 +179,31 @@ describe("gaveUp re-arm on genuine user message", () => {
         } as any)
         await wait(600)
         expect(promptCalls.length).toBe(countWhenMuted)
+    })
+
+    test("a typed 'continue' with no recent plugin send DOES re-arm (genuine user)", async () => {
+        const { hooks, logCalls, promptCalls } = await setup({ failFirstPrompts: 6 })
+        const sid = "ses_human"
+
+        await busy(hooks, sid)
+        const latched = await waitFor(() =>
+            logCalls.some((l) => l.message.includes("retries exhausted") || l.message.includes("GAVE UP")),
+        )
+        expect(latched).toBe(true)
+        await wait(200)
+        const countWhenMuted = promptCalls.length
+
+        // A human typing "continue" is textually identical to our echo but
+        // has no recent plugin send behind it: it must count as a genuine
+        // user message and re-arm the budget.
+        await hooks.event!({
+            event: {
+                type: "message.updated",
+                sessionID: sid,
+                properties: { role: "user", parts: [{ type: "text", text: "continue" }] },
+            },
+        } as any)
+        const resumed = await waitFor(() => promptCalls.length > countWhenMuted)
+        expect(resumed).toBe(true)
     })
 })

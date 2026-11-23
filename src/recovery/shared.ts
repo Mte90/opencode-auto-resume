@@ -100,7 +100,6 @@ export const READY_TO_CONTINUE_PATTERNS = [
 ]
 
 export const OWN_PROMPT_SHAPES: RegExp[] = [
-	/^continue$/,
 	/^continue\s*\u2014\s*stalled\s*\(/,
 	/^continue\s*\nOnly continue work already in progress\./,
 	/^continue\s*\nIf work was already in progress,/,

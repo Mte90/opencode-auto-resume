@@ -86,6 +86,9 @@ export interface SessionWatch {
     toolTextRecovered: boolean
     toolTextAttempts: number
     continueTimestamps: number[]
+    /** Date.now() of the last prompt this plugin actually delivered to the
+     * session — disambiguates our echoed "continue" from a typed one. */
+    ownSentAt: number
     idleSince: number | null
     continuing: boolean
     todos: Todo[]
@@ -501,6 +504,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 toolTextRecovered: false,
                 toolTextAttempts: 0,
                 continueTimestamps: [],
+                ownSentAt: 0,
                 idleSince: null,
                 continuing: false,
                 todos: [],
@@ -799,6 +803,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             )
             recordContinue(sid)
             w.lastRetryAt = Date.now()
+            w.ownSentAt = Date.now()
             sent = true
         } catch (err) {
             const errMsg = err instanceof Error ? err.message : String(err)
@@ -811,6 +816,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 await logPromptResponse(retryResponse, { sessionId: sid, isRetry: true })
                 recordContinue(sid)
                 w.lastRetryAt = Date.now()
+                w.ownSentAt = Date.now()
                 sent = true
             } catch (retryErr) {
                 const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr)
@@ -1176,7 +1182,22 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
     // Text of an inbound user message event, tolerant of where the server
     // carries it (properties.parts, properties.info.parts, or a flat text).
-    function looksLikeOwnPrompt(props: Record<string, unknown> | undefined): boolean {
+    // "continue" (and a custom continuePrompt) is text a human also types:
+    // text equality alone cannot tell our echo from a typed message. The
+    // server echoes our injections back as user messages within seconds,
+    // while a typed "continue" has no recent plugin send behind it — so the
+    // ambiguous texts are classified as ours ONLY when a continue was sent
+    // to this session inside the echo window. Unambiguous texts keep the
+    // static shapes (see OWN_PROMPT_SHAPES).
+    const OWN_ECHO_WINDOW_MS = 30_000
+
+    function sentContinueRecently(sid: string): boolean {
+        const w = sessions.get(sid)
+        if (!w) return false
+        return Date.now() - w.ownSentAt <= OWN_ECHO_WINDOW_MS
+    }
+
+    function looksLikeOwnPrompt(props: Record<string, unknown> | undefined, sid?: string): boolean {
         if (!props) return false
         const parts = (props.parts ?? (props.info as Record<string, unknown> | undefined)?.parts) as
             | Array<Record<string, unknown>>
@@ -1190,11 +1211,9 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         }
         text = text ?? (props.text as string | undefined) ?? ((props.info as Record<string, unknown> | undefined)?.text as string | undefined)
         if (!text) return false
-        // A custom continuePrompt would evade the static shapes: match the
-        // live prompt constants directly so our own echo can never re-arm
-        // the budget it just spent (loop guard for the message.updated
-        // re-arm path).
-        if (text === continuePrompt || text === actionIntentPrompt) return true
+        if ((text === continuePrompt || text === actionIntentPrompt) && sid !== undefined) {
+            return sentContinueRecently(sid)
+        }
         return OWN_PROMPT_SHAPES.some((re) => re.test(text!))
     }
 
@@ -2956,7 +2975,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 const info = props?.info as Record<string, unknown> | undefined
                 const role = (info?.role as string) ?? (props?.role as string)
                 if (role === "user") {
-                    if (looksLikeOwnPrompt(props)) {
+                    if (looksLikeOwnPrompt(props, sid)) {
                         // Our own injected prompt, echoed back by the server as a
                         // user message: NOT a new work cycle. Re-arming here let the
                         // unknown-tool suggestion re-fire unboundedly (2026-10-30).
