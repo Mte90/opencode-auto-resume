@@ -103,6 +103,7 @@ export const OWN_PROMPT_SHAPES: RegExp[] = [
 	/^continue\s*\u2014\s*stalled\s*\(/,
 	/^continue\s*\nOnly continue work already in progress\./,
 	/^continue\s*\nIf work was already in progress,/,
+	/^You appear to have stalled with no open tasks/,
 	/^You tried to use the tool "/,
 	/^You have \d+ unfinished tasks?:/,
 	/^Your last message contained a raw tool call printed as text/,
@@ -183,6 +184,16 @@ export const DONE_WITHOUT_DETAILS_PROMPT =
 
 // ---- Continue prompt ----
 export const CONTINUE_PROMPT = "continue"
+
+/** Stall recovery for a session with NO open todos: bare "continue" invites
+ * the model to invent work, so ask for a completion check instead — either
+ * real remaining work resumes or the model records completion via
+ * task_complete and the session stands down. */
+export const STALL_NO_TODOS_PROMPT =
+	"You appear to have stalled with no open tasks on your list. " +
+	"Verify whether you have actually completed everything that was requested. " +
+	"If all work is done, call the task_complete tool now to record completion. " +
+	"If anything remains, update your todo list and continue the remaining work."
 
 // ---- Pure helper functions ----
 

@@ -48,6 +48,7 @@ import {
     DONE_WITHOUT_WORK_PROMPT,
     DONE_WITHOUT_DETAILS_PROMPT,
     CONTINUE_PROMPT,
+    STALL_NO_TODOS_PROMPT,
     containsToolCallAsText,
     getOpenTodos,
     isOpenTodo,
@@ -2319,7 +2320,30 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                                 await log("info", `Stream stall on ${short(sid)} (busyStallStrategy=abort): aborting before continue`)
                                 tryAbortAndResume(sid, w)
                             } else {
-                                tryResume(sid, w, "Stream stall")
+                                // Todos-aware stall prompt: with open todos the
+                                // bare "continue" is right (work to resume); with
+                                // none, "continue" invites invented work — ask
+                                // for a completion check instead, so the model
+                                // either resumes real work or records completion
+                                // via task_complete and the session stands down.
+                                let stallPrompt = continuePrompt
+                                try {
+                                    let todos = w.todos || []
+                                    if (todos.length === 0) {
+                                        const fetched = await fetchSessionTodos(sid)
+                                        if (fetched.length > 0) {
+                                            w.todos = fetched
+                                            todos = fetched
+                                        }
+                                    }
+                                    if (getOpenTodos(todos).length === 0) {
+                                        stallPrompt = STALL_NO_TODOS_PROMPT
+                                        await log("info", `${short(sid)} - stall with no open todos: sending completion check instead of continue`)
+                                    }
+                                } catch {
+                                    // Keep the classic prompt when the todo check fails.
+                                }
+                                tryResume(sid, w, "Stream stall", stallPrompt)
                             }
                         } else if (!w.gaveUp) {
                             w.gaveUp = true
