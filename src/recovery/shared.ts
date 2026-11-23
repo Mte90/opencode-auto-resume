@@ -100,10 +100,19 @@ export const READY_TO_CONTINUE_PATTERNS = [
 ]
 
 export const OWN_PROMPT_SHAPES: RegExp[] = [
+	/^continue$/,
 	/^continue\s*\u2014\s*stalled\s*\(/,
 	/^continue\s*\nOnly continue work already in progress\./,
 	/^continue\s*\nIf work was already in progress,/,
 	/^You tried to use the tool "/,
+	/^You have \d+ unfinished tasks?:/,
+	/^Your last message contained a raw tool call printed as text/,
+	/^I noticed you have a tool call generated in your thinking/,
+	/^I notice you've been calling the same tool multiple times/,
+	/^It looks like you may have stalled or timed out/,
+	/^You are NOT done\. You called task_complete but you still have open todos\./,
+	/^I need you to verify more carefully that you have actually completed/,
+	/^Your last response claimed the task is complete but contained no work description/,
 ]
 
 export const DONE_CLAIM_PATTERNS = [

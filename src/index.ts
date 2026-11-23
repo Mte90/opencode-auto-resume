@@ -695,12 +695,19 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         await log("debug", `${short(context.sessionId)} - session.prompt() raw response: ${JSON.stringify({ sessionId: context.sessionId, isRetry, rawResponse: JSON.stringify(result, null, 2) })}`)
     }
 
-    async function sendContinuePrompt(sid: string, text: string, w: SessionWatch) {
+    /**
+     * Send a continue-style prompt. Returns true only when a prompt was
+     * actually delivered; false when a latch refused the send (continuing,
+     * userCancelled, completionSignaled, gaveUp, oocLocked). Callers that
+     * count attempts or log delivery must honor the return value — a
+     * refused send is not an attempt.
+     */
+    async function sendContinuePrompt(sid: string, text: string, w: SessionWatch): Promise<boolean> {
         if (w.continuing && !w.watchdogRetryGuard) {
             await log("debug", `${short(sid)} - continue already in progress, skipping`)
-            return
+            return false
         }
-        if (w.userCancelled || w.completionSignaled) return
+        if (w.userCancelled || w.completionSignaled) return false
         // Hard stop (choke point): once this session's recovery cycle has given up,
         // refuse to send ANY further continue prompt, from any code path. This
         // guarantees the jinja/ECONNREFUSED continue-loop cannot run from any
@@ -708,11 +715,11 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         // hook clears gaveUp).
         if (w.gaveUp) {
             await log("debug", `${short(sid)} - gaveUp latched, refusing further continue prompts`)
-            return
+            return false
         }
         if (w.oocLocked) {
             await log("debug", `${short(sid)} - oocLocked latched, refusing further continue prompts (reason: ${w.oocLockReason ?? "n/a"})`)
-            return
+            return false
         }
         if (!w.continuing) dbg(`State transition on ${short(sid)}: continuing=false -> true`)
         w.continuing = true
@@ -730,6 +737,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         const wasBusyAtSend = w.status === "busy"
         const sentAt = Date.now()
         
+        let sent = false
         try {
             const msgs = await getSessionMessages(sid)
 
@@ -775,7 +783,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             // Re-check: ESC (or completion) may have landed while the session
             // messages were being fetched above — never send into a cancelled
             // session. (finally below resets the continuing flag on return.)
-            if (w.userCancelled || w.completionSignaled) return
+            if (w.userCancelled || w.completionSignaled) return false
             const response = await ctx.client.session.prompt({
                 path: { id: sid },
                 body: {
@@ -791,6 +799,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             )
             recordContinue(sid)
             w.lastRetryAt = Date.now()
+            sent = true
         } catch (err) {
             const errMsg = err instanceof Error ? err.message : String(err)
             await log("warn", `${short(sid)} - prompt failed: ${errMsg}`)
@@ -802,6 +811,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 await logPromptResponse(retryResponse, { sessionId: sid, isRetry: true })
                 recordContinue(sid)
                 w.lastRetryAt = Date.now()
+                sent = true
             } catch (retryErr) {
                 const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr)
                 await log("error", `${short(sid)} - prompt retry also failed: ${retryMsg}`)
@@ -938,6 +948,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 }
             }
         }, toolTextCheckDelayMs)
+        return sent
     }
 
     function extractMessages(response: Record<string, unknown>): Array<Record<string, unknown>> {
@@ -1179,6 +1190,11 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         }
         text = text ?? (props.text as string | undefined) ?? ((props.info as Record<string, unknown> | undefined)?.text as string | undefined)
         if (!text) return false
+        // A custom continuePrompt would evade the static shapes: match the
+        // live prompt constants directly so our own echo can never re-arm
+        // the budget it just spent (loop guard for the message.updated
+        // re-arm path).
+        if (text === continuePrompt || text === actionIntentPrompt) return true
         return OWN_PROMPT_SHAPES.some((re) => re.test(text!))
     }
 
@@ -1205,7 +1221,13 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         return false
     }
 
-    async function getSessionStatusMap(): Promise<Record<string, string>> {
+    /**
+     * Live status map from the server. Returns null when the endpoint call
+     * FAILED (network/API error) and {} when it succeeded but nothing is
+     * running — the distinction matters: only a successful empty map proves
+     * a session is not being run by this server process.
+     */
+    async function getSessionStatusMap(): Promise<Record<string, string> | null> {
         try {
             const response = await ctx.client.session.status()
             const raw = ((response as Record<string, unknown>).data ?? response) as Record<string, unknown>
@@ -1224,7 +1246,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         } catch (err) {
             const errMsg = err instanceof Error ? err.message : String(err)
             await log("debug", `session.status() failed: ${errMsg}`)
-            return {}
+            return null
         }
     }
 
@@ -1287,6 +1309,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         async function hasBusySubagents(parentSid: string): Promise<boolean> {
         try {
             const statusMap = await getSessionStatusMap()
+            if (!statusMap) return false
             for (const [sId, statusType] of Object.entries(statusMap)) {
                 if (!sId || sId === parentSid) continue
                 if (statusType === "busy") return true
@@ -1377,7 +1400,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     async function checkSessionHasActiveTool(sid: string): Promise<boolean> {
         try {
             const statusMap = await getSessionStatusMap()
-            if (statusMap[sid] === "busy") {
+            if (statusMap?.[sid] === "busy") {
                 await log("debug", `Session ${short(sid)} is busy, likely executing a tool`)
                 return true
             }
@@ -1408,6 +1431,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         async function checkSubagentStatus(parentSid: string): Promise<{ status: "crashed" | "idle" | "busy" | "unknown"; stuckSid?: string }> {
         try {
             const statusMap = await getSessionStatusMap()
+            if (!statusMap) return { status: "unknown" }
             const now = Date.now()
 
             let hasBusySubagent = false
@@ -1455,6 +1479,23 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             await log("debug", `checkSubagentStatus failed: ${errMsg}`)
             return { status: "unknown" }
         }
+    }
+
+    // A genuine user message starts a new work cycle: re-arm the recovery
+    // budget. sendContinuePrompt hard-stops on gaveUp from any code path and
+    // resumeAttempts gates the stall retries, so without this re-arm a
+    // session that exhausted its budget once stayed muted for the rest of
+    // its life. Wired into BOTH inbound-user hooks (chat.message and
+    // message.updated); idempotent, and each hook has its own own-prompt
+    // guard so the plugin's injected prompts never re-arm the budget they
+    // just spent.
+    function rearmRecoveryBudget(sid: string, w: SessionWatch) {
+        if (w.gaveUp || w.resumeAttempts > 0 || w.recoveryAttempts > 0) {
+            dbg(`State transition on ${short(sid)}: gaveUp=${w.gaveUp} -> false, resumeAttempts=${w.resumeAttempts} -> 0, recoveryAttempts=${w.recoveryAttempts} -> 0 (new user message)`)
+        }
+        w.resumeAttempts = 0
+        w.recoveryAttempts = 0
+        w.gaveUp = false
     }
 
     function resetSessionFlags(w: SessionWatch) {
@@ -1934,7 +1975,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 await tryAbortAndResume(sid, w)
             } else {
                 try {
-                    await sendContinuePrompt(sid, bestCandidate.prompt, w)
+                    const sent = await sendContinuePrompt(sid, bestCandidate.prompt, w)
+                    if (!sent) return
                     if (isOpenTodosReminder) w.todoNudgeAttempts++
                     await log("info", `${short(sid)} - ${bestCandidate.source} recovery sent (attempt ${w.toolTextAttempts})`)
                 } catch (err) {
@@ -2047,15 +2089,23 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             return await tryAbortAndResume(sid, w)
         }
 
-        w.resumeAttempts++
+        const attemptNo = w.resumeAttempts + 1
         const idleSec = Math.round((now - w.lastActivityAt) / 1000)
-        await log("info", `${reason} on ${short(sid)} (${idleSec}s, retry ${w.resumeAttempts}/${maxRetries})`)
+        await log("info", `${reason} on ${short(sid)} (${idleSec}s, retry ${attemptNo}/${maxRetries})`)
 
         try {
-            await sendContinuePrompt(sid, prompt ?? continuePrompt, w)
+            const sent = await sendContinuePrompt(sid, prompt ?? continuePrompt, w)
+            if (!sent) {
+                // A latch refused the send (gaveUp/oocLocked/…): nothing was
+                // delivered, so this attempt must not count toward the retry
+                // budget and must not be reported as sent.
+                return false
+            }
+            w.resumeAttempts = attemptNo
             await log("info", `${short(sid)} - retry sent`)
             return true
         } catch (err) {
+            w.resumeAttempts = attemptNo
             const errMsg = err instanceof Error ? err.message : String(err)
             await log("warn", `${short(sid)} - retry failed: ${errMsg}`)
             w.lastRetryAt = now
@@ -2077,11 +2127,22 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 if (sid && typeof sid === "string" && sid.startsWith("ses_")) {
                     const isNew = !sessions.has(sid)
                     ensureWatch(sid)
-                    const status = (s.status as string | undefined) ?? statusMap[sid]
+                    const status = (s.status as string | undefined) ?? (statusMap ? statusMap[sid] : undefined)
                     if (status) {
                         const w = sessions.get(sid)!
                         w.status = status as SessionWatch["status"]
                         if (status === "idle") w.idleSince = Date.now()
+                    } else if (statusMap !== null) {
+                        // Present in storage but absent from the live status map:
+                        // this server process never ran the session, so it is
+                        // idle by definition. Leaving it "unknown" hid restarted
+                        // dead sessions from the periodic open-todos nudge forever
+                        // — no event ever corrects a status that was never set.
+                        // (Only on a successful fetch: null means the endpoint
+                        // failed and says nothing about the session.)
+                        const w = sessions.get(sid)!
+                        w.status = "idle"
+                        w.idleSince = Date.now()
                     }
                     if (isNew) {
                         log("debug", `Discovered session ${short(sid)} via list() — fetching todos`)
@@ -2112,7 +2173,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 const statusMap = await getSessionStatusMap()
 
             for (const [sid, w] of sessions) {
-                const realStatus = statusMap[sid]
+                const realStatus = statusMap ? statusMap[sid] : undefined
                 if (realStatus && realStatus !== w.status) {
                     w.status = realStatus as SessionWatch["status"]
                     if (realStatus === "busy") w.idleSince = null
@@ -2604,7 +2665,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                                 ) {
                                     let busyAgain = false
                                     try {
-                                        const liveStatus = (await getSessionStatusMap())[sid]
+                                        const liveStatus = (await getSessionStatusMap())?.[sid]
                                         busyAgain = liveStatus === "busy" || liveStatus === "retry"
                                     } catch (e) {
                                         dbg(
@@ -2740,7 +2801,12 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                                             w2.toolTextRecovered = true
                                             w2.toolTextAttempts++
                                             dbg(`session.idle sid=${short(idleSid)}: ACTION INTENT DETECTED, sending "${actionIntentPrompt.slice(0, 40)}..."`)
-                                            await sendContinuePrompt(idleSid, actionIntentPrompt, w2)
+                                            const sent = await sendContinuePrompt(idleSid, actionIntentPrompt, w2)
+                                            if (!sent) {
+                                                // Latch refused the send: give the one-shot back.
+                                                w2.toolTextRecovered = false
+                                                w2.toolTextAttempts--
+                                            }
                                         }
                                     }
                                 } catch (e) {
@@ -2845,7 +2911,12 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                                         w2.toolTextRecovered = true
                                         w2.toolTextAttempts++
                                         dbg(`session.idle sid=${short(sid)}: ACTION INTENT DETECTED, sending "${actionIntentPrompt.slice(0, 40)}..."`)
-                                        await sendContinuePrompt(sid, actionIntentPrompt, w2)
+                                        const sent = await sendContinuePrompt(sid, actionIntentPrompt, w2)
+                                        if (!sent) {
+                                            // Latch refused the send: give the one-shot back.
+                                            w2.toolTextRecovered = false
+                                            w2.toolTextAttempts--
+                                        }
                                     }
                                 }
                             } catch (e) {
@@ -2898,6 +2969,11 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     if (w) {
                         w.doneClaimNoTodosAttempts = 0
                         w.taskCompleteOverrides = 0 // completion-override budget is per work cycle
+                        // Same new-work-cycle re-arm the chat.message hook
+                        // performs: this event is the one proven to fire on
+                        // every host, so the budget must not depend on a
+                        // single hook.
+                        rearmRecoveryBudget(sid, w)
                         w.lastUserMessageAt = Date.now()
                         w.subagentRecoveryTried = false
                         w.unknownToolErrors.clear()
@@ -3153,18 +3229,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 w.taskCompleteSignals = 0
                 await log("info", `${short(sid)} - new user message, re-arming auto-resume`)
             }
-            // New work cycle: re-arm the recovery budget. sendContinuePrompt
-            // hard-stops on gaveUp from any code path and resumeAttempts gates
-            // the stall retries, so without this re-arm a session that
-            // exhausted its budget once stayed muted for the rest of its
-            // life — nudges kept "succeeding" (tryResume returns true) while
-            // sendContinuePrompt silently refused.
-            if (w.gaveUp || w.resumeAttempts > 0 || w.recoveryAttempts > 0) {
-                dbg(`State transition on ${short(sid)}: gaveUp=${w.gaveUp} -> false, resumeAttempts=${w.resumeAttempts} -> 0, recoveryAttempts=${w.recoveryAttempts} -> 0 (new user message)`)
-            }
-            w.resumeAttempts = 0
-            w.recoveryAttempts = 0
-            w.gaveUp = false
+            // New work cycle: re-arm the recovery budget (see helper).
+            rearmRecoveryBudget(sid, w)
         },
 
         "tool.execute.before": async (input: any, hookArgs: any) => {

@@ -87,15 +87,15 @@ async function userMessage(hooks: any, sid: string) {
 }
 
 describe("gaveUp re-arm on genuine user message", () => {
-    test("contract: chat.message resets gaveUp/resumeAttempts/recoveryAttempts", () => {
-        const hookStart = SOURCE.indexOf('"chat.message"')
-        expect(hookStart).toBeGreaterThan(-1)
-        const hookEnd = SOURCE.indexOf('"tool.execute.before"', hookStart)
-        expect(hookEnd).toBeGreaterThan(hookStart)
-        const body = SOURCE.slice(hookStart, hookEnd)
-        expect(body).toMatch(/w\.gaveUp\s*=\s*false/)
-        expect(body).toMatch(/w\.resumeAttempts\s*=\s*0/)
-        expect(body).toMatch(/w\.recoveryAttempts\s*=\s*0/)
+    test("contract: recovery budget re-arm helper wired into both user-message hooks", () => {
+        const helperStart = SOURCE.indexOf("function rearmRecoveryBudget")
+        expect(helperStart).toBeGreaterThan(-1)
+        const helperBody = SOURCE.slice(helperStart, SOURCE.indexOf("function resetSessionFlags", helperStart))
+        expect(helperBody).toMatch(/w\.gaveUp\s*=\s*false/)
+        expect(helperBody).toMatch(/w\.resumeAttempts\s*=\s*0/)
+        expect(helperBody).toMatch(/w\.recoveryAttempts\s*=\s*0/)
+        const wired = SOURCE.match(/rearmRecoveryBudget\(sid, w\)/g) ?? []
+        expect(wired.length).toBeGreaterThanOrEqual(2)
     })
 
     test("exhausted budget latches gaveUp and stays mute; a user message re-arms recovery", async () => {
@@ -124,5 +124,55 @@ describe("gaveUp re-arm on genuine user message", () => {
         const resumed = await waitFor(() => promptCalls.length > countWhenMuted)
         expect(resumed).toBe(true)
         expect(promptCalls[promptCalls.length - 1]!.sid).toBe(sid)
+    })
+
+    test("the message.updated hook re-arms the budget too (host-proven event)", async () => {
+        const { hooks, logCalls, promptCalls } = await setup({ failFirstPrompts: 3 })
+        const sid = "ses_gaveup2"
+
+        await busy(hooks, sid)
+        const latched = await waitFor(() =>
+            logCalls.some((l) => l.message.includes("retries exhausted") || l.message.includes("GAVE UP")),
+        )
+        expect(latched).toBe(true)
+        await wait(200)
+        const countWhenMuted = promptCalls.length
+
+        // message.updated with role=user (NOT chat.message): the event every
+        // host is proven to emit for inbound user messages.
+        await hooks.event!({
+            event: { type: "message.updated", sessionID: sid, properties: { role: "user" } },
+        } as any)
+
+        const resumed = await waitFor(() => promptCalls.length > countWhenMuted)
+        expect(resumed).toBe(true)
+        expect(promptCalls[promptCalls.length - 1]!.sid).toBe(sid)
+    })
+
+    test("an echoed own prompt does NOT re-arm the budget (loop guard)", async () => {
+        const { hooks, logCalls, promptCalls } = await setup({ failFirstPrompts: 3 })
+        const sid = "ses_echo"
+
+        await busy(hooks, sid)
+        const latched = await waitFor(() =>
+            logCalls.some((l) => l.message.includes("retries exhausted") || l.message.includes("GAVE UP")),
+        )
+        expect(latched).toBe(true)
+        await wait(200)
+        const countWhenMuted = promptCalls.length
+
+        // The server echoes our own "continue" back as a user message. It
+        // must be recognized as ours: re-arming on it would turn the gaveUp
+        // hard-stop into an infinite continue loop (the echo re-arms, the
+        // stall sends again, the new echo re-arms...).
+        await hooks.event!({
+            event: {
+                type: "message.updated",
+                sessionID: sid,
+                properties: { role: "user", parts: [{ type: "text", text: "continue" }] },
+            },
+        } as any)
+        await wait(600)
+        expect(promptCalls.length).toBe(countWhenMuted)
     })
 })
