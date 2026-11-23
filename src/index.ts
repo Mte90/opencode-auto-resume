@@ -704,7 +704,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         // Hard stop (choke point): once this session's recovery cycle has given up,
         // refuse to send ANY further continue prompt, from any code path. This
         // guarantees the jinja/ECONNREFUSED continue-loop cannot run from any
-        // entry point. Re-arms only on a genuine new user message (resetSessionFlags clears gaveUp).
+        // entry point. Re-arms only on a genuine new user message (the chat.message
+        // hook clears gaveUp).
         if (w.gaveUp) {
             await log("debug", `${short(sid)} - gaveUp latched, refusing further continue prompts`)
             return
@@ -914,7 +915,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                             // Latch gaveUp so the main timer loop does NOT re-arm, and
                             // disarm the pending recovery. This is the definitive end
                             // of the continue loop; it re-arms only on a genuine new
-                            // user message (resetSessionFlags clears gaveUp).
+                            // user message (the chat.message hook clears gaveUp).
                             w.gaveUp = true
                             w.pendingRecovery = false
                             w.pendingRecoveryReason = null
@@ -1512,7 +1513,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         // PRESERVE: resumeAttempts, gaveUp, recoveryAttempts — these accumulate
         // across busy transitions until maxRetries/maxRecoveryRetries is hit,
         // then latch gaveUp=true to hard-stop the loop. Reset only on genuine
-        // user messages (resetSessionFlags clears them).
+        // user messages (the chat.message hook clears them).
         // PRESERVE doneClaimNoTodosAttempts: re-armed only by an inbound user
         // message (genuine new work cycle). Resetting it here let the
         // done-claim-no-todos prompt refire unboundedly across cycles (#26).
@@ -3152,6 +3153,18 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 w.taskCompleteSignals = 0
                 await log("info", `${short(sid)} - new user message, re-arming auto-resume`)
             }
+            // New work cycle: re-arm the recovery budget. sendContinuePrompt
+            // hard-stops on gaveUp from any code path and resumeAttempts gates
+            // the stall retries, so without this re-arm a session that
+            // exhausted its budget once stayed muted for the rest of its
+            // life — nudges kept "succeeding" (tryResume returns true) while
+            // sendContinuePrompt silently refused.
+            if (w.gaveUp || w.resumeAttempts > 0 || w.recoveryAttempts > 0) {
+                dbg(`State transition on ${short(sid)}: gaveUp=${w.gaveUp} -> false, resumeAttempts=${w.resumeAttempts} -> 0, recoveryAttempts=${w.recoveryAttempts} -> 0 (new user message)`)
+            }
+            w.resumeAttempts = 0
+            w.recoveryAttempts = 0
+            w.gaveUp = false
         },
 
         "tool.execute.before": async (input: any, hookArgs: any) => {
