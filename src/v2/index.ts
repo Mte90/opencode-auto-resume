@@ -91,6 +91,7 @@ import {
 	TRUNCATED_XML_PATTERNS,
 	READY_TO_CONTINUE_PATTERNS,
 	OWN_PROMPT_SHAPES,
+	SUBAGENT_LOOP_RECOVERY_PROMPT,
 	DONE_CLAIM_PATTERNS,
 	TOOL_TEXT_RECOVERY_PROMPT,
 	THINKING_TOOL_RECOVERY_PROMPT,
@@ -474,6 +475,11 @@ interface SessionWatch {
 	 * `parentID` for this session, i.e. it is a child and must never be injected
 	 * into or interrupted. `undefined` = not yet resolved. */
 	isSubAgent?: boolean
+	/** Loop-breaker budget for a subagent repeating identical commands
+	 * (message-based detection; see detectSubagentToolLoop). */
+	subagentLoopAttempts: number
+	/** Last time the busy sweep inspected this subagent's tool history. */
+	subagentLoopCheckedAt: number
 	/** One targeted wake per dead subagent episode. Reset only by a genuine
 	 * user/task message, never by the busy transition the wake itself causes. */
 	subagentRecoveryTried?: boolean
@@ -2037,6 +2043,8 @@ export default define({
 			if (w) {
 				w.emptyIdleNudged ??= false
 				w.subagentRecoveryTried ??= false
+				w.subagentLoopAttempts ??= 0
+				w.subagentLoopCheckedAt ??= 0
 				w.workRetries ??= 0
 				w.recoverGeneration ??= 0
 				w.lifetimeContinues ??= 0
@@ -2097,6 +2105,8 @@ export default define({
 					latchReopened: false,
 					emptyIdleNudged: false,
 					subagentRecoveryTried: false,
+					subagentLoopAttempts: 0,
+					subagentLoopCheckedAt: 0,
 					todos: [],
 					todosFetchedAt: 0,
 					taskCompleteSignals: 0,
@@ -2206,6 +2216,10 @@ export default define({
 				// same thing.
 				w.todoNudgeAttempts = 0
 				w.intentNudgeAttempts = 0
+				// A fresh turn also re-arms the subagent loop-breaker: the child may
+				// legitimately hit an identical-command loop again in new work, and
+				// the budget counts corrections per episode.
+				w.subagentLoopAttempts = 0
 				// contextWrapupAttempts re-arms per turn: the saturation intervention
 				// comment says "one-shot per turn" (line 462), so it must reset
 				// when a fresh turn begins, or the guard goes dead after first use.
@@ -5496,6 +5510,53 @@ export default define({
 		 * parent is stuck *because* the child is, so waking the child is cheaper than
 		 * killing the parent and its whole turn.
 		 */
+		/**
+		 * Message-based same-command loop detection for a subagent: collects the
+		 * most recent tool-part fingerprints (name + stable-stringified args) from
+		 * the child's history and reports a loop on the same "3 of the last 5
+		 * identical" heuristic as the v1 live detector. Reading history instead
+		 * of hooks is the point — subagent tool calls rejected before execution
+		 * never reach any hook, so this is the only view of what the child is
+		 * actually attempting. Unparseable args degrade every fingerprint to the
+		 * same value, which is exactly what makes invalid-call loops detectable.
+		 */
+		function stableToolFingerprint(name: string, args: unknown): string {
+			const stable = (v: unknown): string => {
+				if (v === null || v === undefined) return String(v)
+				if (typeof v !== "object") return JSON.stringify(v) ?? String(v)
+				if (Array.isArray(v)) return "[" + v.map(stable).join(",") + "]"
+				const obj = v as Record<string, unknown>
+				return "{" + Object.keys(obj).sort().map((k) => JSON.stringify(k) + ":" + stable(obj[k])).join(",") + "}"
+			}
+			try {
+				return `${name}:${stable(args)}`.slice(0, 200)
+			} catch {
+				return `${name}:unserializable`
+			}
+		}
+
+		async function detectSubagentToolLoop(sid: string): Promise<boolean> {
+			try {
+				const messages = await loadMessages(sid)
+				const sigs: string[] = []
+				for (let i = messages.length - 1; i >= 0 && sigs.length < 5; i--) {
+					if (msgRole(messages[i]) === "user" && sigs.length > 0) break
+					if (msgRole(messages[i]) !== "assistant") continue
+					const content = (messages[i] as { content?: Array<Record<string, unknown>> }).content ?? []
+					for (let j = content.length - 1; j >= 0 && sigs.length < 5; j--) {
+						const p = content[j]!
+						const t = (p.type as string) ?? ""
+						if (!(t === "tool_use" || t === "tool" || t === "tool_call" || t.startsWith("tool"))) continue
+						sigs.push(stableToolFingerprint((p.name as string) ?? "unknown", p.input ?? p.arguments ?? p.args))
+					}
+				}
+				if (sigs.length < 5) return false
+				return sigs.slice(-5).filter((s) => s === sigs[sigs.length - 1]).length >= 3
+			} catch {
+				return false
+			}
+		}
+
 		async function recoverStuckSubagent(sid: string): Promise<boolean> {
 			if (!running) return false
 			try {
@@ -5906,6 +5967,44 @@ export default define({
 				// emit anything. Without this a freshly-started turn can be declared
 				// stalled while it is still queueing its first model call.
 				if (now - w.createdAt < warmupMs) continue
+				// Subagent same-command loop: calls rejected before execution never
+				// reach any tool hook, and an actively-looping child reads as
+				// busy-with-activity to every silence check — so it spins forever.
+				// Inspect the child's recent tool parts from history (same fingerprint
+				// and 3-of-last-5 heuristic as v1): loop → corrective prompt with an
+				// explicit todowrite reset; after two corrections that changed
+				// nothing, interrupt (kill) the child and let the parent-side
+				// recovery take over.
+				if (now - w.subagentLoopCheckedAt >= checkIntervalMs * 2) {
+					w.subagentLoopCheckedAt = now
+					if (
+						!w.recovering &&
+						!w.permissionPending &&
+						!w.compacting &&
+						!selfAbortActive(w) &&
+						(await isSubAgentSession(sid)) &&
+						(await detectSubagentToolLoop(sid))
+					) {
+						if (w.subagentLoopAttempts < 2) {
+							w.subagentLoopAttempts++
+							log("warn", `${short(sid)} subagent repeating identical commands — loop-breaker ${w.subagentLoopAttempts}/2 (todowrite reset)`)
+							try {
+								await callSessionApi("synthetic", { sessionID: sid, text: SUBAGENT_LOOP_RECOVERY_PROMPT })
+							} catch (e) {
+								log("warn", `loop-breaker failed for ${short(sid)}: ${e instanceof Error ? e.message : String(e)}`)
+							}
+						} else {
+							log("warn", `${short(sid)} subagent loop survived 2 corrections — interrupting (killing) the subagent`)
+							try {
+								await callSessionApi("interrupt", { sessionID: sid })
+								w.subagentLoopAttempts = 0
+								w.subagentLoopCheckedAt = 0
+							} catch (e) {
+								log("warn", `subagent kill failed for ${short(sid)}: ${e instanceof Error ? e.message : String(e)}`)
+							}
+						}
+					}
+				}
 				// The orphan watch comes first, ahead of the silence check below,
 				// because that is the whole point of it: a parent waiting on a dead
 				// subagent has been quiet for less than chunkTimeoutMs, so every

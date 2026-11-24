@@ -104,6 +104,7 @@ export const OWN_PROMPT_SHAPES: RegExp[] = [
 	/^continue\s*\nOnly continue work already in progress\./,
 	/^continue\s*\nIf work was already in progress,/,
 	/^You appear to have stalled with no open tasks/,
+	/^You are repeating the same command in a loop with no progress/,
 	/^You tried to use the tool "/,
 	/^You have \d+ unfinished tasks?:/,
 	/^Your last message contained a raw tool call printed as text/,
@@ -194,6 +195,15 @@ export const STALL_NO_TODOS_PROMPT =
 	"Verify whether you have actually completed everything that was requested. " +
 	"If all work is done, call the task_complete tool now to record completion. " +
 	"If anything remains, update your todo list and continue the remaining work."
+
+/** Loop-breaker for a subagent repeating identical commands: correct it once
+ * or twice (with an explicit todowrite reset), then the caller kills the
+ * child and lets the parent-side recovery take over. */
+export const SUBAGENT_LOOP_RECOVERY_PROMPT =
+	"You are repeating the same command in a loop with no progress. Stop re-running it. " +
+	"First reset your todo list: rewrite the todowrite list from scratch, keeping only the work that actually remains. " +
+	"Then take a different approach on the step that is blocking you — " +
+	"if it keeps failing, report the failure and move on to the next task."
 
 // ---- Pure helper functions ----
 

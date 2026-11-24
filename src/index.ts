@@ -49,6 +49,7 @@ import {
     DONE_WITHOUT_DETAILS_PROMPT,
     CONTINUE_PROMPT,
     STALL_NO_TODOS_PROMPT,
+    SUBAGENT_LOOP_RECOVERY_PROMPT,
     containsToolCallAsText,
     getOpenTodos,
     isOpenTodo,
@@ -103,6 +104,11 @@ export interface SessionWatch {
     lastTokenTotal: number
     contextWrapupAttempts: number
     toolLoopAttempts: number
+    /** Loop-breaker budget for a subagent repeating identical commands
+     * (message-based detection; see detectSubagentToolLoop). */
+    subagentLoopAttempts: number
+    /** Last time the busy-loop pass inspected this subagent's tool history. */
+    subagentLoopCheckedAt: number
     isSubagent: boolean
     // One targeted recovery prompt per dead subagent episode. Reset only by a
     // genuine new user/task message, never by the busy transition it triggers.
@@ -519,6 +525,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 lastTokenTotal: 0,
                 contextWrapupAttempts: 0,
                 toolLoopAttempts: 0,
+                subagentLoopAttempts: 0,
+                subagentLoopCheckedAt: 0,
                 isSubagent: false,
                 subagentRecoveryTried: false,
                 completionSignaled: false,
@@ -1311,6 +1319,38 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
     const SUBAGENT_RECOVERY_PROMPT = "It looks like you may have stalled or timed out. Please retry the last operation or continue with the task."
 
+    /**
+     * Message-based same-command loop detection for a subagent: collects the
+     * most recent tool_use fingerprints (name + stable-stringified args, same
+     * toolCallSignature as the live detector) from the child's history and
+     * reports a loop on the same "3 of the last 5 identical" heuristic.
+     * Reading history instead of hooks is the point — subagent tool calls
+     * do not reliably reach tool.execute.before, so this is the only view
+     * of what the child is actually executing.
+     */
+    async function detectSubagentToolLoop(sid: string): Promise<boolean> {
+        try {
+            const msgs = await getSessionMessages(sid)
+            const sigs: string[] = []
+            for (let i = msgs.length - 1; i >= 0 && sigs.length < 5; i--) {
+                const m = msgs[i]
+                if (roleOf(m) === "user" && sigs.length > 0) break
+                if (roleOf(m) !== "assistant") continue
+                const parts = m.parts as Array<Record<string, unknown>> | undefined
+                if (!parts) continue
+                for (let j = parts.length - 1; j >= 0 && sigs.length < 5; j--) {
+                    const p = parts[j]
+                    if ((p.type as string) !== "tool_use") continue
+                    sigs.push(toolCallSignature((p.name as string) ?? "unknown", p.input ?? p.args))
+                }
+            }
+            if (sigs.length < 5) return false
+            return sigs.slice(-5).filter((s) => s === sigs[sigs.length - 1]).length >= 3
+        } catch {
+            return false
+        }
+    }
+
     async function recoverSubagent(subagentSid: string): Promise<boolean> {
         try {
             await ctx.client.session.prompt({
@@ -1538,6 +1578,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         w.recentToolCalls = []
         w.liveToolSigs = []
         w.toolLoopAttempts = 0
+        w.subagentLoopAttempts = 0
         if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
         w.pendingRecovery = false
         w.pendingRecoveryReason = null
@@ -1562,6 +1603,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         w.recentToolCalls = []
         w.liveToolSigs = []
         w.toolLoopAttempts = 0
+        w.subagentLoopAttempts = 0
         w.contextWrapupAttempts = 0
         w.pendingRecovery = false
         w.pendingRecoveryReason = null
@@ -2202,6 +2244,46 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 if (w.status !== "busy") continue
                 if (w.userCancelled || w.completionSignaled) continue
                 if (w.aborting) continue
+
+                // Subagent same-command loop: the child's tool calls may never
+                // surface through the host tool hooks, so an actively looping
+                // subagent looks "busy with activity" to every other check
+                // (checkSessionHasActiveTool keeps approving it). Inspect the
+                // child's recent tool_use parts directly: identical name+args
+                // fingerprints in a row → corrective prompt (with an explicit
+                // todowrite reset); after two corrections that changed nothing,
+                // kill the child and let the parent-side recovery take over.
+                if (w.isSubagent && !w.pluginAbortInFlight && now - w.subagentLoopCheckedAt >= checkIntervalMs * 2) {
+                    w.subagentLoopCheckedAt = now
+                    if (await detectSubagentToolLoop(sid)) {
+                        if (w.subagentLoopAttempts < 2) {
+                            w.subagentLoopAttempts++
+                            await log("warn", `${short(sid)} - subagent repeating identical commands; sending loop-breaker prompt (${w.subagentLoopAttempts}/2) with todowrite reset`)
+                            try {
+                                await ctx.client.session.prompt({
+                                    path: { id: sid },
+                                    body: { parts: [{ type: "text", text: SUBAGENT_LOOP_RECOVERY_PROMPT }] },
+                                })
+                            } catch (err) {
+                                const errMsg = err instanceof Error ? err.message : String(err)
+                                await log("warn", `${short(sid)} - subagent loop-breaker prompt failed: ${errMsg}`)
+                            }
+                        } else {
+                            await log("warn", `${short(sid)} - subagent loop survived 2 corrections; aborting (killing) the subagent`)
+                            try {
+                                w.pluginAbortInFlight = true
+                                await ctx.client.session.abort({ path: { id: sid } })
+                                w.subagentLoopAttempts = 0
+                                w.subagentLoopCheckedAt = 0
+                            } catch (err) {
+                                const errMsg = err instanceof Error ? err.message : String(err)
+                                await log("warn", `${short(sid)} - subagent kill failed: ${errMsg}`)
+                            } finally {
+                                w.pluginAbortInFlight = false
+                            }
+                        }
+                    }
+                }
 
                 if (w.orphanWatchStartAt !== null) {
                     const orphanIdle = now - w.orphanWatchStartAt
