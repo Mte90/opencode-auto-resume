@@ -4467,6 +4467,21 @@ export default define({
 			// step events, our own injections' turns) that wiped fresh latches
 			// within seconds (ses_ed33c0da, 2026-10-11). Own prompts return above
 			// before reaching here, so our injections never clear it.
+			// A hard latch (task_complete / literal TASK COMPLETE) used to survive
+			// every new user message: completionSignaled cleared here but
+			// completionHard stayed true forever, so neither the stall ladder
+			// nor the instant resume could ever fire again in that session.
+			// Only a message newer than the latch re-arms it — a pre-latch
+			// message the watcher hadn't observed yet must not clear a fresh
+			// completion claim. Own prompts and synthetic interrupts return
+			// above, so they cannot re-open it either.
+			if (
+				w.completionHard &&
+				(typeof latest.at !== "number" || latest.at > w.completionSignaledAt)
+			) {
+				w.completionHard = false
+				dbg(`${short(sid)} genuine new user message — re-opening hard completion latch`)
+			}
 			if (w.completionSignaled) {
 				w.completionSignaled = false
 				w.completionSignaledAt = 0
