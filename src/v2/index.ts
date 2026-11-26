@@ -1048,8 +1048,11 @@ const AWAITING_USER_TOOLS = new Set(["question", "permission", "ask", "confirm"]
  * they want.
  */
 const SAFE_CONTINUE_PROMPT =
-	"continue\nOnly continue work already in progress. Do not start anything new, " +
-	"and do not take destructive or irreversible actions without explicit user approval."
+	"continue\nAutomatic stall notice \u2014 not a user message and not approval. " +
+	"Only continue work already in progress. Do not start anything new, " +
+	"and do not take destructive or irreversible actions without explicit user approval. " +
+	"If the work is waiting on the user, on a rate limit, or on another process, stop here and say what you are waiting for. " +
+	"If you already received this notice for this step, do not repeat the same action."
 
 /**
  * The empty-idle nudge has nothing in progress to continue — that is precisely
@@ -1059,9 +1062,12 @@ const SAFE_CONTINUE_PROMPT =
  * inventing a task.
  */
 const SAFE_EMPTY_IDLE_PROMPT =
-	"continue\nIf work was already in progress, continue it and finish nothing else. " +
+	"continue\nAutomatic idle notice \u2014 not a user message and not approval. " +
+	"If work was already in progress, continue it and finish nothing else. " +
 	"Otherwise ask the user what to do next rather than starting something new. " +
-	"Do not take destructive or irreversible actions without explicit user approval."
+	"Do not take destructive or irreversible actions without explicit user approval. " +
+	"If you are waiting on the user or on a rate limit, stop here and say so. " +
+	"If you already received this notice for this step, do not repeat the same action."
 
 /**
  * The `task_complete` acknowledgement texts.
@@ -3283,8 +3289,10 @@ export default define({
 			]
 				.filter((x): x is string => typeof x === "string" && x.length > 0)
 				.join("; ")
-			return (`continue — stalled (${head}).\nOnly continue work already in progress. ` +
-				`Do not start anything new, and do not take destructive or irreversible actions without explicit user approval.\n${suffix}`).slice(0, 2000)
+			return (`continue — stalled (${head}).\nAutomatic stall notice — not a user message and not approval. ` +
+				`Only continue work already in progress. Do not start anything new, and do not take destructive or irreversible actions without explicit user approval. ` +
+				`If waiting on the user, a rate limit, or another process, stop and say what you are waiting for. ` +
+				`If you already received this notice for this step, do not repeat the same action.\n${suffix}`).slice(0, 2000)
 		}
 
 		/**

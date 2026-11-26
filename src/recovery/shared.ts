@@ -105,7 +105,8 @@ export const READY_TO_CONTINUE_PATTERNS = [
 export const OWN_PROMPT_SHAPES: RegExp[] = [
 	/^continue\s*\u2014\s*stalled\s*\(/,
 	/^continue\s*\nOnly continue work already in progress\./,
-	/^continue\s*\nIf work was already in progress,/,
+	/^continue\s*\nIf work was already in progress/,
+	/^continue\s*\nAutomatic stall notice/,
 	/^You appear to have stalled with no open tasks/,
 	/^You are repeating the same command in a loop with no progress/,
 	/^You tried to use the tool "/,
