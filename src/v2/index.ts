@@ -286,6 +286,11 @@ interface SessionWatch {
 	 * set it would clear it too. */
 	consecFailureRecovers: number
 	failureLoopLatched: boolean
+	/** Consecutive quota recoveries with no genuine user message. The cooldown
+	 * ladder resets each turn, so it never exhausts when each recovery
+	 * manufactures the next 429. Only a genuine user turn resets this. */
+	quotaLoopCount: number
+	quotaLoopLatched: boolean
 	aborting: boolean
 	/** Timestamp of the last plugin-initiated `session.interrupt()`. Any abort-shaped
 	 * event inside `SELF_ABORT_TTL_MS` of it is ours, not the user's. */
@@ -2072,6 +2077,8 @@ export default define({
 					lastGenuineUserAt: 0,
 					consecFailureRecovers: 0,
 					failureLoopLatched: false,
+					quotaLoopCount: 0,
+					quotaLoopLatched: false,
 					aborting: false,
 					selfAbortAt: 0,
 					interruptsThisWindow: 0,
@@ -2484,6 +2491,12 @@ export default define({
 			const tag = "rate-limit"
 			const n = w.rateLimitAttempts
 			markIdle(sid)
+			w.quotaLoopCount = (w.quotaLoopCount ?? 0) + 1
+			if (w.quotaLoopCount > 4) {
+				w.quotaLoopLatched = true
+				log("warn", `${short(sid)} quota loop (${w.quotaLoopCount} rate-limit recoveries, no genuine user message) — standing down until user turn`)
+				return
+			}
 			if (n >= ladder.length) {
 				w.awaitingQuotaRetry = false
 				log("warn", `${short(sid)} ${tag} budget exhausted (${ladder.length} attempts) — standing down until user turn`)
@@ -4106,6 +4119,10 @@ export default define({
 		 * hand-off, not a death, and a latched completion is never re-nudged.
 		 */
 		async function nudgeEmptyIdleTurn(sid: string, w: SessionWatch, messages: unknown[]): Promise<boolean> {
+			if (w.quotaLoopLatched) {
+				dbg(`${short(sid)} quota loop latched — no instant nudge until a genuine user turn`)
+				return false
+			}
 			if (w.emptyIdleNudged) return false
 			if (w.userCancelled || w.gaveUp || w.permissionPending) return false
 			if (w.completionSignaled) return false
@@ -4494,6 +4511,9 @@ export default define({
 			// nudge, which can never outrun the continues of the episode, so the
 			// existing `lifetimeMaxContinues` setting (9) bounds it too.
 			w.workRetries = 0
+			// A genuine user turn ends any quota stand-down loop.
+			w.quotaLoopCount = 0
+			w.quotaLoopLatched = false
 			if (ctx.storage?.remove) {
 				ctx.storage.remove(`${COUNTER_STATE_PREFIX}${sid}`).catch(() => {})
 			}
