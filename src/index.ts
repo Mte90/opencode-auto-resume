@@ -21,6 +21,7 @@ import {
     DEFAULT_LOOP_WINDOW_MS,
     DEFAULT_TOOL_TEXT_CHECK_DELAY_MS,
     DEFAULT_MAX_RECOVERY_RETRIES,
+    DEFAULT_NO_RUN_CHECK_DELAY_MS,
     DEFAULT_MIN_ACTIVITY_GAP_MS,
     DEFAULT_WARMUP_MS,
     DEFAULT_SILENT_DEAD_STREAM_MIN_TOKENS,
@@ -115,6 +116,9 @@ export interface SessionWatch {
     subagentRecoveryTried: boolean
     completionSignaled: boolean
     todoNudgeAttempts: number
+    /** Last reason an open-todos nudge was suppressed. Logged once per change
+     * so a silent idle-with-todos session is diagnosable instead of healthy. */
+    todoNudgeSkipReason: string | null
     taskCompleteOverrides: number
     // Consecutive task_complete ACKs with no new user message, block, or
     // other tool work between them. Guards the ack self-loop where the ack
@@ -378,6 +382,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     (options?.loopWindowMs as number) ?? DEFAULT_LOOP_WINDOW_MS
     const toolTextCheckDelayMs: number =
     (options?.toolTextCheckDelayMs as number) ?? DEFAULT_TOOL_TEXT_CHECK_DELAY_MS
+    const noRunCheckDelayMs: number =
+    (options?.noRunCheckDelayMs as number) ?? DEFAULT_NO_RUN_CHECK_DELAY_MS
     const maxRecoveryRetries: number =
     (options?.maxRecoveryRetries as number) ?? DEFAULT_MAX_RECOVERY_RETRIES
     const minActivityGapMs: number =
@@ -531,6 +537,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 subagentRecoveryTried: false,
                 completionSignaled: false,
                 todoNudgeAttempts: 0,
+                todoNudgeSkipReason: null,
                 taskCompleteOverrides: 0,
                 taskCompleteSignals: 0,
                 doneClaimNoTodosAttempts: 0,
@@ -952,7 +959,29 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         }
                     }
                 } else {
-                    await log("warn", `${short(sid)} - prompt sent >${toolTextCheckDelayMs / 1000}s ago but session is still ${w.status}`)
+                    // Plain nudge (open-todos reminder, action-intent, …): there
+                    // is no pendingRecovery chain that would retry it. If the
+                    // host accepted the prompt but the session never went busy,
+                    // nothing ran — the nudge budget then burns down in silence
+                    // while the session sits idle with open todos. Give a slow
+                    // provider time to start, then escalate once via
+                    // abort+resume, budgeted like every other recovery path.
+                    setTimeout(async () => {
+                        if (w.status === "busy" || w.lastActivityAt > sentAt) return
+                        if (w.userCancelled || w.completionSignaled || w.aborting || w.gaveUp) return
+                        if (w.recoveryAttempts >= maxRecoveryRetries) {
+                            w.gaveUp = true
+                            await log("warn", `No model run after prompt on ${short(sid)}: attempts=${w.recoveryAttempts}, maxRetries=${maxRecoveryRetries} — GAVE UP (re-arms on next user message)`)
+                            return
+                        }
+                        w.recoveryAttempts++
+                        await log("warn", `${short(sid)} - prompt accepted but no model activity after ${noRunCheckDelayMs}ms (status=${w.status}) — attempt=${w.recoveryAttempts}/${maxRecoveryRetries}, nextAction=abort-resume`)
+                        const resumed = await tryAbortAndResume(sid, w)
+                        if (!resumed && !w.aborting) {
+                            w.gaveUp = true
+                            await log("warn", `No model run after prompt on ${short(sid)}: attempts=${w.recoveryAttempts}, lastError=abort+resume failed — GAVE UP (re-arms on next user message)`)
+                        }
+                    }, noRunCheckDelayMs)
                 }
             } else {
                 const elapsedMs = Date.now() - w.lastRetryAt
@@ -1587,6 +1616,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         w.recoveryAttempts = 0
         w.recoveryContinueInFlight = false
         w.watchdogRetryGuard = false
+        w.todoNudgeSkipReason = null
     }
 
     function resetBusyFlags(w: SessionWatch) {
@@ -1613,6 +1643,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
         // Reset nudge budget on each genuine new busy→work cycle (user prompt or agent re-engagement after nudge)
         w.todoNudgeAttempts = 0
+        w.todoNudgeSkipReason = null
         // PRESERVE: resumeAttempts, gaveUp, recoveryAttempts — these accumulate
         // across busy transitions until maxRetries/maxRecoveryRetries is hit,
         // then latch gaveUp=true to hard-stop the loop. Reset only on genuine
@@ -2058,6 +2089,24 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     // Abort + Continue
     // -----------------------------------------------------------------------
 
+    /**
+     * Why an idle session with open todos is not being nudged right now, or
+     * null when the nudge may proceed.
+     */
+    function openTodosNudgeGate(w: SessionWatch, openCount: number): string | null {
+        if (w.completionSignaled) return "completion latched (a stop line or celebration latched before these todos were opened)"
+        if (w.gaveUp) return "gaveUp latched — recovery budget exhausted (re-arms on the next user message)"
+        if (w.todoNudgeAttempts >= maxRetries) return `todo nudge budget exhausted (${w.todoNudgeAttempts}/${maxRetries}) — re-arms when the session next goes busy`
+        if (openCount <= 0) return null
+        return null
+    }
+
+    async function noteTodoNudgeSkip(sid: string, w: SessionWatch, reason: string) {
+        if (w.todoNudgeSkipReason === reason) return
+        w.todoNudgeSkipReason = reason
+        await log("info", `${short(sid)} - open-todos nudge suppressed: ${reason}`)
+    }
+
     async function tryAbortAndResume(sid: string, w: SessionWatch): Promise<boolean> {
         if (typeof sid !== "string" || !sid || !sid.startsWith("ses_")) {
             await log("warn", `Invalid sid for abort: ${sid} (must start with "ses_")`)
@@ -2477,9 +2526,19 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
                 if (w.status !== "idle") continue
                 if (w.isSubagent) continue
-                if (w.userCancelled || w.completionSignaled) continue
+                if (w.userCancelled) continue
                 if (w.continuing) continue
-                if (busyCount() !== 0) continue
+                if (busyCount() !== 0) {
+                    // Another session is working: nudging an idle one now would
+                    // interleave prompts the user did not ask for. That skip used
+                    // to be silent — an idle session with open todos looked
+                    // abandoned when it was just queued behind a busy sibling.
+                    const openNow = getOpenTodos(w.todos || [])
+                    if (openNow.length > 0) {
+                        await noteTodoNudgeSkip(sid, w, `another session is busy (${busyCount()}) — periodic nudge stands down until every session is idle`)
+                    }
+                    continue
+                }
                 // Awaiting-input gate (same contract as the session.idle
                 // block): a trailing pending tool_use means the user holds
                 // the ball — the periodic open-todos nudge must stand down
@@ -2508,8 +2567,12 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     }
                 }
                 const open = getOpenTodos(w.todos || [])
-                if (open.length === 0) continue
-                if (w.todoNudgeAttempts >= maxRetries) continue
+                if (open.length === 0) { w.todoNudgeSkipReason = null; continue }
+                const nudgeGate = openTodosNudgeGate(w, open.length)
+                if (nudgeGate) {
+                    await noteTodoNudgeSkip(sid, w, nudgeGate)
+                    continue
+                }
                 const elapsedSinceLastNudge = Date.now() - w.lastRetryAt
                 const requiredBackoff = backoffMs(w.todoNudgeAttempts, baseBackoffMs, maxBackoffMs)
                 if (w.lastRetryAt > 0 && elapsedSinceLastNudge < requiredBackoff) continue
@@ -2528,6 +2591,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 const sent = await tryResume(sid, w, "Idle with open todos (periodic)", reminder)
                 if (sent) {
                     w.todoNudgeAttempts++
+                    w.todoNudgeSkipReason = null
                     await log("info", `${short(sid)} - idle periodic recheck: nudge ${w.todoNudgeAttempts}/${maxRetries}`)
                 }
             }
@@ -2878,7 +2942,12 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         }
                         const open = getOpenTodos(todos)
                         
-                        if (open.length > 0 && currentBusy === 0 && !awaitingUserInput && !userRecentlyActive(w) && !w.completionSignaled && !w.userCancelled && w.todoNudgeAttempts < maxRetries) {
+                        const nudgeBlocked =
+                            open.length > 0 && currentBusy === 0 && !awaitingUserInput && !userRecentlyActive(w) && !w.userCancelled
+                                ? openTodosNudgeGate(w, open.length)
+                                : null
+                        if (nudgeBlocked) await noteTodoNudgeSkip(sid, w, nudgeBlocked)
+                        if (open.length > 0 && currentBusy === 0 && !awaitingUserInput && !userRecentlyActive(w) && !w.userCancelled && !nudgeBlocked) {
                             const isCelebration = await lastAssistantEndsWithCelebration(sid)
                             await log("info", `${short(sid)} - open todos=${open.length}, isCelebration=${isCelebration}, currentBusy=${currentBusy}`)
                             if (isCelebration) {
@@ -2886,11 +2955,11 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                                 await log("info", `${short(sid)} - 🎉 detected but ${open.length} open todos remain, sending nudge`)
                                 const reminder = buildOpenTodosReminder(todos)
                                 const sent = await tryResume(sid, w, "Idle with open todos (celebration false positive)", reminder)
-                                if (sent) w.todoNudgeAttempts++
+                                if (sent) { w.todoNudgeAttempts++; w.todoNudgeSkipReason = null }
                             } else {
                                 const reminder = buildOpenTodosReminder(todos)
                                 const sent = await tryResume(sid, w, "Idle with open todos", reminder)
-                                if (sent) w.todoNudgeAttempts++
+                                if (sent) { w.todoNudgeAttempts++; w.todoNudgeSkipReason = null }
                             }
                         }
                     }

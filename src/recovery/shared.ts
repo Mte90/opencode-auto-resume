@@ -26,6 +26,9 @@ export const DEFAULT_LOOP_MAX_CONTINUES = 3
 export const DEFAULT_LOOP_WINDOW_MS = 10 * 60_000
 export const DEFAULT_TOOL_TEXT_CHECK_DELAY_MS = 3_000
 export const DEFAULT_MAX_RECOVERY_RETRIES = 2
+/** Delay before concluding that an accepted prompt never started a model run.
+ * Well above the tool-text check delay so a slow provider can still start. */
+export const DEFAULT_NO_RUN_CHECK_DELAY_MS = 15_000
 export const DEFAULT_MIN_ACTIVITY_GAP_MS = 1_000
 export const DEFAULT_WARMUP_MS = 15_000
 export const DEFAULT_SILENT_DEAD_STREAM_MIN_TOKENS = 200

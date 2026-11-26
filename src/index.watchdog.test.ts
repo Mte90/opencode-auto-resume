@@ -214,7 +214,7 @@ describe("WP-05 watchdog — recovery retry & escalation", () => {
         expect(logCalls.some(l => l.message.includes("prompt sent >"))).toBe(false)
     })
 
-    test("watchdog logs a warning only when pendingRecovery is false (backward compatible)", async () => {
+    test("plain nudge without pendingRecovery escalates via abort+resume when the model never runs", async () => {
         const { ctx, logCalls, promptCalls, abortCalls } = createWatchdogContext({
             statusMap: { ses_plain: "idle" },
             messages: {
@@ -226,19 +226,22 @@ describe("WP-05 watchdog — recovery retry & escalation", () => {
         const hooks = await AutoResumePlugin(ctx, {
             ...BASE_OPTS,
             toolTextCheckDelayMs: 40,
+            noRunCheckDelayMs: 60,
             checkIntervalMs: 20,
         } as any)
         const sid = "ses_plain"
 
         // No streaming failure — a plain action-intent recovery sends a prompt
-        // with pendingRecovery === false.
+        // with pendingRecovery === false. The host accepts it but the model
+        // never runs: after noRunCheckDelayMs the no-run escalation fires
+        // (warn + abort+resume), budgeted by maxRecoveryRetries.
         await hooks.event!(makeStatusEvent(sid, "busy") as any)
         await hooks.event!(makeStatusEvent(sid, "idle") as any)
 
-        await wait(500)
+        await wait(400)
         expect(promptCalls.length).toBe(1)
-        expect(abortCalls.length).toBe(0)
-        expect(logCalls.some(l => l.message.includes("prompt sent >"))).toBe(true)
+        expect(abortCalls.length).toBe(1)
+        expect(logCalls.some(l => l.message.includes("prompt accepted but no model activity"))).toBe(true)
         expect(logCalls.some(l => RETRY_LOG.test(l.message))).toBe(false)
     })
 
