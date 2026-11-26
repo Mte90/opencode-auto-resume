@@ -165,7 +165,7 @@ export function buildOpenTodosReminder(todos: Todo[]): string {
     const plural = open.length > 1 ? "s" : ""
     const taskWord = open.length > 1 ? "tasks" : "task"
     const thisWord = open.length > 1 ? "these" : "this"
-    return `You have ${open.length} unfinished task${plural}:\n${list}\n\nPlease continue working on ${thisWord} ${taskWord}.`
+    return `You have ${open.length} unfinished task${plural}:\n${list}\n\nBefore continuing, verify that each task above is still valid — update the list and remove any task that is already done, outdated, or no longer needed. If the project keeps tasks in a tracking file, check it and update it to match the list.\n\nPlease continue working on ${thisWord} ${taskWord}.`
 }
 
 export function containsDoneClaimPattern(text: string, patterns: RegExp[] = DONE_CLAIM_PATTERNS): boolean {

@@ -187,5 +187,23 @@ describe("shared.ts exports", () => {
 		test("DEFAULT_SILENT_DEAD_STREAM_MIN_TOKENS === 200", () => {
 			expect(shared.DEFAULT_SILENT_DEAD_STREAM_MIN_TOKENS).toBe(200)
 		})
+
+		test("buildOpenTodosReminder asks to verify and prune the list", () => {
+			const text = shared.buildOpenTodosReminder([
+				{ content: "A", status: "pending", priority: "high" },
+			] as any)
+			expect(text).toContain("verify that each task above is still valid")
+			expect(text).toContain("remove any task that is already done, outdated, or no longer needed")
+			expect(text).toContain("If the project keeps tasks in a tracking file, check it and update it to match the list")
+		})
+
+		test("OWN_PROMPT_SHAPES still matches the todo reminder first line", () => {
+			const text = shared.buildOpenTodosReminder([
+				{ content: "A", status: "pending", priority: "high" },
+			] as any)
+			const firstLine = text.split("\n")[0]
+			const matches = shared.OWN_PROMPT_SHAPES.filter((re) => re.test(firstLine))
+			expect(matches.length).toBeGreaterThan(0)
+		})
 	})
 })

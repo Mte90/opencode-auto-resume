@@ -392,9 +392,9 @@ The todo plugin is optional, and without it the unfinished-task nudges never tri
 
 When a turn ends with items still open, the nudge names them:
 
-> You have 2 unfinished tasks: 1. [pending] Verify the plugin loads under v2 2. [in_progress] Write the todo-nudges section of the README Please continue working on these tasks.
+> You have 2 unfinished tasks: 1. [pending] Verify the plugin loads under v2 2. [in_progress] Write the todo-nudges section of the README Before continuing, verify that each task above is still valid — update the list and remove any task that is already done, outdated, or no longer needed. If the project keeps tasks in a tracking file, check it and update it to match the list. Please continue working on these tasks.
 
-`buildOpenTodosReminder` sends that verbatim, numbering each open item (`pending` or `in_progress`) and falling back to a bare `continue` when the list is unusable. Four paths send it: a 🎉 celebration with items still open, a `task_complete` with items still open, a stop statement with work listed, and a completion claim with work listed. The ready-to-continue check reads the same list in reverse: a "ready" claim while every todo is already closed gets two chances before a plain `continue`.
+`buildOpenTodosReminder` sends that verbatim, numbering each open item (`pending` or `in_progress`) and falling back to a bare `continue` when the list is unusable. The reminder also asks the model to verify the list before resuming and to keep any project task-tracking file in sync, so stale entries are updated or removed instead of resurrecting work that is already done. Four paths send it: a 🎉 celebration with items still open, a `task_complete` with items still open, a stop statement with work listed, and a completion claim with work listed. The ready-to-continue check reads the same list in reverse: a "ready" claim while every todo is already closed gets two chances before a plain `continue`.
 
 #### Context saturation → magic-context wrapup
 

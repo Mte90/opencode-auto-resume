@@ -202,7 +202,7 @@ describe("buildOpenTodosReminder()", () => {
             { content: "Fix login bug", status: "pending", priority: "high" },
         ]
         expect(buildOpenTodosReminder(todos)).toBe(
-            "You have 1 unfinished task:\n1. [pending] Fix login bug\n\nPlease continue working on this task."
+            "You have 1 unfinished task:\n1. [pending] Fix login bug\n\nBefore continuing, verify that each task above is still valid — update the list and remove any task that is already done, outdated, or no longer needed. If the project keeps tasks in a tracking file, check it and update it to match the list.\n\nPlease continue working on this task."
         )
     })
 
@@ -226,6 +226,8 @@ describe("buildOpenTodosReminder()", () => {
         expect(result).toContain("2. [in_progress] Task two")
         expect(result).toContain("3. [pending] Task three")
         expect(result).toContain("3 unfinished tasks")
+        expect(result).toContain("verify that each task above is still valid")
+        expect(result).toContain("tracking file")
     })
 
     test("returns 'continue' for empty array", () => {
