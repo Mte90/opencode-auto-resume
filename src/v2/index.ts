@@ -896,6 +896,9 @@ const INDETERMINATE_STRIKES = 2
  * for models that are actually available", and opencode treats an openai 404 as
  * retryable. Nor 429/5xx, which are the transient rungs. */
 const PERMANENT_STATUS_CODES = new Set([401, 403])
+/** A continue re-sends the same oversized history, so it can never clear a
+ * context-limit error. Hard-latch on it. */
+const CONTEXT_LIMIT_RE = /input tokens exceed the model context limit|exceeds? the (?:model )?context (?:limit|window)|context length exceed|maximum context length/i
 /** Permanent messages that are about the session's own HISTORY, so every retry
  * re-sends the same broken payload. Measured on the live log: "Referenced
  * reasoning item" recurred in one session ~17.6 minutes apart over ~4 episodes —
@@ -3153,6 +3156,7 @@ export default define({
 			if (errType && PERMANENT_ERROR_TYPES.has(errType)) return `type ${errType}`
 			if (typeof status === "number" && PERMANENT_STATUS_CODES.has(status)) return `http ${status}`
 			if (PERMANENT_GONE_RE.test(errMsg)) return errMsg.slice(0, 160)
+			if (CONTEXT_LIMIT_RE.test(errMsg)) return `context limit: ${errMsg.slice(0, 120)}`
 			if (PERMANENT_HISTORY_RE.test(errMsg)) return errMsg.slice(0, 160)
 			if (PERMANENT_UNKNOWN_MODEL_RE.test(errMsg)) {
 				if (status === 404) return null // openai 404s can be live models; keep recovering
