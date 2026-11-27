@@ -1233,6 +1233,16 @@ const STOP_STATEMENT_PATTERNS: RegExp[] = [
 	/\bready\s+when\s+you'?re\s+ready\b[^.;:!?—–\n]*[.!]*$/i,
 	/\bready\s+and\s+waiting\b[^.;:!?—–\n]*[.!]*$/i,
 ]
+/** True when a stop says it is waiting on the user (approval, a decision,
+ * a physical action). Such a stop is final: an open todo must not revive it
+ * with a "please continue" reminder. */
+function isWaitingForUser(text: string): boolean {
+  const tail = text.split("\n").slice(-3).join("\n")
+  return /\bwaiting\s+on\s+(?:your|the\s+user'?s?)\b/i.test(tail)
+    || /\b(?:awaiting|waiting\s+for)\s+(?:your|the\s+user'?s?)\s+(?:go-?ahead|approval|input|decision|guidance|confirmation|direction|clarification|response|reply|action)\b/i.test(tail)
+    || /\b(?:need|needs|require|requires)\s+(?:your|the\s+user'?s?)\s+(?:go-?ahead|approval|input|decision|guidance|confirmation|direction|clarification)\b/i.test(tail)
+}
+
 function containsStopStatement(text: string): boolean {
 	const lines = stripBoundaryMarkers(text).split("\n")
 	const lastLines = lines.slice(-3).join("\n")
@@ -5292,6 +5302,10 @@ export default define({
 			// completion); with nothing open, latch and end the turn quietly.
 			if (containsStopStatement(text)) {
 				const open = getOpenTodos(await readTodos(sid))
+				if (isWaitingForUser(text)) {
+					dbg(`${short(sid)} turn is waiting on the user — open todos do not revive it`)
+					return
+				}
 				if (open.length > 0) {
 					await targetedRecovery(sid, "stop-open-todos", buildOpenTodosReminder(open), "todoNudgeAttempts")
 					return
@@ -6152,7 +6166,9 @@ export default define({
 					}
 					if (histText && turnEndsWithCompletionClaim(histText)) {
 						const open = getOpenTodos(await readTodos(sid))
-						if (open.length > 0) {
+						if (isWaitingForUser(histText)) {
+							dbg(`${short(sid)} quiet turn is waiting on the user — open todos do not revive it`)
+						} else 						if (open.length > 0) {
 							await targetedRecovery(sid, "stop-open-todos", buildOpenTodosReminder(open), "todoNudgeAttempts")
 						} else if (!w.completionSignaled) {
 							w.completionSignaled = true
