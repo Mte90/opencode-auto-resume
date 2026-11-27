@@ -1625,6 +1625,15 @@ function looksLikeOwnPrompt(text: string | undefined): boolean {
 	return OWN_PROMPT_SHAPES.some((re) => re.test(text))
 }
 
+/** True when a message was injected by this plugin via ctx.session.synthetic.
+ * Its body may be redacted / not match OWN_PROMPT_SHAPES, but the `auto-resume:`
+ * description travels with the stored message and survives a plugin reload.
+ * Without this, such a message reads as a genuine user turn and resets workRetries. */
+function isOwnInjectedMessage(m: unknown): boolean {
+	const mm = m as { description?: unknown } | null | undefined
+	return typeof mm?.description === "string" && mm.description.startsWith("auto-resume:")
+}
+
 function isTaskToolCall(ev: V2Event): boolean {
 	const tool = ev.data?.tool ?? ev.data?.toolName
 	if (typeof tool === "string") {
@@ -4393,6 +4402,9 @@ export default define({
 			// The prompt body itself says who wrote it. This survives a plugin
 			// reload, where the in-memory own-prompt record starts empty.
 			const ownByShape = looksLikeOwnPrompt(latest.text)
+			// Synthetic injections carry a durable `auto-resume:` description but
+			// their body is redacted / not a known shape (done-claim details).
+			const ownByDesc = typeof latest.description === "string" && latest.description.startsWith("auto-resume:")
 			const ownByTime =
 				typeof latest.at === "number" &&
 				w.lastInjectAt > 0 &&
@@ -4405,7 +4417,7 @@ export default define({
 			// there is no readable body (content null projection) AND the message
 			// arrived on our inject clock.
 			const ownByTimeOnly = ownByTime && !(typeof latest.text === "string" && latest.text.length > 0)
-			if (ownByText || ownByShape || ownByTimeOnly) {
+			if (ownByText || ownByShape || ownByDesc || ownByTimeOnly) {
 				dbg(`${short(sid)} newest user message is our own prompt — not re-arming budgets`)
 				return
 			}
@@ -6770,7 +6782,8 @@ export default define({
 									const hist = await loadMessages(sid)
 									for (const m of hist) {
 										if (msgRole(m) !== "user") continue
-										if (msgAt(m) <= w.lastInjectAt) continue
+										if (isOwnInjectedMessage(m)) continue
+								if (msgAt(m) <= w.lastInjectAt) continue
 										// Exclude our own prompts — they land
 										// shortly after the inject and must not
 										// be treated as a genuine user turn
