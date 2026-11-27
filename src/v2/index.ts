@@ -1048,8 +1048,11 @@ const AWAITING_USER_TOOLS = new Set(["question", "permission", "ask", "confirm"]
  * they want.
  */
 const SAFE_CONTINUE_PROMPT =
-	"continue\nOnly continue work already in progress. Do not start anything new, " +
-	"and do not take destructive or irreversible actions without explicit user approval."
+	"continue\nAutomatic stall notice \u2014 not a user message and not approval. " +
+	"Only continue work already in progress. Do not start anything new, " +
+	"and do not take destructive or irreversible actions without explicit user approval. " +
+	"If the work is waiting on the user, on a rate limit, or on another process, stop here and say what you are waiting for. " +
+	"If you already received this notice for this step, do not repeat the same action."
 
 /**
  * The empty-idle nudge has nothing in progress to continue — that is precisely
@@ -1059,9 +1062,12 @@ const SAFE_CONTINUE_PROMPT =
  * inventing a task.
  */
 const SAFE_EMPTY_IDLE_PROMPT =
-	"continue\nIf work was already in progress, continue it and finish nothing else. " +
+	"continue\nAutomatic idle notice \u2014 not a user message and not approval. " +
+	"If work was already in progress, continue it and finish nothing else. " +
 	"Otherwise ask the user what to do next rather than starting something new. " +
-	"Do not take destructive or irreversible actions without explicit user approval."
+	"Do not take destructive or irreversible actions without explicit user approval. " +
+	"If you are waiting on the user or on a rate limit, stop here and say so. " +
+	"If you already received this notice for this step, do not repeat the same action."
 
 /**
  * The `task_complete` acknowledgement texts.
@@ -3283,8 +3289,10 @@ export default define({
 			]
 				.filter((x): x is string => typeof x === "string" && x.length > 0)
 				.join("; ")
-			return (`continue — stalled (${head}).\nOnly continue work already in progress. ` +
-				`Do not start anything new, and do not take destructive or irreversible actions without explicit user approval.\n${suffix}`).slice(0, 2000)
+			return (`continue — stalled (${head}).\nAutomatic stall notice — not a user message and not approval. ` +
+				`Only continue work already in progress. Do not start anything new, and do not take destructive or irreversible actions without explicit user approval. ` +
+				`If waiting on the user, a rate limit, or another process, stop and say what you are waiting for. ` +
+				`If you already received this notice for this step, do not repeat the same action.\n${suffix}`).slice(0, 2000)
 		}
 
 		/**
@@ -4467,6 +4475,21 @@ export default define({
 			// step events, our own injections' turns) that wiped fresh latches
 			// within seconds (ses_ed33c0da, 2026-10-11). Own prompts return above
 			// before reaching here, so our injections never clear it.
+			// A hard latch (task_complete / literal TASK COMPLETE) used to survive
+			// every new user message: completionSignaled cleared here but
+			// completionHard stayed true forever, so neither the stall ladder
+			// nor the instant resume could ever fire again in that session.
+			// Only a message newer than the latch re-arms it — a pre-latch
+			// message the watcher hadn't observed yet must not clear a fresh
+			// completion claim. Own prompts and synthetic interrupts return
+			// above, so they cannot re-open it either.
+			if (
+				w.completionHard &&
+				(typeof latest.at !== "number" || latest.at > w.completionSignaledAt)
+			) {
+				w.completionHard = false
+				dbg(`${short(sid)} genuine new user message — re-opening hard completion latch`)
+			}
 			if (w.completionSignaled) {
 				w.completionSignaled = false
 				w.completionSignaledAt = 0
