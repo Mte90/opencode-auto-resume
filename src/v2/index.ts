@@ -4395,7 +4395,7 @@ export default define({
 
 		function noteInboundUserMessage(sid: string, w: SessionWatch, messages: unknown[]): void {
 			rememberOwnPrompts(w, messages)
-			let latest: { id?: string; at?: number; text?: string } | null = null
+			let latest: { id?: string; at?: number; text?: string; description?: unknown } | null = null
 			for (let i = messages.length - 1; i >= 0; i--) {
 				const m = messages[i] as {
 					id?: string
@@ -4404,12 +4404,13 @@ export default define({
 					time?: { created?: number }
 					info?: { time?: { created?: number }; role?: string }
 					content?: Array<{ type?: string; text?: string }>
+					description?: unknown
 					text?: string
 				}
 				const isUser = msgRole(m) === "user"
 				if (!isUser) continue
 				const text = messageTextOf(m)
-				latest = { id: typeof m.id === "string" ? m.id : undefined, at: m.time?.created ?? m.info?.time?.created, text }
+				latest = { id: typeof m.id === "string" ? m.id : undefined, at: m.time?.created ?? m.info?.time?.created, text, description: m.description }
 				break
 			}
 			if (!latest) return
